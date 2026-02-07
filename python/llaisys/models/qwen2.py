@@ -1,0 +1,327 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Sequence, Tuple
+
+import json
+import os
+import re
+
+import numpy as np
+import safetensors
+
+from ctypes import POINTER, byref, c_int, c_int64, c_size_t, c_void_p
+
+from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
+from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+from ..tensor import Tensor
+
+
+_LAYER_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.weight$"), "attn_norm_w"),
+    # Qwen-style attention.* names.
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wq\.weight$"), "attn_q_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wq\.bias$"), "attn_q_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wk\.weight$"), "attn_k_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wk\.bias$"), "attn_k_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wv\.weight$"), "attn_v_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wv\.bias$"), "attn_v_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.attention\.wo\.weight$"), "attn_o_w"),
+    # HF/Qwen2-style self_attn.*_proj names (observed in DeepSeek-R1-Distill-Qwen-1.5B).
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.q_proj\.weight$"), "attn_q_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.q_proj\.bias$"), "attn_q_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.k_proj\.weight$"), "attn_k_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.k_proj\.bias$"), "attn_k_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.v_proj\.weight$"), "attn_v_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.v_proj\.bias$"), "attn_v_b"),
+    (re.compile(r"^model\.layers\.(\d+)\.self_attn\.o_proj\.weight$"), "attn_o_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$"), "mlp_norm_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$"), "mlp_gate_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.up_proj\.weight$"), "mlp_up_w"),
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.down_proj\.weight$"), "mlp_down_w"),
+)
+
+_GLOBAL_NAMES: Dict[str, str] = {
+    "model.embed_tokens.weight": "in_embed",
+    "lm_head.weight": "out_embed",
+    "model.norm.weight": "out_norm_w",
+}
+
+
+def _maybe_bfloat16_dtype() -> Optional[np.dtype]:
+    try:
+        import ml_dtypes  # type: ignore
+
+        return np.dtype(ml_dtypes.bfloat16)
+    except Exception:
+        return None
+
+
+_BF16_DTYPE = _maybe_bfloat16_dtype()
+
+
+def _torch_dtype_to_datatype(torch_dtype: Optional[str]) -> DataType:
+    if torch_dtype is None:
+        return DataType.F32
+    torch_dtype = torch_dtype.lower()
+    if "bfloat16" in torch_dtype or torch_dtype == "bf16":
+        return DataType.BF16 if _BF16_DTYPE is not None else DataType.F32
+    if "float16" in torch_dtype or torch_dtype == "fp16" or torch_dtype == "f16":
+        return DataType.F16
+    if "float32" in torch_dtype or torch_dtype == "fp32" or torch_dtype == "f32":
+        return DataType.F32
+    return DataType.F32
+
+
+def _datatype_to_numpy_dtype(dtype: DataType) -> np.dtype:
+    if dtype == DataType.F32:
+        return np.dtype(np.float32)
+    if dtype == DataType.F16:
+        return np.dtype(np.float16)
+    if dtype == DataType.BF16 and _BF16_DTYPE is not None:
+        return _BF16_DTYPE
+    # Fallback: use float32 even if meta says BF16 but runtime support is missing.
+    return np.dtype(np.float32)
+
+
+def _as_contiguous(array: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    if array.dtype != dtype:
+        array = array.astype(dtype, copy=False)
+    if not array.flags.c_contiguous:
+        array = np.ascontiguousarray(array)
+    return array
+
+
+def _detach_tensor_handle(tensor: Tensor) -> c_void_p:
+    """Transfer ownership to the backend by detaching the handle from Tensor.__del__."""
+    handle = tensor.lib_tensor()
+    # The backend takes ownership. Prevent Python-side double free.
+    tensor._tensor = None  # type: ignore[attr-defined]
+    return handle
+
+
+@dataclass(frozen=True)
+class _MetaInfo:
+    dtype: DataType
+    nlayer: int
+    hs: int
+    nh: int
+    nkvh: int
+    dh: int
+    di: int
+    maxseq: int
+    voc: int
+    epsilon: float
+    theta: float
+    end_token: int
+
+
+def _read_config(model_path: Path) -> dict:
+    config_path = model_path / "config.json"
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _parse_meta(model_path: Path) -> _MetaInfo:
+    cfg = _read_config(model_path)
+
+    dtype = _torch_dtype_to_datatype(cfg.get("torch_dtype"))
+
+    hs = int(cfg["hidden_size"])
+    nh = int(cfg["num_attention_heads"])
+    nkvh = int(cfg.get("num_key_value_heads", nh))
+    dh = hs // nh
+
+    eos = cfg.get("eos_token_id", cfg.get("end_token_id", 0))
+    if isinstance(eos, Iterable) and not isinstance(eos, (str, bytes)):
+        eos_list = list(eos)
+        end_token = int(eos_list[0]) if eos_list else 0
+    else:
+        end_token = int(eos)
+
+    theta = float(cfg.get("rope_theta", 10000.0))
+
+    cfg_maxseq = int(cfg["max_position_embeddings"])
+    # KV-cache memory grows linearly with maxseq and can easily reach multiple GB.
+    # Cap it by default to keep the stage-1 implementation stable on typical machines.
+    cap_maxseq = int(os.getenv("LLAISYS_MAXSEQ", "4096"))
+    maxseq = min(cfg_maxseq, cap_maxseq)
+
+    return _MetaInfo(
+        dtype=dtype,
+        nlayer=int(cfg["num_hidden_layers"]),
+        hs=hs,
+        nh=nh,
+        nkvh=nkvh,
+        dh=dh,
+        di=int(cfg["intermediate_size"]),
+        maxseq=maxseq,
+        voc=int(cfg["vocab_size"]),
+        epsilon=float(cfg.get("rms_norm_eps", 1e-6)),
+        theta=theta,
+        end_token=end_token,
+    )
+
+
+def _build_meta_struct(meta: _MetaInfo) -> LlaisysQwen2Meta:
+    return LlaisysQwen2Meta(
+        meta.dtype,
+        meta.nlayer,
+        meta.hs,
+        meta.nh,
+        meta.nkvh,
+        meta.dh,
+        meta.di,
+        meta.maxseq,
+        meta.voc,
+        meta.epsilon,
+        meta.theta,
+        meta.end_token,
+    )
+
+
+def _device_ids(device_id: int = 0):
+    arr = (c_int * 1)(device_id)
+    return arr, 1
+
+
+class Qwen2:
+    """Qwen2 model wrapper backed by the LLAISYS C++ runtime."""
+
+    def __init__(self, model_path: Path | str, device: DeviceType = DeviceType.CPU):
+        self._model_path = Path(model_path)
+        self._device = device
+
+        meta = _parse_meta(self._model_path)
+        self._meta_info = meta
+        self._meta_struct = _build_meta_struct(meta)
+
+        dev_ids, ndev = _device_ids(0)
+        self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
+            byref(self._meta_struct),
+            device,
+            dev_ids,
+            ndev,
+        )
+        if not self._model:
+            raise RuntimeError("Failed to create Qwen2 model instance")
+        self._weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self._model)
+        if not self._weights_ptr:
+            raise RuntimeError("Failed to acquire Qwen2 weight slots")
+        self._weights: LlaisysQwen2Weights = self._weights_ptr.contents
+
+        self._np_dtype = _datatype_to_numpy_dtype(meta.dtype)
+
+        self._load_safetensors()
+
+    def __del__(self):
+        if hasattr(self, "_model") and self._model:
+            LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
+            self._model = None
+
+    # -------------------- Weight Loading --------------------
+
+    def _assign_global(self, field: str, array: np.ndarray) -> None:
+        tensor = Tensor(
+            shape=array.shape,
+            dtype=self._meta_info.dtype,
+            device=self._device,
+            device_id=0,
+        )
+        tensor.load(array.ctypes.data_as(c_void_p))
+        handle = _detach_tensor_handle(tensor)
+        setattr(self._weights, field, handle)
+
+    def _assign_layer(self, field: str, layer_idx: int, array: np.ndarray) -> None:
+        slots = getattr(self._weights, field)
+        tensor = Tensor(
+            shape=array.shape,
+            dtype=self._meta_info.dtype,
+            device=self._device,
+            device_id=0,
+        )
+        tensor.load(array.ctypes.data_as(c_void_p))
+        handle = _detach_tensor_handle(tensor)
+        slots[layer_idx] = handle
+
+    def _map_and_assign(self, name: str, array: np.ndarray) -> bool:
+        if name in _GLOBAL_NAMES:
+            self._assign_global(_GLOBAL_NAMES[name], array)
+            return True
+
+        for pattern, field in _LAYER_PATTERNS:
+            m = pattern.match(name)
+            if not m:
+                continue
+            layer_idx = int(m.group(1))
+            if layer_idx < 0 or layer_idx >= self._meta_info.nlayer:
+                raise ValueError(f"Layer index out of range for {name}: {layer_idx}")
+            self._assign_layer(field, layer_idx, array)
+            return True
+
+        return False
+
+    def _load_safetensors(self) -> None:
+        safetensor_files = sorted(self._model_path.glob("*.safetensors"))
+        if not safetensor_files:
+            raise FileNotFoundError(f"No safetensors files found under {self._model_path}")
+
+        for file in safetensor_files:
+            data = safetensors.safe_open(file, framework="numpy", device="cpu")
+            for name in data.keys():
+                array = data.get_tensor(name)
+                array = _as_contiguous(array, self._np_dtype)
+                self._map_and_assign(name, array)
+
+    # -------------------- Inference --------------------
+
+    def _infer(self, token_ids: Sequence[int]) -> int:
+        if not token_ids:
+            raise ValueError("token_ids must be non-empty")
+        buf = (c_int64 * len(token_ids))(*[int(t) for t in token_ids])
+        next_token = int(
+            LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, buf, c_size_t(len(token_ids)))
+        )
+        if next_token < 0 or next_token >= self._meta_info.voc:
+            raise RuntimeError(f"Invalid token id returned from infer: {next_token}")
+        return next_token
+
+    def generate(
+        self,
+        inputs: Sequence[int],
+        max_new_tokens: Optional[int] = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+    ) -> Sequence[int]:
+        # Sampling knobs are accepted for interface compatibility; the backend currently uses argmax.
+        _ = (top_k, top_p, temperature)
+
+        tokens = [int(t) for t in inputs]
+        if not tokens:
+            return tokens
+
+        if len(tokens) > self._meta_info.maxseq:
+            raise ValueError("Prompt length exceeds maxseq")
+
+        remaining = self._meta_info.maxseq - len(tokens)
+        if remaining <= 0:
+            return tokens
+
+        max_new = remaining if max_new_tokens is None else min(int(max_new_tokens), remaining)
+        if max_new <= 0:
+            return tokens
+
+        next_token = self._infer(tokens)
+        tokens.append(next_token)
+        if next_token == self._meta_info.end_token:
+            return tokens
+
+        for _ in range(max_new - 1):
+            next_token = self._infer([tokens[-1]])
+            tokens.append(next_token)
+            if next_token == self._meta_info.end_token:
+                break
+
+        return tokens
