@@ -38,6 +38,8 @@ llaisys/
 │        ├─ qwen2_api.cc     # C API 与 Qwen2Model 绑定
 │        ├─ qwen2_model.hpp  # 驱动 + block + weights 声明（合并版）
 │        └─ qwen2_model.cpp  # 构造、infer、调度 + weights 校验/映射（合并版）
+│        ├─ qwen2_model.hpp  # 驱动 + block + weights 声明（合并版）
+│        └─ qwen2_model.cpp  # 构造、infer、调度 + weights 校验/映射（合并版）
 ├─ python/
 │  └─ llaisys/
 │     ├─ entrypoints/
