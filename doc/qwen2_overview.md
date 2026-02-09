@@ -15,7 +15,8 @@ llaisys/
 │     │  ├─ infer_types.h     # 通用 Batch/Output C 结构
 │     │  └─ kv_cache.h        # 通用 KV 管理 C API（seq_*）
 │     └─ models/
-│        └─ qwen2.h          # C API、配置结构、句柄定义
+│        ├─ model.h          # 通用模型 C API（create/decode/logits/kv）
+│        └─ qwen2.h          # Qwen2 专有元数据/权重结构定义
 ├─ src/
 │  └─ llaisys/
 │     ├─ runtime/
@@ -35,9 +36,7 @@ llaisys/
 │     │  ├─ model.hpp        # 通用模型接口（weights/decode/kv_*）
 │     │  └─ model.cpp
 │     └─ qwen2/
-│        ├─ qwen2_api.cc     # C API 与 Qwen2Model 绑定
-│        ├─ qwen2_model.hpp  # 驱动 + block + weights 声明（合并版）
-│        └─ qwen2_model.cpp  # 构造、infer、调度 + weights 校验/映射（合并版）
+│        ├─ qwen2_api.cc     # Qwen2 实现注册到通用模型工厂
 │        ├─ qwen2_model.hpp  # 驱动 + block + weights 声明（合并版）
 │        └─ qwen2_model.cpp  # 构造、infer、调度 + weights 校验/映射（合并版）
 ├─ python/
@@ -53,9 +52,6 @@ llaisys/
 │     │  ├─ scheduler.py     # RequestScheduler, BatchPlan/BatchItem
 │     │  ├─ executor.py      # Executor
 │     │  └─ worker.py        # Worker
-│     ├─ model_runners/
-│     │  ├─ base.py          # ModelRunner 抽象接口
-│     │  └─ qwen2_runner.py  # Qwen2 ModelRunner 实现
 │     ├─ server/
 │     │  ├─ openai_server.py # OpenAIServer/HttpServer
 │     │  ├─ async_engine.py  # AsyncLLMEngine
@@ -63,9 +59,11 @@ llaisys/
 │     │  ├─ metrics.py       # 监控指标输出
 │     │  └─ schemas.py       # ApiRequest/StreamHandle/响应结构
 │     ├─ libllaisys/
-│     │  └─ qwen2.py         # ctypes 声明与 Qwen2Handle
+│     │  ├─ model.py         # 通用模型 ctypes 声明（LlaisysModel）
+│     │  └─ qwen2.py         # Qwen2 专有 ctypes 结构定义（meta/weights）
 │     └─ models/
-│        └─ qwen2.py         # 暂时作为ModelRunner: HF→weights 映射、Tokenizer、单步推理
+│        ├─ base.py          # 模型适配抽象接口
+│        └─ qwen2.py         # Qwen2 模型适配实现：HF→weights 映射、Tokenizer、单步推理
 ├─ webui/
 │  ├─ index.html             # Web UI 入口
 │  ├─ app.js                 # 向服务器请求/流式接收
@@ -77,18 +75,20 @@ llaisys/
 解耦拆分规则：
 
 1. `src/llaisys/runtime/*` 与 `python/llaisys/common/*` 只放公共组件，不出现模型专有权重名或层字段。
-2. `src/llaisys/qwen2/*` 与 `python/llaisys/model_runners/qwen2_runner.py` 只放 Qwen2 专有逻辑。
-3. Engine/Server 仅依赖 `model_runners/base.py` 抽象接口和 `common/model_registry.py`，不直接依赖具体模型实现。
-4. 新增模型时只新增 `src/llaisys/<model>/` 与 `python/llaisys/model_runners/<model>_runner.py`，公共模块不改或少改。
+2. `src/llaisys/qwen2/*` 与 `python/llaisys/models/qwen2.py` 只放 Qwen2 专有逻辑。
+3. Engine/Server 仅依赖 `python/llaisys/models/base.py` 抽象接口和 `common/model_registry.py`，不直接依赖具体模型实现。
+4. 新增模型时只新增 `src/llaisys/<model>/` 与 `python/llaisys/models/<model>.py`，公共模块不改或少改。
 
 - **注释约定**：
   - `include/`：关键结构与 API 使用 `//` 说明参数含义和生命周期。
+  - `src/llaisys/models/*.cpp`：通用模型分发与类型路由逻辑需注明模型类型分支与错误码语义。
   - `src/llaisys/qwen2/*.cpp`：文件头注明模块职责，复杂函数前加简述；内部逻辑依赖 `ASSERT`/`CHECK_*`。
-  - `python/llaisys/libllaisys/qwen2.py`：每个 ctypes 函数注明 `argtypes/restype` 对应的实际意义。
-  - `python/llaisys/model_runners/qwen2_runner.py`：类 docstring 描述整体用途，私有方法附注权重映射、Tokenizer 与单步执行策略；必要时可保留对 `python/llaisys/models/qwen2.py` 的兼容调用。
+  - `python/llaisys/libllaisys/model.py`：每个通用模型 ctypes 函数注明 `argtypes/restype` 与返回码语义。
+  - `python/llaisys/libllaisys/qwen2.py`：Qwen2 专有 ctypes 结构与辅助转换函数注明字段语义。
+  - `python/llaisys/models/qwen2.py`：类 docstring 描述整体用途，私有方法附注权重映射、Tokenizer 与单步执行策略。
   - `doc/`：保持当前 Markdown 结构，记录设计演进。
 
-以上目录中 `src/llaisys/qwen2/` 及对应 Python/文档文件为本次实现新增内容，提交时需一并创建并按注释约定维护。所有新增文件遵循仓库既有风格：`snake_case` 文件名、命名空间 `llaisys::models::qwen2`，注释使用英语或简明中文，避免冗长段落。
+以上目录中 `src/llaisys/models/`、`src/llaisys/qwen2/` 及对应 Python/文档文件为本次实现新增内容，提交时需一并创建并按注释约定维护。所有新增文件遵循仓库既有风格：`snake_case` 文件名；通用层使用 `llaisys::models` 命名空间，模型实现使用 `llaisys::models::<model>` 命名空间，注释使用英语或简明中文，避免冗长段落。
 
 ## 3. 架构设计
 ### 3.1 Online/Offline 总体架构（流程 + 进程）
@@ -108,7 +108,7 @@ Process: main
     ↓
   Worker
     ↓
-  Qwen2 (ModelRunner)
+  models/<model>.py
     ↓
   C++ Core (batch/ubatch + KV + ops)
   ↓
@@ -138,7 +138,7 @@ Process: llm_engine
 Process: worker
   Worker
     ↓
-  Qwen2 (ModelRunner)
+  models/<model>.py
     ↓
   C++ Core (batch/ubatch + KV + ops)
     ↓
@@ -154,8 +154,8 @@ Process: worker
 - 引擎核心：`LLMEngine`，负责请求生命周期与调度驱动。
 - Scheduler：`RequestScheduler`，负责队列、prefill/decode 混排、batch/ubatch 组装。
 - Executor：执行计划与资源协调，管理 Worker 调度。
-- Worker：模型执行单元，负责调用 ModelRunner 并触发 Core 执行。
-- ModelRunner：模型适配与执行组织（权重映射、Tokenizer、输入输出组织、单次推理调用）。
+- Worker：模型执行单元，负责调用 `python/llaisys/models/*.py` 适配器并触发 Core 执行。
+- models 层：模型适配与执行组织（权重映射、Tokenizer、输入输出组织、单次推理调用）。
 - Core：C++ 推理核（KV-Cache/算子/batch 执行）。
 
 
@@ -177,10 +177,11 @@ C++ Core
 
 Core 公共实现约束（所有 4.1.x 默认遵循）：
 
-1. 代码落点：`include/llaisys/runtime/infer_types.h`、`include/llaisys/runtime/kv_cache.h`、`include/llaisys/models/qwen2.h`、`src/llaisys/runtime/{weights,workspace,kv_cache,graph}/`、`src/llaisys/qwen2/qwen2_model.hpp`、`src/llaisys/qwen2/qwen2_model.cpp`、`src/llaisys/qwen2/qwen2_api.cc`、`python/llaisys/libllaisys/qwen2.py`。
+1. 代码落点：`include/llaisys/runtime/infer_types.h`、`include/llaisys/runtime/kv_cache.h`、`include/llaisys/models/model.h`、`include/llaisys/models/qwen2.h`、`src/llaisys/runtime/{weights,workspace,kv_cache,graph}/`、`src/llaisys/models/{model.hpp,model.cpp}`、`src/llaisys/qwen2/qwen2_model.hpp`、`src/llaisys/qwen2/qwen2_model.cpp`、`src/llaisys/qwen2/qwen2_api.cc`、`python/llaisys/libllaisys/model.py`、`python/llaisys/models/qwen2.py`。
 2. C API 使用纯 C 结构体，不暴露 STL 容器。
 3. Core 统一输入语义为 SoA batch（`token/pos/n_seq_id/seq_id/logits`）。
-4. 旧接口 `llaisysQwen2ModelInfer(model, token_ids, ntoken)` 保留，用于兼容。
+4. 阶段0主入口为通用模型 API（`llaisysModel*`），Engine/Server 不依赖模型专用 C API。
+5. 权重槽位访问统一走 `llaisysModelWeights`（按 `model_type` 转型）。
 
 #### 4.1.1 需求 3.1.1：模型权重加载与生命周期
 
@@ -199,7 +200,7 @@ void replace_weight_slot(const char *name, llaisysTensor_t new_handle);
    - 不同句柄则先安全释放旧句柄，再写入新句柄；
    - 支持共享句柄引用计数或别名去重。
 5. 在 `qwen2_api.cc` 的 create/destroy 错误路径保持 fail-fast，避免跨 C 边界异常泄漏。
-6. Python `python/llaisys/model_runners/qwen2_runner.py` 继续使用 `_detach_tensor_handle()` 转移所有权（可复用兼容模块实现）。
+6. Python `python/llaisys/models/qwen2.py` 继续使用 `_detach_tensor_handle()` 转移所有权（作为模型适配器实现）。
 
 验收：
 
@@ -343,7 +344,7 @@ KvStatus attach_seq(size_t slot_idx, int64_t seq_id);
 
 实现设计：
 
-1. 在 `include/llaisys/runtime/infer_types.h` 新增与 llama.cpp 对齐的 SoA batch 结构（`qwen2.h` 仅 include 并复用）：
+1. 在 `include/llaisys/runtime/infer_types.h` 新增与 llama.cpp 对齐的 SoA batch 结构（所有模型统一复用）：
 
 ```c
 typedef struct LlaisysBatch {
@@ -357,27 +358,28 @@ typedef struct LlaisysBatch {
 } LlaisysBatch;
 ```
 
-2. 输出读取改为上下文查询式接口（对齐 llama.cpp）：
+2. 输出读取改为上下文查询式接口（对齐 llama.cpp），主路径使用通用模型 API：
 
 ```c
-float * llaisysQwen2ModelGetLogits(struct LlaisysQwen2Model * model);
-float * llaisysQwen2ModelGetLogitsIth(struct LlaisysQwen2Model * model, int32_t i);
-int32_t llaisysQwen2ModelNOutputs(struct LlaisysQwen2Model * model);
-const int32_t * llaisysQwen2ModelOutputIds(struct LlaisysQwen2Model * model);
+float * llaisysModelGetLogits(struct LlaisysModel * model);
+float * llaisysModelGetLogitsIth(struct LlaisysModel * model, int32_t i);
+int32_t llaisysModelNOutputs(struct LlaisysModel * model);
+const int32_t * llaisysModelOutputIds(struct LlaisysModel * model);
 ```
 
-3. 输出契约：logits 行只为 `batch.logits[i] != 0` 的 token 生成，且按 batch 出现顺序紧凑存放。
-4. `batch.logits` 语义是“是否输出该行 logits”，不是“是否必须采样”。
-5. `output_ids[j]` 表示第 `j` 条输出行对应 batch 内哪个 token 索引，便于 Engine 精确回填到序列状态。
-6. 采样与 logits 输出解耦：采样默认在 Engine 执行；Core 仅提供 logits 缓冲查询。
-7. logits/output_ids 存放在 runtime 的连续输出缓冲区（由 workspace/output 组件管理），生命周期至少覆盖到下一次 `Decode()` 调用前。
-8. 增加 `output_reserve(n_outputs)` 语义（对齐 llama.cpp）：
+3. 模型适配层统一通过 `llaisysModelGetLogits*` 读取输出，不引入模型专用 logits 接口。
+4. 输出契约：logits 行只为 `batch.logits[i] != 0` 的 token 生成，且按 batch 出现顺序紧凑存放。
+5. `batch.logits` 语义是“是否输出该行 logits”，不是“是否必须采样”。
+6. `output_ids[j]` 表示第 `j` 条输出行对应 batch 内哪个 token 索引，便于 Engine 精确回填到序列状态。
+7. 采样与 logits 输出解耦：采样默认在 Engine 执行；Core 仅提供 logits 缓冲查询。
+8. logits/output_ids 存放在 runtime 的连续输出缓冲区（由 workspace/output 组件管理），生命周期至少覆盖到下一次 `Decode()` 调用前。
+9. 增加 `output_reserve(n_outputs)` 语义（对齐 llama.cpp）：
 
 ```cpp
 bool output_reserve(int32_t n_outputs);
 ```
 
-9. 在每次 `decode()`（以及可选 `encode()`）前先计算本轮 `n_outputs` 并调用 `output_reserve(n_outputs)`，保证输出缓冲区稳定，避免热路径临时扩容。
+10. 在每次 `decode()`（以及可选 `encode()`）前先计算本轮 `n_outputs` 并调用 `output_reserve(n_outputs)`，保证输出缓冲区稳定，避免热路径临时扩容。
 
 验收：
 
@@ -491,8 +493,8 @@ int64_t kv_seq_pos_max(int64_t seq_id) const;
    - `kv_seq_add(seq, p0, p1, delta)`：对命中 cell 的逻辑 `pos += delta`（显式位置平移）；
    - `kv_seq_keep(seq)`：仅保留 `seq`，其他 `seq_id` 全部移除；
    - `kv_seq_pos_max(seq)`：返回该序列当前最大逻辑位置（不存在返回 -1）。
-3. 公共 C API 在 `include/llaisys/runtime/kv_cache.h` 定义（如 `llaisysKvSeq*`）；`qwen2.h` 保留 `llaisysQwen2KvSeq*` 兼容包装，内部实现路径为 `Qwen2Model -> IKvCache`。
-4. ctypes 在 `python/llaisys/libllaisys/qwen2.py` 同步绑定，并保留错误码到异常的映射表。
+3. 通用模型 C API 在 `include/llaisys/models/model.h` 定义（如 `llaisysModelKvSeq*`）；内部实现路径为 `ModelHandle -> <ModelImpl> -> IKvCache`。
+4. ctypes 在 `python/llaisys/libllaisys/model.py` 统一绑定，并保留错误码到异常的映射表。
 
 验收：
 
@@ -573,7 +575,7 @@ void check_block_shapes_(...) const;
 void fill_pos_ids_from_batch_(const tensor_t &pos_ids, const UBatchView &ubatch);
 ```
 
-2. 禁止再用 `cur_len_ + i` 生成 pos（仅在 `batch.pos == NULL` 的兼容路径允许自动位置）。
+2. 禁止再用 `cur_len_ + i` 生成 pos；仅在 `batch.pos == NULL` 时按 `seq_pos_max(seq)+1` 自动补位。
 
 验收：
 
@@ -583,18 +585,19 @@ void fill_pos_ids_from_batch_(const tensor_t &pos_ids, const UBatchView &ubatch)
 
 实现设计：
 
-1. 新增对齐 llama.cpp 的主入口：
+1. 新增对齐 llama.cpp 的主入口（通用模型 API）：
 
 ```cpp
-int32_t llaisysQwen2ModelDecode(struct LlaisysQwen2Model * model, struct LlaisysBatch batch);
+int32_t llaisysModelDecode(struct LlaisysModel * model, struct LlaisysBatch batch);
 struct LlaisysBatch llaisysBatchInit(int32_t n_tokens, int32_t embd, int32_t n_seq_max);
 struct LlaisysBatch llaisysBatchGetOne(int64_t * token, int32_t n_tokens);
 void llaisysBatchFree(struct LlaisysBatch batch);
 ```
 
-2. 每次 `decode` 处理一个 batch；内部可拆多个 ubatch 执行，外部只关心单次返回状态码。
-3. 状态码语义对齐 llama.cpp：`0=success`、`1=no KV slot`、`2=aborted`、`-1=invalid input`、`<-1=fatal`。
-4. 旧入口 `infer(token_ids, ntoken)` 仅作为兼容 helper，内部走 `llaisysBatchGetOne`/`llaisysQwen2ModelDecode` 路径。
+2. 模型执行统一走 `llaisysModelDecode`，不定义模型专用 `Decode` 公共入口。
+3. 每次 `decode` 处理一个 batch；内部可拆多个 ubatch 执行，外部只关心单次返回状态码。
+4. 状态码语义对齐 llama.cpp：`0=success`、`1=no KV slot`、`2=aborted`、`-1=invalid input`、`<-1=fatal`。
+5. 历史单序列调用由 Python 适配层在本地转换为 `llaisysBatchGetOne`/`llaisysModelDecode`，不再新增 C 层专用入口。
 
 验收：
 
@@ -636,6 +639,7 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 7. Workspace 采用 `graph_reserve + reserve/view`，不是模型内逐 tensor 手工扩容。
 8. 运行期图执行采用 `can_reuse` 优先，必要时 `build+alloc` 重建。
 9. 输出缓冲采用 `output_reserve(n_outputs)`，与采样解耦。
+10. 对外只使用 `LlaisysModel` 通用接口；模型差异通过 `model_type + meta` 处理。
 
 ### 4.2 infer Engine（Python）
 
@@ -646,7 +650,7 @@ LLMEngine
   ├─ RequestScheduler
   ├─ Executor
   └─ Worker
-       └─ ModelRunner -> Core
+       └─ models/<model>.py -> Core
 ```
 
 Engine 公共实现约束：
@@ -771,7 +775,7 @@ class StepOutput:
 
 实现设计：
 
-1. `worker.py` 中 lazy init `ModelRunner`。
+1. `worker.py` 中 lazy init `python/llaisys/models/*.py` 模型适配器。
 2. 暴露：
 
 ```python
@@ -780,7 +784,7 @@ class Worker:
     def run(self, plan: BatchPlan) -> dict[int, StepOutput]: ...
 ```
 
-3. `run()` 内部把 BatchPlan 转成 ctypes `LlaisysBatch`（SoA）并调用 `llaisysQwen2ModelDecode`。
+3. `run()` 内部把 BatchPlan 转成 ctypes `LlaisysBatch`（SoA）并调用通用 `llaisysModelDecode`。
 
 验收：
 
@@ -801,14 +805,14 @@ class Worker:
 
 实现设计：
 
-1. `python/llaisys/model_runners/qwen2_runner.py` 提供：
+1. `python/llaisys/models/qwen2.py` 提供：
 
 ```python
 def load_config(model_path: str) -> dict: ...
 def load_tokenizer(model_path: str): ...
 ```
 
-2. Worker 通过这些函数创建 ModelRunner。
+2. Worker 通过这些函数创建模型适配器实例。
 
 验收：
 
@@ -818,7 +822,7 @@ def load_tokenizer(model_path: str): ...
 
 实现设计：
 
-1. 在 ModelRunner 增加：
+1. 在 `python/llaisys/models/qwen2.py` 增加：
 
 ```python
 def validate_weight_coverage(self) -> None: ...
@@ -834,7 +838,7 @@ def validate_weight_coverage(self) -> None: ...
 
 实现设计：
 
-1. ModelRunner 提供统一接口：
+1. 模型适配器提供统一接口：
 
 ```python
 def encode_chat(self, messages: list[dict]) -> list[int]: ...
@@ -888,7 +892,7 @@ class LLMConfig:
 
 1. 缺失字段时报配置错误。
 
-#### 4.2.14 需求 4.5.2：首期 Qwen2，预留多模型
+#### 4.2.14 需求 4.5.2：阶段0多模型注册与路由
 
 实现设计：
 
@@ -896,26 +900,28 @@ class LLMConfig:
 
 ```python
 MODEL_REGISTRY = {
-    "qwen2": Qwen2ModelRunner,
+    "qwen2": Qwen2Model,
+    # "llama": LlamaModel,
+    # "mistral": MistralModel,
 }
 ```
 
-2. Worker 通过 registry 创建 runner。
+2. Worker 通过 registry 创建模型适配器；Engine 主流程不依赖具体模型类名。
 
 验收：
 
-1. 新增模型只需要注册，不改 Engine 主流程。
+1. 新增模型只需要新增 `python/llaisys/models/<model>.py` 并注册，不改 Engine 主流程。
 
 #### 4.2.15 需求 4.5.3：Worker 加载，Engine 路由
 
 实现设计：
 
-1. Engine 根据请求的 `model` 字段选择 Worker。
-2. Worker 在首次任务时加载模型实例。
+1. Engine 根据请求的 `model` 字段选择 Worker/模型适配器。
+2. Worker 在首次任务时按 `model_type` 懒加载模型实例。
 
 验收：
 
-1. Engine 不直接实例化 `Qwen2`。
+1. Engine 不直接实例化具体模型（如 `Qwen2`）。
 
 ### 4.3 infer Server（Python）
 
@@ -1071,7 +1077,7 @@ class AsyncLLMEngine:
 实现设计：
 
 1. Engine 通过 `model` 字段选择 WorkerPool。
-2. 首期 WorkerPool 仅注册 qwen2。
+2. 阶段0要求 WorkerPool 支持多模型注册机制；默认至少注册 qwen2，可按配置扩展其他模型。
 
 验收：
 
@@ -1221,11 +1227,11 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 
 ### 6.1 对齐需求 7.x 的分阶段落地
 
-1. 阶段 0：完成 Core 对齐 llama.cpp 的重构（含 batch/ubatch SoA、slot/cell KV、输出接口与图复用基础），并通过此前已有全部测试（含 `test/test_infer.py --test`）。
+1. 阶段 0：完成 Core 对齐 llama.cpp 的重构（含 batch/ubatch SoA、slot/cell KV、输出接口与图复用基础）并落地通用多模型 API（`LlaisysModel`）；同时通过此前已有全部测试（含 `test/test_infer.py --test`）。
 2. 阶段 1：离线闭环 + argmax（先保证正确性与兼容性）。
 3. 阶段 2：sampling + online（补齐可用性）。
 4. 阶段 3：连续批处理 + 前缀缓存 + 投机（提升吞吐与时延）。
-5. 全阶段要求：接口稳定，旧接口可兼容迁移。
+5. 全阶段要求：接口稳定，主线接口保持 `llaisysModel*` 统一命名与语义。
 
 ### 6.2 对齐需求 8.x 的测试与验收
 
@@ -1233,12 +1239,14 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 2. `test/test_core_decode_batch.py`：验证 SoA batch/decode 路径在单序列场景与旧 `infer()` 输出一致。
 3. `test/test_core_output_api.py`：验证 `GetLogits/GetLogitsIth/NOutputs/OutputIds` 行为一致、行数与 `logits` 标记一致。
 4. `test/test_kv_cache.py`：KV slot/cell 语义、`seq_id + pos` 隔离、`kv_seq_*` 接口行为。
-5. `test/test_core_compat.py`：旧 C API `llaisysQwen2ModelInfer` 兼容性回归（重构后仍可用）。
-6. `test/test_offline.py`：离线一致性与流式/非流式行为。
-7. `test/test_online.py`：在线并发、流式、取消。
-8. `test/test_sampling.py`：采样链行为。
-9. 连续批处理 benchmark：吞吐收益验证。
-10. 全阶段回归要求：新增能力不得破坏旧接口与既有测试基线。
+5. `test/test_core_model_api.py`：通用 `LlaisysModel` 接口（create/decode/logits/kv）行为验证。
+6. `test/test_model_registry.py`：多模型注册与按 `model` 字段路由验证（至少覆盖 qwen2 + 一个 mock 模型）。
+7. `test/test_qwen2_adapter.py`：验证 `python/llaisys/models/qwen2.py` 基于通用 C API 的适配行为。
+8. `test/test_offline.py`：离线一致性与流式/非流式行为。
+9. `test/test_online.py`：在线并发、流式、取消。
+10. `test/test_sampling.py`：采样链行为。
+11. 连续批处理 benchmark：吞吐收益验证。
+12. 全阶段回归要求：新增能力不得破坏通用接口与既有测试基线。
 
 ### 6.3 暂不考虑（后续再议）
 
