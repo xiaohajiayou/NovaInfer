@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llaisys/models/qwen2.h"
+#include "llaisys/runtime/infer_types.h"
 
 #include "../llaisys_tensor.hpp"
 
@@ -36,6 +37,18 @@ public:
     ~Qwen2Model();
 
     LlaisysQwen2Weights *weights() noexcept { return &weights_; }
+    int32_t decode(const LlaisysBatch &batch);
+    float *logits() noexcept;
+    float *logits_ith(int32_t i) noexcept;
+    int32_t n_outputs() const noexcept;
+    const int32_t *output_ids() const noexcept;
+
+    int kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
+    int kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
+    int kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
+    int kv_seq_keep(int64_t seq_id);
+    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
+
     int64_t infer(int64_t *token_ids, size_t ntoken);
 
 private:
@@ -91,6 +104,11 @@ private:
     tensor_t zero_bias_logits_{};
 
     size_t workspace_token_cap_{0};
+    std::vector<float> output_logits_f32_{};
+    std::vector<int32_t> output_ids_{};
+
+    bool validate_decode_batch_(const LlaisysBatch &batch) const;
+    void materialize_outputs_(size_t ntoken, const int8_t *logits_mask);
 
     void init_weight_slots_();
     void init_kv_cache_();

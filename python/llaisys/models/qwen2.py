@@ -10,10 +10,12 @@ import re
 
 import numpy as np
 import safetensors
+import torch
 
-from ctypes import POINTER, byref, c_int, c_int64, c_size_t, c_void_p
+from ctypes import POINTER, byref, cast, c_int, c_int8, c_int32, c_int64, c_void_p
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
+from ..libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from ..tensor import Tensor
 
@@ -198,15 +200,18 @@ class Qwen2:
         self._meta_struct = _build_meta_struct(meta)
 
         dev_ids, ndev = _device_ids(0)
-        self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(
-            byref(self._meta_struct),
+        create_params = LlaisysModelCreateParams(
+            int(ModelType.QWEN2),
+            cast(byref(self._meta_struct), c_void_p),
             device,
             dev_ids,
             ndev,
         )
+        self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params))
         if not self._model:
             raise RuntimeError("Failed to create Qwen2 model instance")
-        self._weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self._model)
+        weights_ptr = LIB_LLAISYS.llaisysModelWeights(self._model)
+        self._weights_ptr = cast(weights_ptr, POINTER(LlaisysQwen2Weights))
         if not self._weights_ptr:
             raise RuntimeError("Failed to acquire Qwen2 weight slots")
         self._weights: LlaisysQwen2Weights = self._weights_ptr.contents
@@ -217,7 +222,7 @@ class Qwen2:
 
     def __del__(self):
         if hasattr(self, "_model") and self._model:
-            LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
+            LIB_LLAISYS.llaisysModelDestroy(self._model)
             self._model = None
 
     # -------------------- Weight Loading --------------------
@@ -268,9 +273,13 @@ class Qwen2:
             raise FileNotFoundError(f"No safetensors files found under {self._model_path}")
 
         for file in safetensor_files:
-            data = safetensors.safe_open(file, framework="numpy", device="cpu")
+            # Use torch backend for safetensors loading to avoid numpy bfloat16 incompatibility.
+            data = safetensors.safe_open(file, framework="pt", device="cpu")
             for name in data.keys():
-                array = data.get_tensor(name)
+                tensor = data.get_tensor(name)
+                if tensor.dtype == torch.bfloat16:
+                    tensor = tensor.to(torch.float32)
+                array = tensor.detach().cpu().numpy()
                 array = _as_contiguous(array, self._np_dtype)
                 self._map_and_assign(name, array)
 
@@ -279,10 +288,35 @@ class Qwen2:
     def _infer(self, token_ids: Sequence[int]) -> int:
         if not token_ids:
             raise ValueError("token_ids must be non-empty")
-        buf = (c_int64 * len(token_ids))(*[int(t) for t in token_ids])
-        next_token = int(
-            LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, buf, c_size_t(len(token_ids)))
-        )
+        n_tokens = len(token_ids)
+        token_buf = (c_int64 * n_tokens)(*[int(t) for t in token_ids])
+        logits_mask = (c_int8 * n_tokens)()
+        logits_mask[n_tokens - 1] = 1
+
+        batch = LlaisysBatch()
+        batch.n_tokens = c_int32(n_tokens)
+        batch.token = token_buf
+        batch.embd = None
+        batch.pos = None
+        batch.n_seq_id = None
+        batch.seq_id = None
+        batch.logits = logits_mask
+
+        status = int(LIB_LLAISYS.llaisysModelDecode(self._model, batch))
+        if status != 0:
+            raise RuntimeError(f"Decode failed with status={status}")
+
+        n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(self._model))
+        if n_outputs <= 0:
+            raise RuntimeError("Decode returned no logits rows")
+
+        logits_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(self._model, c_int32(n_outputs - 1))
+        if not logits_ptr:
+            raise RuntimeError("Failed to get logits row")
+
+        logits = np.ctypeslib.as_array(logits_ptr, shape=(self._meta_info.voc,))
+        next_token = int(np.argmax(logits))
+
         if next_token < 0 or next_token >= self._meta_info.voc:
             raise RuntimeError(f"Invalid token id returned from infer: {next_token}")
         return next_token

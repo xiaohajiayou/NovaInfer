@@ -19,6 +19,32 @@ tensor_t make_tensor(const std::vector<size_t> &shape,
     return Tensor::create(shape, dtype, device_type, device_id);
 }
 
+void copy_row_to_f32(const std::byte *src, llaisysDataType_t dtype, size_t n, float *dst) {
+    switch (dtype) {
+    case LLAISYS_DTYPE_F32: {
+        const float *in = reinterpret_cast<const float *>(src);
+        std::memcpy(dst, in, n * sizeof(float));
+        return;
+    }
+    case LLAISYS_DTYPE_F16: {
+        const llaisys::fp16_t *in = reinterpret_cast<const llaisys::fp16_t *>(src);
+        for (size_t i = 0; i < n; ++i) {
+            dst[i] = llaisys::utils::cast<float>(in[i]);
+        }
+        return;
+    }
+    case LLAISYS_DTYPE_BF16: {
+        const llaisys::bf16_t *in = reinterpret_cast<const llaisys::bf16_t *>(src);
+        for (size_t i = 0; i < n; ++i) {
+            dst[i] = llaisys::utils::cast<float>(in[i]);
+        }
+        return;
+    }
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(dtype);
+    }
+}
+
 } // namespace
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
@@ -375,8 +401,187 @@ int64_t Qwen2Model::infer(int64_t *token_ids, size_t ntoken) {
 
     const int64_t next_token = reinterpret_cast<const int64_t *>(workspace_.argmax_idx->data())[0];
 
+    // Legacy infer path exposes one output row (last token logits).
+    materialize_outputs_(ntoken, nullptr);
     cur_len_ += ntoken;
     return next_token;
+}
+
+bool Qwen2Model::validate_decode_batch_(const LlaisysBatch &batch) const {
+    if (batch.n_tokens <= 0) {
+        return false;
+    }
+    if (batch.embd != nullptr) {
+        return false;
+    }
+    if (batch.token == nullptr) {
+        return false;
+    }
+
+    const size_t ntoken = static_cast<size_t>(batch.n_tokens);
+    for (size_t i = 0; i < ntoken; ++i) {
+        const int32_t nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+        if (nseq != 1) {
+            return false;
+        }
+        if (batch.seq_id != nullptr) {
+            if (batch.seq_id[i] == nullptr) {
+                return false;
+            }
+            if (batch.seq_id[i][0] != 0) {
+                return false;
+            }
+        }
+    }
+
+    if (batch.pos != nullptr) {
+        for (size_t i = 0; i < ntoken; ++i) {
+            const int64_t expected = static_cast<int64_t>(cur_len_ + i);
+            if (batch.pos[i] != expected) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void Qwen2Model::materialize_outputs_(size_t ntoken, const int8_t *logits_mask) {
+    output_ids_.clear();
+    output_logits_f32_.clear();
+
+    if (ntoken == 0) {
+        return;
+    }
+
+    if (logits_mask == nullptr) {
+        output_ids_.push_back(static_cast<int32_t>(ntoken - 1));
+    } else {
+        for (size_t i = 0; i < ntoken; ++i) {
+            if (logits_mask[i] != 0) {
+                output_ids_.push_back(static_cast<int32_t>(i));
+            }
+        }
+    }
+
+    const size_t n_outputs = output_ids_.size();
+    if (n_outputs == 0) {
+        return;
+    }
+
+    const size_t voc = meta_.voc;
+    const size_t row_bytes = voc * utils::dsize(meta_.dtype);
+    const std::byte *all_logits = workspace_.logits->data();
+
+    output_logits_f32_.resize(n_outputs * voc);
+    for (size_t i = 0; i < n_outputs; ++i) {
+        const size_t token_idx = static_cast<size_t>(output_ids_[i]);
+        const std::byte *row = all_logits + token_idx * row_bytes;
+        copy_row_to_f32(row, meta_.dtype, voc, output_logits_f32_.data() + i * voc);
+    }
+}
+
+int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
+    if (!validate_decode_batch_(batch)) {
+        return -1;
+    }
+
+    const size_t ntoken = static_cast<size_t>(batch.n_tokens);
+    if (cur_len_ + ntoken > meta_.maxseq) {
+        return 1;
+    }
+
+    try {
+        infer(batch.token, ntoken);
+        materialize_outputs_(ntoken, batch.logits);
+        return 0;
+    } catch (const std::invalid_argument &) {
+        return -1;
+    } catch (...) {
+        return -2;
+    }
+}
+
+float *Qwen2Model::logits() noexcept {
+    return output_logits_f32_.empty() ? nullptr : output_logits_f32_.data();
+}
+
+float *Qwen2Model::logits_ith(int32_t i) noexcept {
+    if (i < 0 || static_cast<size_t>(i) >= output_ids_.size()) {
+        return nullptr;
+    }
+    return output_logits_f32_.data() + static_cast<size_t>(i) * meta_.voc;
+}
+
+int32_t Qwen2Model::n_outputs() const noexcept {
+    return static_cast<int32_t>(output_ids_.size());
+}
+
+const int32_t *Qwen2Model::output_ids() const noexcept {
+    return output_ids_.empty() ? nullptr : output_ids_.data();
+}
+
+int Qwen2Model::kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
+    if (dst_seq != 0 || src_seq != 0) {
+        return 2;
+    }
+    if (p0 < 0 || p1 < 0 || p0 > p1 || static_cast<size_t>(p1) > cur_len_) {
+        return 3;
+    }
+    if (p0 == p1) {
+        return 4;
+    }
+    return 0;
+}
+
+int Qwen2Model::kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
+    if (seq_id != 0) {
+        return 2;
+    }
+    if (p0 < 0 || p1 < 0 || p0 > p1 || static_cast<size_t>(p1) > cur_len_) {
+        return 3;
+    }
+    if (p0 == p1) {
+        return 4;
+    }
+
+    if (p0 == 0 && static_cast<size_t>(p1) >= cur_len_) {
+        cur_len_ = 0;
+        return 0;
+    }
+    if (static_cast<size_t>(p1) == cur_len_) {
+        cur_len_ = static_cast<size_t>(p0);
+        return 0;
+    }
+
+    return 3;
+}
+
+int Qwen2Model::kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
+    if (seq_id != 0) {
+        return 2;
+    }
+    if (p0 < 0 || p1 < 0 || p0 > p1 || static_cast<size_t>(p1) > cur_len_) {
+        return 3;
+    }
+    if (p0 == p1) {
+        return 4;
+    }
+    if (delta == 0) {
+        return 0;
+    }
+    return 3;
+}
+
+int Qwen2Model::kv_seq_keep(int64_t seq_id) {
+    return seq_id == 0 ? 0 : 2;
+}
+
+int64_t Qwen2Model::kv_seq_pos_max(int64_t seq_id) const noexcept {
+    if (seq_id != 0 || cur_len_ == 0) {
+        return -1;
+    }
+    return static_cast<int64_t>(cur_len_ - 1);
 }
 
 void Qwen2Model::destroy_weights_() {
