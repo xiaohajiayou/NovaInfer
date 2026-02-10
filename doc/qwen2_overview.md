@@ -5,7 +5,65 @@
 1. 基于现有 LLAISYS 的 Qwen2 推理能力，在不破坏当前测试正确性的前提下，完成 Core、Engine、Server、Client 的分层扩展。
 2. 对齐 `doc/qwen2_requirements.md` 中的每条需求，形成可执行的 RFC 级实现指南。
 3. 支持离线与在线统一执行链路，支持多序列并发、连续批处理、流式输出，并为多模型/多设备/分布式预留接口。
-## 2. 源码组织
+
+对齐范围说明：
+
+1. Core 对齐 llama.cpp 语义与接口风格。
+2. 离线编排链路对齐 vLLM/`nano-vllm` 的 `LLM.generate -> engine step` 思路。
+3. Online 仅对齐 vLLM 架构边界与接口语义，不要求阶段0完成全量服务能力。
+## 2. 源码组织与状态
+
+### 2.1 Stage0 当前落地（As-Built）
+
+说明：以下是当前仓库已经落地并通过阶段0测试的实际目录与模块位置。
+
+```
+llaisys/
+├─ include/
+│  └─ llaisys/
+│     ├─ runtime/
+│     │  └─ infer_types.h     # 通用 SoA batch 结构（已落地）
+│     └─ models/
+│        ├─ model.h           # 通用模型 C API（已落地）
+│        └─ qwen2.h           # Qwen2 专有元数据/权重结构（已落地）
+├─ src/
+│  ├─ core/
+│  │  ├─ runtime/             # 现有运行时实现（历史目录）
+│  │  ├─ context/
+│  │  └─ storage/
+│  └─ llaisys/
+│     ├─ model.cc             # 通用模型工厂/路由（含 qwen2 + mock）
+│     ├─ runtime.cc
+│     ├─ tensor.cc
+│     ├─ ops.cc
+│     ├─ runtime/
+│     │  ├─ workspace/        # 已落地：大 buffer + view（Qwen2Workspace）
+│     │  ├─ kv_cache/         # 已落地：KV 元数据管理（KvCache）
+│     │  ├─ output/           # 已落地：logits/output_ids 缓冲（OutputBuffer）
+│     │  └─ weights/          # 已落地：权重槽位生命周期（replace/destroy）
+│     └─ qwen2/
+│        ├─ qwen2_api.cc
+│        ├─ qwen2_model.hpp
+│        └─ qwen2_model.cpp   # 模型专有图执行与算子编排
+├─ python/
+│  └─ llaisys/
+│     ├─ libllaisys/
+│     │  ├─ model.py          # 通用 ctypes 绑定（含 ReplaceWeight）
+│     │  └─ qwen2.py          # Qwen2 专有 ctypes 结构
+│     └─ models/
+│        └─ qwen2.py          # Qwen2 适配器（权重写入走 ReplaceWeight）
+└─ test/
+   └─ test_core_*.py / test_kv_cache.py / test_model_registry.py / test_qwen2_adapter.py
+```
+
+阶段边界（As-Built）：
+
+1. 当前 Python 侧仅落地 `models/qwen2.py` 适配器与通用 ctypes 绑定。
+2. `LLM/LLMEngine/Scheduler/Executor/Worker/AsyncLLMEngine` 仍属于阶段1/2目标设计，尚未落地到源码目录。
+
+### 2.2 目标目录（Target Refactor）
+
+说明：以下为目标态目录。当前阶段0已完成 `runtime/{workspace,kv_cache,output,weights}` 拆分；`runtime/graph` 与 `src/llaisys/models/{model.hpp,model.cpp}` 仍为后续演进项。
 
 ```
 llaisys/
@@ -26,6 +84,9 @@ llaisys/
 │     │  ├─ workspace/
 │     │  │  ├─ workspace.hpp # 通用 Workspace/buffer 管理
 │     │  │  └─ workspace.cpp
+│     │  ├─ output/
+│     │  │  ├─ output.hpp    # 通用 logits/output_ids 缓冲
+│     │  │  └─ output.cpp
 │     │  ├─ graph/
 │     │  │  ├─ graph.hpp     # 通用计算图编排接口
 │     │  │  └─ graph.cpp
@@ -177,7 +238,9 @@ C++ Core
 
 Core 公共实现约束（所有 4.1.x 默认遵循）：
 
-1. 代码落点：`include/llaisys/runtime/infer_types.h`、`include/llaisys/runtime/kv_cache.h`、`include/llaisys/models/model.h`、`include/llaisys/models/qwen2.h`、`src/llaisys/runtime/{weights,workspace,kv_cache,graph}/`、`src/llaisys/models/{model.hpp,model.cpp}`、`src/llaisys/qwen2/qwen2_model.hpp`、`src/llaisys/qwen2/qwen2_model.cpp`、`src/llaisys/qwen2/qwen2_api.cc`、`python/llaisys/libllaisys/model.py`、`python/llaisys/models/qwen2.py`。
+1. 代码落点（双态口径）：
+   - Stage0 As-Built：`include/llaisys/runtime/infer_types.h`、`include/llaisys/models/model.h`、`include/llaisys/models/qwen2.h`、`src/llaisys/model.cc`、`src/llaisys/runtime/{weights,workspace,kv_cache,output}/`、`src/llaisys/qwen2/qwen2_model.hpp`、`src/llaisys/qwen2/qwen2_model.cpp`、`src/llaisys/qwen2/qwen2_api.cc`、`python/llaisys/libllaisys/model.py`、`python/llaisys/models/qwen2.py`。
+   - Target Refactor：`include/llaisys/runtime/kv_cache.h`、`src/llaisys/runtime/graph/`、`src/llaisys/models/{model.hpp,model.cpp}`。
 2. C API 使用纯 C 结构体，不暴露 STL 容器。
 3. Core 统一输入语义为 SoA batch（`token/pos/n_seq_id/seq_id/logits`）。
 4. 阶段0主入口为通用模型 API（`llaisysModel*`），Engine/Server 不依赖模型专用 C API。
@@ -185,22 +248,18 @@ Core 公共实现约束（所有 4.1.x 默认遵循）：
 
 #### 4.1.1 需求 3.1.1：模型权重加载与生命周期
 
-实现设计：
+实现设计（As-Built）：
 
-1. 在 `src/llaisys/runtime/weights/weights.hpp` 定义公共权重容器接口（如 `IWeightStore`），统一管理句柄生命周期与去重释放。
-2. `Qwen2Model` 仅持有 `IWeightStore` 句柄，并通过键名读取权重，不直接管理每个槽位的销毁逻辑。
-3. 覆盖写入保护函数下沉到 `runtime/weights`：
+1. 在 `src/llaisys/runtime/weights/weights.hpp` 提供机制函数：
+   - `replace_slot(llaisysTensor_t *slot, llaisysTensor_t new_handle)`；
+   - `destroy_unique(std::vector<llaisysTensor_t *>)`。
+2. `Qwen2Model::destroy_weights_()` 统一走 `destroy_unique`，避免共享权重 double free。
+3. 通用 C API 增加 `llaisysModelReplaceWeight(model, field_name, layer_idx, new_weight)`，由 `src/llaisys/model.cc` 将字段名路由到 `LlaisysQwen2Weights` 对应槽位，再调用 `replace_slot`。
+4. Python `python/llaisys/models/qwen2.py` 在 `_assign_global/_assign_layer` 中调用 `llaisysModelReplaceWeight`，失败时立即 `tensorDestroy(new_handle)`，避免异常路径泄漏。
 
-```cpp
-void replace_weight_slot(const char *name, llaisysTensor_t new_handle);
-```
+目标演进（Target）：
 
-4. `replace_weight_slot()` 规则：
-   - 同名槽位旧句柄与新句柄相同则直接返回；
-   - 不同句柄则先安全释放旧句柄，再写入新句柄；
-   - 支持共享句柄引用计数或别名去重。
-5. 在 `qwen2_api.cc` 的 create/destroy 错误路径保持 fail-fast，避免跨 C 边界异常泄漏。
-6. Python `python/llaisys/models/qwen2.py` 继续使用 `_detach_tensor_handle()` 转移所有权（作为模型适配器实现）。
+1. 若后续新增第二个模型并出现重复代码，再引入 `IWeightStore` 级别抽象；阶段0不强制。
 
 验收：
 
@@ -209,51 +268,18 @@ void replace_weight_slot(const char *name, llaisysTensor_t new_handle);
 
 #### 4.1.2 需求 3.1.2：中间 buffer 设计与复用
 
-实现设计：
+实现设计（As-Built）：
 
-1. 在 `src/llaisys/runtime/workspace/workspace.hpp` 定义公共 Workspace（arena）接口，采用“一块连续大内存 + offset/view”的模式（对齐 llama.cpp 思路）。
-2. `Qwen2Model` 仅持有 `IWorkspace` 句柄，不直接持有中间 buffer 成员或 `workspace_token_cap_` 这类容量状态。
-3. Workspace 最小接口定义：
+1. 在 `src/llaisys/runtime/workspace/workspace.hpp` 实现 `Qwen2Workspace`：
+   - 一块 `main_arena_`（模型 dtype）；
+   - 一块 `i64_arena_`（pos ids）；
+   - 通过 slice/view 暴露 `hidden/qkv/attn/mlp/logits/k_ctx/v_ctx`。
+2. `Qwen2Model` 只持有 `qwen2_workspace_t` 句柄；每轮 `reserve(ntoken)` grow-only，容量足够时只复用，不重复分配。
+3. 当前未引入 `graph_reserve/can_reuse` 抽象接口；这部分属于 `runtime/graph` 目标演进。
 
-```cpp
-struct WorkspaceView {
-    void *ptr;
-    size_t bytes;
-};
+目标演进（Target）：
 
-class IWorkspace {
-public:
-    virtual bool reserve(size_t bytes, size_t alignment) = 0;  // grow-only
-    virtual WorkspaceView view(size_t offset, size_t bytes) = 0;
-    virtual size_t capacity() const = 0;
-    virtual ~IWorkspace() = default;
-};
-```
-
-4. 图执行前先做一次内存规划（按本轮 `n_tokens` 计算每个中间张量所需字节和 offset），得到 `GraphMemPlan`：
-
-```cpp
-struct BufferSlot {
-    const char *name;
-    size_t offset;
-    size_t bytes;
-};
-
-struct GraphMemPlan {
-    size_t total_bytes;
-    std::vector<BufferSlot> slots;
-};
-```
-
-5. 执行流程固定为：`plan -> reserve(total_bytes) -> view(offset)`。若容量足够则不重新分配，只复用已有 arena。
-6. Worker 单实例复用 Workspace，不做请求级释放；进程退出时统一回收。
-7. 初始化阶段图预留流程（本期）：
-   - 至少执行一次 `graph_reserve(profile=PP)`，完成 prefill 常见形态预留。
-8. `graph_reserve` 的职责是 allocator 语义，不是单纯 build graph：
-   - 重置调度器状态；
-   - 用保守 ubatch 构图；
-   - 否则执行 `reserve/alloc`，把 compute buffers 预留到位。
-9. 对外行为约束：初始化完成后，常见 prefill/decode 形态不应在首轮触发临时扩容。
+1. 当引入第二个模型时，再抽象为通用 `IWorkspace + GraphMemPlan`。
 
 验收：
 
@@ -264,75 +290,18 @@ struct GraphMemPlan {
 
 #### 4.1.3 需求 3.1.3：KV-Cache 设计与多序列支持
 
-实现设计：
+实现设计（As-Built）：
 
-1. 在 `src/llaisys/runtime/kv_cache/kv_cache.hpp` 新增（公共组件，cell 为一等对象）：
+1. 在 `src/llaisys/runtime/kv_cache/kv_cache.hpp` 实现 `KvCache`：
+   - 维护 `seq_id -> pos_to_slot`；
+   - 维护 `free_slots_` 与 `slot_seq_/slot_pos_`；
+   - 提供 `alloc_tokens/seq_slots/seq_cp_prepare/seq_rm/seq_add/seq_keep/seq_pos_max`。
+2. `Qwen2Model` 只持有 `std::unique_ptr<KvCache>`，模型层不再直接持有 `seq_states_/free_slots_` 元数据。
+3. `kv_seq_cp` 由 `KvCache` 先给出 `src_slots/dst_slots`，模型层仅负责按 slots 做每层 K/V tensor 拷贝。
 
-```cpp
-using SeqId = int64_t;
-using Pos = int64_t;
+目标演进（Target）：
 
-struct KvCell {
-    size_t idx;             // physical slot index
-    int64_t pos;
-    uint32_t generation;    // optional: debug/reuse tracking
-    bool used;
-    std::vector<SeqId> seq_ids;  // persistent mapping: cell -> seq set
-};
-
-struct SeqPosStat {
-    SeqId seq_id;
-    Pos pos_min;
-    Pos pos_max;
-    bool active;
-    size_t n_cells;
-};
-
-struct SlotInfo {
-    // token[i] -> cell idxs[i], transient for current ubatch
-    std::vector<size_t> idxs;
-};
-
-struct UBatchView {
-    int32_t n_tokens;
-    const int64_t * token;      // SoA: contiguous token ids
-    const int64_t * pos;        // SoA: contiguous positions (nullable => auto)
-    const int32_t * n_seq_id;   // SoA: per-token number of seq ids
-    int64_t * const * seq_id;   // SoA: per-token seq-id pointer
-    const int8_t * logits;      // SoA: output-row request mask
-};
-
-class IKvCache {
-public:
-    virtual KvStatus find_slots(const UBatchView &ubatch, SlotInfo *out) = 0;
-    virtual KvStatus commit_slots(const UBatchView &ubatch, const SlotInfo &slots) = 0;
-    virtual bool cell_has_seq(size_t idx, SeqId seq_id) const = 0;
-    virtual bool cell_has_any_seq(size_t idx, const SeqId *seq_ids, int32_t n_seq_id) const = 0;
-    virtual Pos cell_pos(size_t idx) const = 0;
-    virtual ~IKvCache() = default;
-};
-```
-
-2. `Qwen2Model` 仅新增 KV 组件句柄（不直接持有 slot 元数据）：
-
-```cpp
-std::shared_ptr<llaisys::runtime::IKvCache> kv_cache_;
-```
-
-3. `init_kv_cache_()` 负责构建 `IKvCache` 实例并注入配置（`maxseq/nlayer/nkvh/dh`），并分配每层 `k_cache/v_cache` 张量（cell 维度等于 `maxseq`）。
-4. slot 分配与序列绑定逻辑放到 `runtime/kv_cache` 内部，不放在 `Qwen2Model`：
-
-```cpp
-KvStatus alloc_or_attach(int64_t seq_id, int64_t pos, size_t *slot_idx);
-KvStatus attach_seq(size_t slot_idx, int64_t seq_id);
-```
-
-5. 明确 KV 元数据不变量（实现里要有断言）：
-   - `idx` 是物理位置，`pos` 是逻辑位置，二者不可混用；
-   - `used == false` 时 `seq_ids` 必须为空；
-   - `seq_pos_stat` 只是统计缓存，必要时可由 `cells` 重建；
-   - 持久映射方向是 `cell -> (seq_ids, pos)`，`seq -> cells` 使用统计或临时扫描，不维护强一致全局反向表；
-   - Core 不实现每个 `seq_id` 的硬性 cell 配额（对齐 llama.cpp），仅管理全局 cell 池。
+1. 若后续引入 `n_seq_id > 1` 的 cell 共享语义，再升级到 `IKvCache + cell<->seq_set` 抽象。
 
 验收：
 
@@ -342,44 +311,16 @@ KvStatus attach_seq(size_t slot_idx, int64_t seq_id);
 
 #### 4.1.4 需求 3.1.4：输出 buffer 管理
 
-实现设计：
+实现设计（As-Built）：
 
-1. 在 `include/llaisys/runtime/infer_types.h` 新增与 llama.cpp 对齐的 SoA batch 结构（所有模型统一复用）：
+1. SoA `LlaisysBatch` 与通用输出查询接口（`GetLogits/GetLogitsIth/NOutputs/OutputIds`）已全部落地。
+2. 在 `src/llaisys/runtime/output/output.hpp` 实现 `OutputBuffer`，统一维护 `logits_f32_` 与 `output_ids_`，并提供 `clear/reserve_rows/append_row`。
+3. `Qwen2Model::decode()` 每轮先 `output_->clear()`，按 `batch.logits` 决定是否 `append_row`，输出契约与接口文档一致。
+4. 采样仍与 Core 解耦：Core 仅产 logits 行，采样在 Engine/上层执行。
 
-```c
-typedef struct LlaisysBatch {
-    int32_t n_tokens;
-    int64_t * token;      // used when embd == NULL
-    float   * embd;       // optional, reserved for embedding/multimodal path
-    int64_t * pos;        // nullable: auto-tracked when NULL
-    int32_t * n_seq_id;   // nullable: default 1 when NULL
-    int64_t ** seq_id;    // nullable: default seq_id=0 when NULL
-    int8_t  * logits;     // output-row mask, 0 means no logits row for this token
-} LlaisysBatch;
-```
+目标演进（Target）：
 
-2. 输出读取改为上下文查询式接口（对齐 llama.cpp），主路径使用通用模型 API：
-
-```c
-float * llaisysModelGetLogits(struct LlaisysModel * model);
-float * llaisysModelGetLogitsIth(struct LlaisysModel * model, int32_t i);
-int32_t llaisysModelNOutputs(struct LlaisysModel * model);
-const int32_t * llaisysModelOutputIds(struct LlaisysModel * model);
-```
-
-3. 模型适配层统一通过 `llaisysModelGetLogits*` 读取输出，不引入模型专用 logits 接口。
-4. 输出契约：logits 行只为 `batch.logits[i] != 0` 的 token 生成，且按 batch 出现顺序紧凑存放。
-5. `batch.logits` 语义是“是否输出该行 logits”，不是“是否必须采样”。
-6. `output_ids[j]` 表示第 `j` 条输出行对应 batch 内哪个 token 索引，便于 Engine 精确回填到序列状态。
-7. 采样与 logits 输出解耦：采样默认在 Engine 执行；Core 仅提供 logits 缓冲查询。
-8. logits/output_ids 存放在 runtime 的连续输出缓冲区（由 workspace/output 组件管理），生命周期至少覆盖到下一次 `Decode()` 调用前。
-9. 增加 `output_reserve(n_outputs)` 语义（对齐 llama.cpp）：
-
-```cpp
-bool output_reserve(int32_t n_outputs);
-```
-
-10. 在每次 `decode()`（以及可选 `encode()`）前先计算本轮 `n_outputs` 并调用 `output_reserve(n_outputs)`，保证输出缓冲区稳定，避免热路径临时扩容。
+1. 若需要进一步对齐 llama.cpp，可补充显式 `output_reserve(n_outputs)` C++ API 并把容量策略开放给 Engine。
 
 验收：
 
@@ -626,9 +567,9 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 
 1. 非法 dtype 输入稳定报错，不出现 silent wrong result。
 
-#### 4.1.16 Core 对齐 llama.cpp 的关键口径
+#### 4.1.16 Core 对齐 llama.cpp 的关键口径（As-Built + Target）
 
-具体落地：
+当前已落地（As-Built）：
 
 1. 输入是 token 列表，不是 `[B,T]`。
 2. batch 输入采用 SoA 连续数组（`token/pos/n_seq_id/seq_id/logits`）。
@@ -636,9 +577,9 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 4. 多序列隔离靠 `seq_id + pos` mask。
 5. 资源不足默认失败，回收依赖显式 `seq_*`。
 6. Core 不做 per-seq 硬配额；请求公平性在 Engine/Server 处理。
-7. Workspace 采用 `graph_reserve + reserve/view`，不是模型内逐 tensor 手工扩容。
-8. 运行期图执行采用 `can_reuse` 优先，必要时 `build+alloc` 重建。
-9. 输出缓冲采用 `output_reserve(n_outputs)`，与采样解耦。
+7. Workspace 采用 runtime 组件 `reserve + view`（已落地）；`graph_reserve` 属于后续 `runtime/graph`。
+8. 运行期图执行目前在模型内组织；`can_reuse/build+alloc` 的统一骨架属于后续 `runtime/graph`。
+9. 输出缓冲已抽到 runtime/output；显式 `output_reserve(n_outputs)` API 为可选增强。
 10. 对外只使用 `LlaisysModel` 通用接口；模型差异通过 `model_type + meta` 处理。
 
 ### 4.2 infer Engine（Python）
@@ -1223,32 +1164,35 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
    +------------------------------- SSE streaming --------------------------------+
 ```
 
-## 6. 未来扩展
+## 6. 交付验收
+### 6.1 阶段 0：
+完成 Core 对齐 llama.cpp 的重构，落地通用多模型 API（`LlaisysModel`），实现完整的runtime能力、多序列推理能力。
+- 兼容例外：为保持 `test/test_infer.py --test`，允许 `python/llaisys/models/qwen2.py:generate()` 临时走内部 argmax（仅离线兼容路径）。
+- 退出条件：进入阶段1前，离线主流程必须切换到 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+- 必须通过此前已有全部测试（包含 `test/test_infer.py --test`）。
+- `test/test_core_decode_batch.py`：验证 SoA batch/decode 路径在单序列场景与多序列场景下的正确性。
+-  `test/test_core_output_api.py`：验证 `GetLogits/GetLogitsIth/NOutputs/OutputIds` 行为一致、行数与 `logits` 标记一致。
+-  `test/test_kv_cache.py`：KV slot/cell 语义、`seq_id + pos` 隔离、`kv_seq_*` 接口行为。
+-  `test/test_core_model_api.py`：通用 `LlaisysModel` 接口（create/decode/logits/kv）行为验证。
+-  `test/test_model_registry.py`：多模型注册与按 `model` 字段路由验证（至少覆盖 qwen2 + 一个 mock 模型）。
+-  `test/test_qwen2_adapter.py`：验证 `python/llaisys/models/qwen2.py` 基于通用 C API 的适配行为。
+-  `test/test_core_parity.py`：与 `transformers` 在 batch+argmax 路径做逐步 next-token 对拍（有本地模型时必跑）。
+### 6.2 阶段 1：
+Engine 内 argmax + offline完整实现。
+- `test/test_offline.py`：离线一致性与流式/非流式行为。
+### 6.3 阶段 2：
+Engine 采样链（top-k/top-p/temperature）+ online完整实现。
+- `test/test_online.py`：在线并发、流式、取消。
+- `test/test_sampling.py`：采样链行为。
+### 6.4 阶段 3：
+连续批处理 + 前缀缓存 + 投机（提升吞吐与时延）。
+- 连续批处理 benchmark：吞吐收益验证。
+### 6.5 全阶段要求：
+接口稳定，主线接口保持 `llaisysModel*` 统一命名与语义。
+全阶段回归要求：新增能力不得破坏通用接口与既有测试基线。
 
-### 6.1 对齐需求 7.x 的分阶段落地
 
-1. 阶段 0：完成 Core 对齐 llama.cpp 的重构（含 batch/ubatch SoA、slot/cell KV、输出接口与图复用基础）并落地通用多模型 API（`LlaisysModel`）；同时通过此前已有全部测试（含 `test/test_infer.py --test`）。
-2. 阶段 1：离线闭环 + argmax（先保证正确性与兼容性）。
-3. 阶段 2：sampling + online（补齐可用性）。
-4. 阶段 3：连续批处理 + 前缀缓存 + 投机（提升吞吐与时延）。
-5. 全阶段要求：接口稳定，主线接口保持 `llaisysModel*` 统一命名与语义。
-
-### 6.2 对齐需求 8.x 的测试与验收
-
-1. 阶段 0 验收门槛：必须通过此前已有全部测试（至少包含 `test/test_infer.py --test`）。
-2. `test/test_core_decode_batch.py`：验证 SoA batch/decode 路径在单序列场景与旧 `infer()` 输出一致。
-3. `test/test_core_output_api.py`：验证 `GetLogits/GetLogitsIth/NOutputs/OutputIds` 行为一致、行数与 `logits` 标记一致。
-4. `test/test_kv_cache.py`：KV slot/cell 语义、`seq_id + pos` 隔离、`kv_seq_*` 接口行为。
-5. `test/test_core_model_api.py`：通用 `LlaisysModel` 接口（create/decode/logits/kv）行为验证。
-6. `test/test_model_registry.py`：多模型注册与按 `model` 字段路由验证（至少覆盖 qwen2 + 一个 mock 模型）。
-7. `test/test_qwen2_adapter.py`：验证 `python/llaisys/models/qwen2.py` 基于通用 C API 的适配行为。
-8. `test/test_offline.py`：离线一致性与流式/非流式行为。
-9. `test/test_online.py`：在线并发、流式、取消。
-10. `test/test_sampling.py`：采样链行为。
-11. 连续批处理 benchmark：吞吐收益验证。
-12. 全阶段回归要求：新增能力不得破坏通用接口与既有测试基线。
-
-### 6.3 暂不考虑（后续再议）
+## 7. 未来扩展 暂不考虑（后续再议）
 
 1. `memory_update -> re-reserve` 自动链路（含内存形态变化后的图重保留策略）。
 2. 完整 `PP -> TG(split_only) -> PP` 三段预留细节。

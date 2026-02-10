@@ -6,6 +6,7 @@ from ctypes import (
     c_int8,
     c_int32,
     c_int64,
+    c_char_p,
     c_void_p,
 )
 from enum import IntEnum
@@ -19,6 +20,7 @@ llaisysModel_t = c_void_p
 class ModelType(IntEnum):
     UNKNOWN = 0
     QWEN2 = 1
+    MOCK = 2
 
 
 class LlaisysBatch(Structure):
@@ -55,6 +57,9 @@ def load_model(lib):
 
     lib.llaisysModelWeights.argtypes = [llaisysModel_t]
     lib.llaisysModelWeights.restype = c_void_p
+
+    lib.llaisysModelReplaceWeight.argtypes = [llaisysModel_t, c_char_p, c_int32, c_void_p]
+    lib.llaisysModelReplaceWeight.restype = c_int
 
     lib.llaisysModelDecode.argtypes = [llaisysModel_t, LlaisysBatch]
     lib.llaisysModelDecode.restype = c_int32

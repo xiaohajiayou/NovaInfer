@@ -3,11 +3,24 @@
 本文档定义阶段0需要落地的 Core 对外接口与结构体。  
 阶段0口径：对外只暴露通用多模型 API（工厂模式）；`qwen2` 仅作为一个 `model_type` 实现。
 
+当前状态说明（As-Built）：
+
+1. 主线接口已切到通用 `llaisysModel*`。
+2. 为阶段0测试引入了 `LLAISYS_MODEL_TYPE_MOCK`（测试路由模型），不影响 `qwen2` 主线接口语义。
+3. `include/llaisys/runtime/kv_cache.h` 属于目标头文件，当前仓库尚未落地该文件；KV 状态码语义目前由 `model.h` 文档约定与实现保持一致。
+4. 已提供 `llaisysModelReplaceWeight`，用于安全替换权重槽位（同句柄 no-op，异句柄先释放旧权重）。
+
+对齐范围说明：
+
+1. 本文档只定义 Core 通用 C API（阶段0主线），不定义 Engine/Server Python 类接口。
+2. 与 vLLM/`nano-vllm` 的对齐主要体现在“Core 返回 logits，采样在上层执行”的职责边界。
+3. online 服务协议（OpenAI API、流式、取消）由 Server 文档约束，不在本接口文档中展开。
+
 ## 1. 头文件边界
 
 1. `include/llaisys/models/model.h`：通用模型接口（唯一主入口）。
 2. `include/llaisys/runtime/infer_types.h`：通用 batch/output 结构。
-3. `include/llaisys/runtime/kv_cache.h`：KV 状态码与通用语义。
+3. `include/llaisys/runtime/kv_cache.h`：KV 状态码与通用语义（目标态，当前未落地）。
 4. `include/llaisys/models/qwen2.h`：Qwen2 专有元数据/权重槽位定义（不包含独立 decode/logits/kv API）。
 
 ## 2. 阶段0公开结构体
@@ -18,6 +31,7 @@
 typedef enum LlaisysModelType {
     LLAISYS_MODEL_TYPE_UNKNOWN = 0,
     LLAISYS_MODEL_TYPE_QWEN2   = 1,
+    LLAISYS_MODEL_TYPE_MOCK    = 2, // stage0 test-only route
 } LlaisysModelType;
 
 typedef struct LlaisysModelCreateParams {
@@ -87,6 +101,11 @@ __export void llaisysModelDestroy(struct LlaisysModel *model);
 __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
 
 __export void *llaisysModelWeights(struct LlaisysModel *model);
+__export int llaisysModelReplaceWeight(
+    struct LlaisysModel *model,
+    const char *field_name,
+    int32_t layer_idx,
+    llaisysTensor_t new_weight);
 
 __export int32_t llaisysModelDecode(
     struct LlaisysModel *model,
@@ -103,7 +122,15 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
 1. 返回模型私有权重槽位表指针（`void *`）。
 2. 调用方先读 `llaisysModelType(model)`，再按类型转换：
    - `LLAISYS_MODEL_TYPE_QWEN2` -> `struct LlaisysQwen2Weights *`。
+   - `LLAISYS_MODEL_TYPE_MOCK` -> `NULL`（无模型专有权重槽位）。
 3. 生命周期与模型句柄一致，调用方不得释放该指针本身。
+
+`llaisysModelReplaceWeight` 语义：
+
+1. 用于通过字段名+层号安全替换槽位句柄，避免直接覆写指针导致泄漏。
+2. 全局槽位（如 `in_embed/out_embed/out_norm_w`）要求 `layer_idx = -1`。
+3. 分层槽位（如 `attn_q_w/mlp_down_w`）要求 `layer_idx` 在 `[0, nlayer)`。
+4. 返回码：`0` 成功，`-1` 参数非法，`-2` 模型类型不支持，`-3` 字段名非法，`-4` 层索引非法。
 
 `Decode` 返回码（阶段0约定）：
 
@@ -112,6 +139,13 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
 3. `2`：执行被中止（保留码）
 4. `-1`：输入参数非法
 5. `< -1`：内部致命错误
+
+`Decode` 与采样职责边界（阶段0约定）：
+
+1. `llaisysModelDecode` 只负责执行计算并产出 logits 行（由 `batch.logits` 与 `output_ids` 描述）。
+2. Core 不执行采样决策（不在 decode 主路径内做 argmax/top-k/top-p/temperature）。
+3. 采样由上层 Engine/Executor 基于 `GetLogitsIth` 返回结果执行。
+4. 阶段0兼容期允许模型适配层临时使用离线路径 argmax（仅用于旧测试兼容），不改变 `decode` 主路径职责。
 
 ### 3.2 通用 Batch 辅助接口
 
@@ -186,13 +220,14 @@ KV 返回码：
 2. `llaisysModelDestroy`
 3. `llaisysModelType`
 4. `llaisysModelWeights`
-5. `llaisysModelDecode`
-6. `llaisysModelGetLogits`
-7. `llaisysModelGetLogitsIth`
-8. `llaisysModelNOutputs`
-9. `llaisysModelOutputIds`
-10. `llaisysModelKvSeqCp/Rm/Add/Keep/PosMax`
-11. `llaisysBatchInit/GetOne/Free`
+5. `llaisysModelReplaceWeight`
+6. `llaisysModelDecode`
+7. `llaisysModelGetLogits`
+8. `llaisysModelGetLogitsIth`
+9. `llaisysModelNOutputs`
+10. `llaisysModelOutputIds`
+11. `llaisysModelKvSeqCp/Rm/Add/Keep/PosMax`
+12. `llaisysBatchInit/GetOne/Free`
 
 模型适配层（`python/llaisys/models/qwen2.py`）通过上述通用接口完成 Qwen2 的权重映射与推理调用，不引入独立的 `qwen2_*` ctypes 主流程。
 

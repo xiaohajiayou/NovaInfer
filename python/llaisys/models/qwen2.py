@@ -227,6 +227,20 @@ class Qwen2:
 
     # -------------------- Weight Loading --------------------
 
+    def _replace_weight_slot(self, field: str, layer_idx: int, handle: c_void_p) -> None:
+        rc = int(
+            LIB_LLAISYS.llaisysModelReplaceWeight(
+                self._model,
+                field.encode("utf-8"),
+                c_int32(layer_idx),
+                handle,
+            )
+        )
+        if rc != 0:
+            # replace failed -> backend did not take ownership, so free the new handle.
+            LIB_LLAISYS.tensorDestroy(handle)
+            raise RuntimeError(f"Failed to replace weight slot field={field} layer={layer_idx} rc={rc}")
+
     def _assign_global(self, field: str, array: np.ndarray) -> None:
         tensor = Tensor(
             shape=array.shape,
@@ -236,10 +250,9 @@ class Qwen2:
         )
         tensor.load(array.ctypes.data_as(c_void_p))
         handle = _detach_tensor_handle(tensor)
-        setattr(self._weights, field, handle)
+        self._replace_weight_slot(field, -1, handle)
 
     def _assign_layer(self, field: str, layer_idx: int, array: np.ndarray) -> None:
-        slots = getattr(self._weights, field)
         tensor = Tensor(
             shape=array.shape,
             dtype=self._meta_info.dtype,
@@ -248,7 +261,7 @@ class Qwen2:
         )
         tensor.load(array.ctypes.data_as(c_void_p))
         handle = _detach_tensor_handle(tensor)
-        slots[layer_idx] = handle
+        self._replace_weight_slot(field, layer_idx, handle)
 
     def _map_and_assign(self, name: str, array: np.ndarray) -> bool:
         if name in _GLOBAL_NAMES:

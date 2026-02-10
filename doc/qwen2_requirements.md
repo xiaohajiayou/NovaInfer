@@ -18,6 +18,12 @@
 2. 在线服务（OpenAI 接口 + 流式）。
 3. 多模型路由（至少支持按 `model` 字段选择实例）。
 
+对齐范围（统一口径）：
+
+1. Core 层按 llama.cpp 语义对齐（SoA batch、`logits/output_ids`、`kv_seq_*`、资源不足失败返回）。
+2. Engine 离线链路按 vLLM/`nano-vllm` 的 `LLM.generate -> engine step` 思路对齐（阶段1落地）。
+3. Online 服务按 vLLM API Server 分层对齐（阶段2落地）；阶段0不要求 online 全链路实现。
+
 ## 2. 分层与责任边界（需求）
 
 1. Server 层：负责对外 API、会话管理、限流、流式输出与在线请求生命周期管理。
@@ -37,6 +43,7 @@
    - KV 序列管理接口。
 2. 支持模型类型枚举（至少包含 `qwen2`），并通过统一入口创建模型实例。
 3. 对外主线仅保留通用模型 C API；`qwen2` 专用包装若存在仅作为迁移期可选项，不纳入主线验收。
+4. 需提供通用权重槽位安全替换能力（`llaisysModelReplaceWeight`），用于避免重复赋值时句柄泄漏。
 
 ### 3.2 内存与资源管理
 
@@ -63,64 +70,88 @@
 5. 常用算子：embedding、linear、rms_norm、rope、self_attention、swiglu、argmax。
 6. 算子支持常见 dtype 并具备一致性检查。
 
-## 4. Engine 层需求（Python）
+## 4. Engine 层需求（Python，严格对齐 vLLM）
 
-### 4.1 Scheduler
+### 4.1 LLM / AsyncLLM（入口层）
 
-1. 维护请求队列与调度策略（prefill/decode 混排）。
-2. 组 batch/ubatch，并控制每轮执行的 token 集合。
+1. 提供统一入口：离线 `LLM.generate` 与在线异步入口（`AsyncLLM`）。
+2. 接收 `SamplingParams`（top-k/top-p/temperature/max_new_tokens/stop）。
+3. 将请求标准化后提交到 EngineClient，不直接执行模型前向与采样算法。
+4. 返回值语义为“已采样完成”的输出（token/text/finish_reason），而非裸 logits。
+
+### 4.2 EngineClient（客户端层）
+
+1. 负责入口层与 EngineCore（`LLMEngine`）之间的调用封装。
+2. 支持同进程直连与可切换 IPC/RPC 形态（后续多进程部署）。
+3. 负责请求提交、结果拉取、流式回传、取消信号透传。
+
+### 4.3 LLMEngine / EngineCore（核心编排层）
+
+1. 维护请求生命周期状态机（queued/running/finished/cancelled/failed）。
+2. 驱动 step 循环：每轮 `Scheduler -> Executor`，直到请求结束。
+3. 维护每请求/每序列状态（token 进度、停止条件、KV 句柄、统计信息）。
+4. 负责多模型路由配置下发（选择模型实例，但不写模型专有逻辑）。
+
+### 4.4 Scheduler
+
+1. 维护请求队列与公平调度策略（prefill/decode 混排）。
+2. 组 batch/ubatch，并控制每轮执行 token 集合与并发窗口。
 3. 支持连续批处理与多序列并发。
-4. 自回归驱动：支持 prompt prefill 与 decode 循环；支持 max_new_tokens、stop token、stop string；支持流式输出回调与 UTF-8 拼接。
-5. 负责请求级公平调度与上下文配额（例如轮转策略、每请求最大上下文/增量 token 限制）。
+4. 负责请求级上下文配额与增量 token 配额（防止单请求长期占用）。
+5. 仅产出执行计划，不直接做模型前向或采样。
 
-### 4.2 Executor
+### 4.5 Executor（执行协调层）
 
-1. 接收调度计划并组织执行。
-2. 负责与 Worker 协作，驱动模型执行并收集结果。
+1. 接收 Scheduler 计划并组织一次 step 的执行。
+2. 协调 Worker 执行模型前向，收集 `logits + output_ids`。
+3. 触发执行侧采样链（阶段1 argmax，阶段2 top-k/top-p/temperature）。
+4. 触发停止条件判断（max_new_tokens/eos/stop token/stop string）。
 
-### 4.3 Worker
+### 4.6 Worker（执行单元）
 
-1. 负责实例化模型适配器（`python/llaisys/models/*.py`）并执行推理。
-2. 支持多设备扩展的接口预留（单机多卡 TP 为后续阶段目标），Core 提供多设备内存接口支持。
-3. 支持多模型实例池（至少可按 `model_type` 选择对应适配器）。
+1. 实例化并持有模型适配器（`python/llaisys/models/*.py`）与 Core 句柄。
+2. 执行模型前向（decode/prefill），返回当前 step 的 logits 行。
+3. 仅执行计算，不负责调度策略、停止条件决策与请求生命周期管理。
+4. 采样可在 Worker/Executor 执行侧完成（对齐 vLLM“执行侧采样”口径），但入口层与 ModelRunner 不参与采样决策。
+5. 支持多设备扩展预留（单机多卡 TP 为后续目标）。
 
-### 4.4 模型适配层（models）
+### 4.7 Sampler + OutputProcessor（执行侧采样 + 引擎侧结果组织）
+
+1. Sampler 基于 logits 与 SamplingParams 产出下一 token；采样决策在执行侧（Worker/Executor），不在入口层。
+2. OutputProcessor 在 EngineCore 结果聚合路径执行：将 sampled token 增量转为文本增量并维护 UTF-8 拼接正确性。
+3. OutputProcessor 统一组织输出对象（token/text/finish_reason/usage），在线流式与离线非流式复用同一语义。
+4. 执行侧与结果组织侧边界固定：执行侧产出 token 增量，EngineCore 负责请求级输出拼装。
+
+### 4.8 模型适配层（models）
 
 1. 模型文件解析：支持 HuggingFace 目录结构，读取 config/tokenizer。
-2. 权重加载：支持单文件或分片 safetensors；负责 HF 权重名到 Core 权重槽位的映射与校验。
-3. Tokenizer：支持 AutoTokenizer、Qwen2 chat template 与特殊 token（bos/eos/pad/system/user/assistant）。
-4. 采样参数透传至采样模块（采样策略由 Engine 层控制）。
+2. 权重加载：支持单文件或分片 safetensors；负责 HF 权重名到 Core 权重槽位映射与校验。
+3. Tokenizer：支持 AutoTokenizer、Qwen2 chat template 与特殊 token。
+4. 仅负责模型适配与前向调用，不承担调度、采样策略决策与请求状态管理。
 
-### 4.5 模型选择与加载（阶段0必须）
+### 4.9 模型选择与加载
 
 1. Engine 初始化时必须明确模型类型与模型路径。
-2. 阶段0要求：在架构上支持多模型路由；实现上至少提供 `qwen2`，并允许注册新增模型而不修改 Engine 主流程。
-3. 模型实例化与权重加载在 Worker 层完成，Engine 负责配置与路由。
+2. 架构上支持多模型路由；当前至少提供 `qwen2`，可新增注册项不改 Engine 主流程。
+3. 模型实例化与权重加载在 Worker 层完成；Engine 负责配置与路由编排。
 
-## 5. Server 层需求（Python，按 vLLM 分层）
+## 5. Server 层需求（Python，对齐 vLLM API Server）
 
 ### 5.1 API Server
 
-1. API 协议：提供 HTTP 服务接口与 OpenAI 兼容 API，覆盖 completions/chat/completions/embeddings 等基础路由。
-2. 流式输出：支持 SSE/流式返回，保证 token 级增量输出与正确的结束语义。
-3. 请求取消：支持主动取消与超时取消，确保释放对应请求与 KV-Cache 资源。
-4. 会话管理：单用户会话、多用户并发；会话内多轮对话上下文可复用。
-5. 隔离与限流：请求级隔离、并发限制、排队上限与背压策略。
-6. 可选增加用户/会话级 token budget，防止单用户长期占用资源。
-7. 日志与错误：提供请求级日志与错误码，关键失败信息可追踪。
+1. 提供 HTTP 服务接口与 OpenAI 兼容 API（completions/chat/completions/embeddings 基础路由）。
+2. 支持 SSE 流式输出，保证 token 级增量语义与正确结束信号。
+3. 支持请求取消（主动取消与超时取消），并将取消信号透传给 Engine。
+4. 支持会话管理（单用户会话、多用户并发、会话上下文复用）。
+5. 提供隔离与限流（并发上限、排队上限、背压策略）。
+6. 提供请求日志与错误码，关键失败可追踪。
 
-### 5.2 AsyncLLMEngine
+### 5.2 Server 与 Engine 对接边界
 
-1. 异步入口：接收 API Server 请求并异步提交到 LLMEngine。
-2. 流式转发：将增量 token 结果以流式方式回传给 API Server。
-3. 请求生命周期：维护请求状态（排队/执行/结束/取消）与结果聚合。
-
-### 5.3 LLMEngine
-
-1. 调度协作：驱动 Scheduler 进行 prefill/decode 混排与 batch/ubatch 组装。
-2. 执行协作：协调 Executor/Worker 进行模型执行并回收结果。
-3. 多模型路由：基于 `model` 字段选择模型类型与实例（阶段0必须可扩展，不得写死在 Engine 主流程）。
-4. 监控指标：提供吞吐、延迟、KV-Cache 使用率、CPU/GPU 资源与内存统计。
+1. 调用链固定为：`API Server -> AsyncLLM -> EngineClient -> LLMEngine(EngineCore)`。
+2. Server 仅负责协议适配、鉴权/限流、流式转发；不负责调度、模型前向或采样。
+3. Engine 返回统一输出对象（token/text/finish_reason/usage），Server 负责序列化为 OpenAI 响应格式。
+4. 监控口径分层：Server 暴露 API 级指标；Engine 暴露调度与执行级指标（吞吐/延迟/KV/资源占用）。
 
 ## 6. Web UI（模块需求）
 
@@ -145,10 +176,19 @@
 ## 7. 设计约束与阶段落地
 
 1. 阶段 0：完成 Core 对齐 llama.cpp 的重构，并完成通用多模型接口抽象（统一 `LlaisysModel` 主线接口）。
-2. 阶段 1：优先保证离线推理闭环与 argmax 验证。
-3. 阶段 2：加入 sampling 与在线推理能力。
-4. 阶段 3：连续批处理、前缀缓存与投机解码。
-5. 任何阶段必须保持接口稳定，不影响已有推理流程。
+2. 阶段 0 兼容例外：为保持 `test/test_infer.py --test`，允许 `ModelRunner.generate()` 临时使用内部 argmax，但该路径仅用于离线兼容，不作为长期主路径。
+3. 阶段 0 退出条件：进入阶段1前，离线主流程必须切换为 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+4. 阶段 1：优先保证离线推理闭环与 Engine 内 argmax 验证（Core 仅返回 logits）。
+5. 阶段 2：在 Engine 层扩展 sampling（top-k/top-p/temperature）与在线推理能力。
+6. 阶段 3：连续批处理、前缀缓存与投机解码。
+7. 任何阶段必须保持接口稳定，不影响已有推理流程。
+
+### 7.1 阶段0当前完成度口径（As-Built）
+
+1. 已完成（功能闭环）：通用 `LlaisysModel` 主线接口、多序列 SoA decode、`kv_seq_*`、`GetLogits*` 输出接口、`qwen2 + mock` 路由、阶段0核心测试脚本。
+2. 已完成（Core 目录重构）：`workspace/kv_cache/output/weights` 已拆分到 `src/llaisys/runtime/`，`qwen2_model.cpp` 仅保留模型专有执行逻辑与算子编排。
+3. 已完成（权重槽位安全替换）：提供 `llaisysModelReplaceWeight`，模型适配层通过统一 API 写入权重槽位，避免重复赋值泄漏。
+4. 未完成：阶段1要求的 Engine 离线主链路 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 
 ## 8. 验收标准
 
@@ -160,3 +200,8 @@
 6. 增加 `test_online.py`：验证支持多用户并发与流式输出。
 7. 增加 `test_sampling.py`：验证采样策略可配置且行为一致。
 8. 增加连续批处理的测试，验证连续批处理可显著提升吞吐。
+
+### 8.1 当前验收状态（更新于阶段0收敛后）
+
+1. 阶段0验收通过（含 `run_stage0_tests.sh` 全量与 parity 对拍）。
+2. 下一里程碑为阶段1（Engine 离线闭环），不再新增阶段0范围内的结构性改动。

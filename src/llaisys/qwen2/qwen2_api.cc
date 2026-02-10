@@ -83,16 +83,4 @@ __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen
     return nullptr;
 }
 
-__export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
-    try {
-        CHECK_ARGUMENT(model != nullptr && model->impl != nullptr, "Qwen2: model must not be null");
-        return model->impl->model->infer(token_ids, ntoken);
-    } catch (const std::exception &e) {
-        fail_fast("llaisysQwen2ModelInfer", e);
-    } catch (...) {
-        fail_fast_unknown("llaisysQwen2ModelInfer");
-    }
-    return 0;
-}
-
 } // extern "C"

@@ -8,6 +8,7 @@ __C {
     typedef enum LlaisysModelType {
         LLAISYS_MODEL_TYPE_UNKNOWN = 0,
         LLAISYS_MODEL_TYPE_QWEN2 = 1,
+        LLAISYS_MODEL_TYPE_MOCK = 2,
     } LlaisysModelType;
 
     struct LlaisysModelCreateParams {
@@ -25,6 +26,16 @@ __C {
     __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
 
     __export void *llaisysModelWeights(struct LlaisysModel *model);
+    // Safely replace one weight slot:
+    //  0 success
+    // -1 invalid input
+    // -2 unsupported model type
+    // -3 unknown field name
+    // -4 invalid layer index for per-layer field
+    __export int llaisysModelReplaceWeight(struct LlaisysModel *model,
+                                           const char *field_name,
+                                           int32_t layer_idx,
+                                           llaisysTensor_t new_weight);
 
     // Return codes:
     //  0  success
