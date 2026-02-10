@@ -217,6 +217,8 @@ class Qwen2:
         self._weights: LlaisysQwen2Weights = self._weights_ptr.contents
 
         self._np_dtype = _datatype_to_numpy_dtype(meta.dtype)
+        self._offline_engine = None
+        self._tokenizer = None
 
         self._load_safetensors()
 
@@ -298,36 +300,104 @@ class Qwen2:
 
     # -------------------- Inference --------------------
 
-    def _infer(self, token_ids: Sequence[int]) -> int:
+    @property
+    def max_seq_len(self) -> int:
+        return int(self._meta_info.maxseq)
+
+    @property
+    def end_token_id(self) -> int:
+        return int(self._meta_info.end_token)
+
+    def _get_tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
+        return self._tokenizer
+
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        tokenizer = self._get_tokenizer()
+        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+    def decode_batch(
+        self,
+        token_ids: Sequence[int],
+        pos_ids: Optional[Sequence[int]] = None,
+        seq_ids: Optional[Sequence[int]] = None,
+        logits_mask: Optional[Sequence[int]] = None,
+    ):
         if not token_ids:
             raise ValueError("token_ids must be non-empty")
         n_tokens = len(token_ids)
+
         token_buf = (c_int64 * n_tokens)(*[int(t) for t in token_ids])
-        logits_mask = (c_int8 * n_tokens)()
-        logits_mask[n_tokens - 1] = 1
+        pos_buf = None
+        if pos_ids is not None:
+            if len(pos_ids) != n_tokens:
+                raise ValueError("pos_ids length mismatch")
+            pos_buf = (c_int64 * n_tokens)(*[int(p) for p in pos_ids])
+
+        if logits_mask is None:
+            logits_mask = [0] * n_tokens
+            logits_mask[-1] = 1
+        if len(logits_mask) != n_tokens:
+            raise ValueError("logits_mask length mismatch")
+        logits_buf = (c_int8 * n_tokens)(*[int(x) for x in logits_mask])
+
+        n_seq_buf = None
+        seq_ptr_buf = None
+        seq_rows = None
+        if seq_ids is not None:
+            if len(seq_ids) != n_tokens:
+                raise ValueError("seq_ids length mismatch")
+            n_seq_buf = (c_int32 * n_tokens)()
+            seq_ptr_buf = (POINTER(c_int64) * n_tokens)()
+            seq_rows = []
+            for i, sid in enumerate(seq_ids):
+                row = (c_int64 * 1)(int(sid))
+                seq_rows.append(row)
+                n_seq_buf[i] = 1
+                seq_ptr_buf[i] = row
 
         batch = LlaisysBatch()
         batch.n_tokens = c_int32(n_tokens)
         batch.token = token_buf
         batch.embd = None
-        batch.pos = None
-        batch.n_seq_id = None
-        batch.seq_id = None
-        batch.logits = logits_mask
+        batch.pos = pos_buf
+        batch.n_seq_id = n_seq_buf
+        batch.seq_id = seq_ptr_buf
+        batch.logits = logits_buf
 
         status = int(LIB_LLAISYS.llaisysModelDecode(self._model, batch))
         if status != 0:
             raise RuntimeError(f"Decode failed with status={status}")
 
         n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(self._model))
-        if n_outputs <= 0:
+        if n_outputs < 0:
+            raise RuntimeError("Decode returned invalid output row count")
+        if n_outputs == 0:
+            return [], []
+
+        output_ids_ptr = LIB_LLAISYS.llaisysModelOutputIds(self._model)
+        if not output_ids_ptr:
+            raise RuntimeError("Decode returned outputs without output_ids")
+        output_ids = np.ctypeslib.as_array(output_ids_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
+
+        logits_rows = []
+        for i in range(n_outputs):
+            logits_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(self._model, c_int32(i))
+            if not logits_ptr:
+                raise RuntimeError(f"Failed to get logits row: {i}")
+            row = np.ctypeslib.as_array(logits_ptr, shape=(self._meta_info.voc,))
+            logits_rows.append(np.array(row, copy=True))
+
+        return output_ids, logits_rows
+
+    def _infer(self, token_ids: Sequence[int]) -> int:
+        _, logits_rows = self.decode_batch(token_ids=token_ids)
+        if not logits_rows:
             raise RuntimeError("Decode returned no logits rows")
-
-        logits_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(self._model, c_int32(n_outputs - 1))
-        if not logits_ptr:
-            raise RuntimeError("Failed to get logits row")
-
-        logits = np.ctypeslib.as_array(logits_ptr, shape=(self._meta_info.voc,))
+        logits = logits_rows[-1]
         next_token = int(np.argmax(logits))
 
         if next_token < 0 or next_token >= self._meta_info.voc:
@@ -341,34 +411,23 @@ class Qwen2:
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
+        stop_token_ids: Optional[Sequence[int]] = None,
+        stop: Optional[Sequence[str]] = None,
     ) -> Sequence[int]:
-        # Sampling knobs are accepted for interface compatibility; the backend currently uses argmax.
-        _ = (top_k, top_p, temperature)
+        # Stage-1: route offline generation through LLMEngine chain.
+        from ..engine.llm_engine import LLMEngine
+        from ..engine.types import SamplingParams
 
-        tokens = [int(t) for t in inputs]
-        if not tokens:
-            return tokens
+        if self._offline_engine is None:
+            self._offline_engine = LLMEngine(model_runner=self)
 
-        if len(tokens) > self._meta_info.maxseq:
-            raise ValueError("Prompt length exceeds maxseq")
-
-        remaining = self._meta_info.maxseq - len(tokens)
-        if remaining <= 0:
-            return tokens
-
-        max_new = remaining if max_new_tokens is None else min(int(max_new_tokens), remaining)
-        if max_new <= 0:
-            return tokens
-
-        next_token = self._infer(tokens)
-        tokens.append(next_token)
-        if next_token == self._meta_info.end_token:
-            return tokens
-
-        for _ in range(max_new - 1):
-            next_token = self._infer([tokens[-1]])
-            tokens.append(next_token)
-            if next_token == self._meta_info.end_token:
-                break
-
-        return tokens
+        sampling_params = SamplingParams(
+            max_new_tokens=max_new_tokens,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+            stop_token_ids=tuple(stop_token_ids or ()),
+            stop=tuple(stop or ()),
+        )
+        result = self._offline_engine.generate(inputs=inputs, sampling_params=sampling_params)
+        return result.token_ids

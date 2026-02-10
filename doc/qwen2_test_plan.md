@@ -31,7 +31,7 @@
 8. `test/test_core_parity.py`：与 `transformers` 做 batch+argmax 逐步对拍（有本地模型时必跑）。
 
 阶段 0 特殊约束：
-1. 允许 `ModelRunner.generate()` 临时使用内部 argmax，仅用于 `test_infer` 兼容。
+1. `test/test_infer.py` 定义为 ModelRunner 级对拍：走 `decode_batch + argmax`，不经过 Engine。
 2. 不允许在 Core `decode` 主路径内做采样决策（Core 只产 logits）。
 
 ### 2.2 阶段 1（offline + Engine 内 argmax）
@@ -39,10 +39,16 @@
 必须通过：
 1. 阶段 0 全量用例。
 2. `test/test_offline.py`：离线生成一致性、流式/非流式行为。
+3. `test/test_llm_entrypoint.py`：`LLM.generate/stream` 入口契约（token兼容、prompt/prompts、batch params）。
+4. `test/test_engine_state_machine.py`：状态流转（`waiting -> running -> finished_*`）与异常路径。
+5. `test/test_engine_model_registry.py`：新增模型注册不修改 Engine 主流程。
+6. `test/test_offline_parity.py`：Engine 离线链路与 `transformers` 对拍（single + multi-seq，需本地模型）。
 
 新增约束：
 1. 离线主流程必须切到 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 2. 采样在 Engine 执行（argmax），Core 继续只返回 logits。
+3. `waiting_for_remote_kvs/preempted` 若未激活，需在文档标注为“预留状态”。
+4. 即便做同进程瘦身实现，也必须保留 `submit/step/cancel`、状态机、`Scheduler -> Worker` 与统一输出结构的测试可见性。
 
 ### 2.3 阶段 2（Engine 采样链 + online）
 
@@ -74,11 +80,11 @@
 
 1. 权重映射完整性（必须权重缺失时报错）。
 2. 通用接口调用链可用：`llaisysModelCreate -> llaisysModelDecode -> GetLogitsIth`。
-3. 离线 `generate()` 在固定种子/参数下可复现。
+3. `decode_batch + argmax` 在固定参数下与 `transformers` next-token 对拍一致。
 
 ### 3.3 Engine/Server 用例（阶段 1/2）
 
-1. 请求状态流转：`queued -> running -> finished/cancelled/failed`。
+1. 请求状态流转：`waiting -> running -> finished_*`（覆盖 `finished_stopped / finished_length_capped / finished_aborted / finished_ignored`），并预留 `waiting_for_remote_kvs / preempted`。
 2. 采样策略切换生效（argmax 与 top-k/top-p 温度）。
 3. 流式输出分片可拼接，stop 条件一致。
 4. 取消请求后 KV 资源释放。
@@ -104,6 +110,7 @@ pytest -q test/test_kv_cache.py
 pytest -q test/test_qwen2_adapter.py
 pytest -q test/test_model_registry.py
 python test/test_core_parity.py --model /path/to/local/model
+python test/test_offline_parity.py --model /path/to/local/model --test
 ```
 
 在线与采样（阶段 2 起）：

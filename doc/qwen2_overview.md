@@ -58,8 +58,9 @@ llaisys/
 
 阶段边界（As-Built）：
 
-1. 当前 Python 侧仅落地 `models/qwen2.py` 适配器与通用 ctypes 绑定。
-2. `LLM/LLMEngine/Scheduler/Executor/Worker/AsyncLLMEngine` 仍属于阶段1/2目标设计，尚未落地到源码目录。
+1. Python 侧已落地离线主链路：`LLM -> EngineClient -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+2. 已落地状态机与统一输出结构（含 `finish_reason/status/usage`），并支持离线 `stream()`。
+3. 在线专属组件（`AsyncLLMEngine/API Server`）仍属于阶段2目标，当前仅保留接口分层约束。
 
 ### 2.2 目标目录（Target Refactor）
 
@@ -608,11 +609,14 @@ Engine 公共实现约束：
 
 ```python
 class RequestStatus(Enum):
-    QUEUED = "queued"
+    WAITING = "waiting"
+    WAITING_FOR_REMOTE_KVS = "waiting_for_remote_kvs"
     RUNNING = "running"
-    FINISHED = "finished"
-    CANCELLED = "cancelled"
-    FAILED = "failed"
+    PREEMPTED = "preempted"
+    FINISHED_STOPPED = "finished_stopped"
+    FINISHED_LENGTH_CAPPED = "finished_length_capped"
+    FINISHED_ABORTED = "finished_aborted"
+    FINISHED_IGNORED = "finished_ignored"
 ```
 
 2. `LLMEngine` 维护 `requests: dict[str, Request]` 和 `active_seq_ids: set[int]`。
@@ -914,7 +918,7 @@ Server 公共实现约束：
 
 验收：
 
-1. 取消后请求状态转为 `cancelled` 且停止推送。
+1. 取消后请求状态转为 `finished_aborted` 且停止推送。
 
 #### 4.3.4 需求 5.1.4：会话管理
 
@@ -1167,7 +1171,7 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 ## 6. 交付验收
 ### 6.1 阶段 0：
 完成 Core 对齐 llama.cpp 的重构，落地通用多模型 API（`LlaisysModel`），实现完整的runtime能力、多序列推理能力。
-- 兼容例外：为保持 `test/test_infer.py --test`，允许 `python/llaisys/models/qwen2.py:generate()` 临时走内部 argmax（仅离线兼容路径）。
+- `test/test_infer.py --test` 定义为 ModelRunner 级对拍（`decode_batch + argmax` 对齐 `transformers`），不经过 Engine 层。
 - 退出条件：进入阶段1前，离线主流程必须切换到 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 - 必须通过此前已有全部测试（包含 `test/test_infer.py --test`）。
 - `test/test_core_decode_batch.py`：验证 SoA batch/decode 路径在单序列场景与多序列场景下的正确性。
@@ -1180,6 +1184,34 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 ### 6.2 阶段 1：
 Engine 内 argmax + offline完整实现。
 - `test/test_offline.py`：离线一致性与流式/非流式行为。
+- `test/test_llm_entrypoint.py`：`LLM` 入口契约（token兼容、prompt/prompts、batch params、stream）。
+- `test/test_offline_parity.py`：Engine 离线链路与 `transformers` 对拍（single + multi-seq，有本地模型时执行）。
+
+阶段1实现原则（瘦实现，不瘦边界）：
+
+1. 允许把 `EngineClient/OutputProcessor` 等类在同进程场景合并到 `LLMEngine`，减少代码层级与样板。
+2. 不允许删除以下在线前置契约：`submit/step/cancel` 语义、请求状态机、`Scheduler -> Worker` 边界、统一输出结构。
+3. 阶段1以离线可交付为目标，online 专属能力可延后到阶段2，但接口语义必须提前保留。
+
+阶段1剩余工作清单（用于评审裁剪）：
+
+- 必做（建议纳入阶段1验收）：
+  - `LLM.generate` 离线接口收口：支持 `prompt/prompts + SamplingParams`，不只接受 token ids。
+  - Engine 请求循环收口：从“单次 generate 内部直跑”升级为 `submit -> step -> collect` 的统一离线执行路径。
+  - 停止条件补齐：在 `eos/max_new_tokens/stop_token_ids` 基础上增加 `stop string`（含 UTF-8 增量拼接语义）。
+  - 输出对象补齐：`token_ids/text/finish_reason/status/usage` 一致返回，离线与后续在线复用同一结构。
+  - 状态机落地一致性：`waiting/running/finished_*` 在主路径可观测，`waiting_for_remote_kvs/preempted` 明确为“预留但未激活”或补最小触发逻辑。
+  - 阶段1回归闭环：`test_offline + test_llm_entrypoint + test_engine_state_machine + test_engine_model_registry` 固定执行；有模型时追加 `test_offline_parity`。
+
+- 可选（可推迟到阶段2）：
+  - 离线批量 prompts 的高层接口（多请求统一 submit/step 复用）。
+  - 无（当前代码已提供离线 `stream()` 迭代器，返回 token/text 增量与结束信号）。
+
+阶段1完成判定（建议）：
+
+1. 离线主入口统一为 `LLM -> EngineClient -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+2. Core 仍只返回 `logits/output_ids`，采样不下沉到 Core。
+3. 状态机与输出对象在离线场景可稳定复现并有测试覆盖。
 ### 6.3 阶段 2：
 Engine 采样链（top-k/top-p/temperature）+ online完整实现。
 - `test/test_online.py`：在线并发、流式、取消。

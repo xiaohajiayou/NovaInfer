@@ -87,7 +87,7 @@
 
 ### 4.3 LLMEngine / EngineCore（核心编排层）
 
-1. 维护请求生命周期状态机（queued/running/finished/cancelled/failed）。
+1. 维护请求生命周期状态机（对齐 vLLM 风格）：`waiting / waiting_for_remote_kvs / running / preempted / finished_stopped / finished_length_capped / finished_aborted / finished_ignored`。
 2. 驱动 step 循环：每轮 `Scheduler -> Executor`，直到请求结束。
 3. 维护每请求/每序列状态（token 进度、停止条件、KV 句柄、统计信息）。
 4. 负责多模型路由配置下发（选择模型实例，但不写模型专有逻辑）。
@@ -176,9 +176,12 @@
 ## 7. 设计约束与阶段落地
 
 1. 阶段 0：完成 Core 对齐 llama.cpp 的重构，并完成通用多模型接口抽象（统一 `LlaisysModel` 主线接口）。
-2. 阶段 0 兼容例外：为保持 `test/test_infer.py --test`，允许 `ModelRunner.generate()` 临时使用内部 argmax，但该路径仅用于离线兼容，不作为长期主路径。
+2. 阶段 0 对拍口径：`test/test_infer.py --test` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
 3. 阶段 0 退出条件：进入阶段1前，离线主流程必须切换为 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 4. 阶段 1：优先保证离线推理闭环与 Engine 内 argmax 验证（Core 仅返回 logits）。
+   - 阶段1建议最小交付：`LLM.generate`（prompt入口）+ Engine 状态机主路径 + stop string + 统一输出对象（含 finish_reason/status/usage）。
+   - `waiting_for_remote_kvs/preempted` 可作为预留状态，但需在文档中明确“未激活”。
+   - 允许实现瘦身（同进程合并类），但不得移除 `submit/step/cancel` 语义、请求状态机、`Scheduler -> Worker` 边界与统一输出结构。
 5. 阶段 2：在 Engine 层扩展 sampling（top-k/top-p/temperature）与在线推理能力。
 6. 阶段 3：连续批处理、前缀缓存与投机解码。
 7. 任何阶段必须保持接口稳定，不影响已有推理流程。
@@ -188,7 +191,7 @@
 1. 已完成（功能闭环）：通用 `LlaisysModel` 主线接口、多序列 SoA decode、`kv_seq_*`、`GetLogits*` 输出接口、`qwen2 + mock` 路由、阶段0核心测试脚本。
 2. 已完成（Core 目录重构）：`workspace/kv_cache/output/weights` 已拆分到 `src/llaisys/runtime/`，`qwen2_model.cpp` 仅保留模型专有执行逻辑与算子编排。
 3. 已完成（权重槽位安全替换）：提供 `llaisysModelReplaceWeight`，模型适配层通过统一 API 写入权重槽位，避免重复赋值泄漏。
-4. 未完成：阶段1要求的 Engine 离线主链路 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+4. 已完成（阶段1离线主链路）：`LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core` 已落地并通过离线回归测试。
 
 ## 8. 验收标准
 
@@ -196,10 +199,11 @@
 2. 增加 `test_core_model_api.py`：验证通用模型接口 create/decode/logits/kv 行为。
 3. 增加 `test_qwen2_adapter.py`：验证 `python/llaisys/models/qwen2.py` 基于通用接口可完成权重映射与推理调用。
 4. 增加 `test_kv_cache.py`：验证 KV-Cache 管理与 slot 映射工作稳定，无泄漏。
-5. 增加 `test_offline.py`：验证离线推理结果可复现且与参考实现一致。
-6. 增加 `test_online.py`：验证支持多用户并发与流式输出。
-7. 增加 `test_sampling.py`：验证采样策略可配置且行为一致。
-8. 增加连续批处理的测试，验证连续批处理可显著提升吞吐。
+5. 增加 `test_offline.py`：验证 Engine 级离线行为（状态机、stop、stream、usage）可复现。
+6. 增加 `test_offline_parity.py`：验证 Engine 离线链路与 `transformers` 对拍一致。
+7. 增加 `test_online.py`：验证支持多用户并发与流式输出。
+8. 增加 `test_sampling.py`：验证采样策略可配置且行为一致。
+9. 增加连续批处理的测试，验证连续批处理可显著提升吞吐。
 
 ### 8.1 当前验收状态（更新于阶段0收敛后）
 

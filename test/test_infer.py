@@ -8,6 +8,7 @@ from huggingface_hub import snapshot_download
 import os
 import time
 import llaisys
+import numpy as np
 import sys
 import io
 
@@ -54,29 +55,52 @@ def hf_infer(
     return outputs[0].tolist(), result
 
 
-def load_llaisys_model(model_path, device_name):
-    model = llaisys.models.Qwen2(model_path, llaisys_device(device_name))
-    return model
+def load_llaisys_model_runner(model_path, device_name):
+    model_runner = llaisys.models.Qwen2(
+        model_path=model_path,
+        device=llaisys_device(device_name),
+    )
+    return model_runner
 
 
-def llaisys_infer(
-    prompt, tokenizer, model, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
+def llaisys_model_runner_infer(
+    prompt,
+    tokenizer,
+    model_runner,
+    max_new_tokens=128,
+    top_p=0.8,
+    top_k=50,
+    temperature=0.8,
 ):
+    _ = (top_p, top_k, temperature)
     input_content = tokenizer.apply_chat_template(
         conversation=[{"role": "user", "content": prompt}],
         add_generation_prompt=True,
         tokenize=False,
     )
-    inputs = tokenizer.encode(input_content)
-    outputs = model.generate(
-        inputs,
-        max_new_tokens=max_new_tokens,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-    )
+    input_tokens = tokenizer.encode(input_content)
+    output_tokens = [int(t) for t in input_tokens]
 
-    return outputs, tokenizer.decode(outputs, skip_special_tokens=True)
+    _, logits_rows = model_runner.decode_batch(token_ids=input_tokens)
+    if not logits_rows:
+        raise RuntimeError("ModelRunner prefill returned no logits")
+
+    next_token = int(np.argmax(logits_rows[-1]))
+    output_tokens.append(next_token)
+
+    for _ in range(max(0, int(max_new_tokens) - 1)):
+        if next_token == int(model_runner.end_token_id):
+            break
+        _, logits_rows = model_runner.decode_batch(token_ids=[next_token])
+        if not logits_rows:
+            raise RuntimeError("ModelRunner decode returned no logits")
+        next_token = int(np.argmax(logits_rows[-1]))
+        output_tokens.append(next_token)
+        if next_token == int(model_runner.end_token_id):
+            break
+
+    output = tokenizer.decode(output_tokens, skip_special_tokens=True)
+    return output_tokens, output
 
 
 if __name__ == "__main__":
@@ -98,9 +122,8 @@ if __name__ == "__main__":
 
     tokenizer, model, model_path = load_hf_model(args.model, args.device)
 
-    # Example prompt
     start_time = time.time()
-    tokens, output = hf_infer(
+    hf_tokens, hf_output = hf_infer(
         args.prompt,
         tokenizer,
         model,
@@ -114,36 +137,35 @@ if __name__ == "__main__":
     del model
     gc.collect()
 
-    print("\n=== Answer ===\n")
+    print("\n=== HF Answer ===\n")
     print("Tokens:")
-    print(tokens)
+    print(hf_tokens)
     print("\nContents:")
-    print(output)
+    print(hf_output)
     print("\n")
     print(f"Time elapsed: {(end_time - start_time):.2f}s\n")
 
-    model = load_llaisys_model(model_path, args.device)
+    model_runner = load_llaisys_model_runner(model_path, args.device)
     start_time = time.time()
-    llaisys_tokens, llaisys_output = llaisys_infer(
+    mr_tokens, mr_output = llaisys_model_runner_infer(
         args.prompt,
         tokenizer,
-        model,
+        model_runner,
         max_new_tokens=args.max_steps,
         top_p=top_p,
         top_k=top_k,
         temperature=temperature,
     )
-
     end_time = time.time()
 
-    print("\n=== Your Result ===\n")
+    print("\n=== ModelRunner Result ===\n")
     print("Tokens:")
-    print(llaisys_tokens)
+    print(mr_tokens)
     print("\nContents:")
-    print(llaisys_output)
+    print(mr_output)
     print("\n")
     print(f"Time elapsed: {(end_time - start_time):.2f}s\n")
 
     if args.test:
-        assert llaisys_tokens == tokens
+        assert mr_tokens == hf_tokens
         print("\033[92mTest passed!\033[0m\n")
