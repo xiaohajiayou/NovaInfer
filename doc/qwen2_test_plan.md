@@ -56,6 +56,11 @@
 1. 阶段 1 全量用例。
 2. `test/test_sampling.py`：top-k/top-p/temperature 行为。
 3. `test/test_online.py`：在线并发、流式、取消、错误码。
+4. `test/test_online_stream_isolation.py`：并发流式下 request_id 隔离（DummyRunner）。
+5. `test/test_online_real_model_multisession.py`：真实模型并发流式不串线（需本地模型）。
+
+说明：
+1. 未提供 `--model-path` 时，`requires_model` 用例会自动 skip，不影响无模型环境的快速回归。
 
 ### 2.4 阶段 3（连续批处理 + 前缀缓存 + 投机）
 
@@ -91,32 +96,48 @@
 
 ## 4. 执行方式
 
-推荐脚本（阶段0）：
+统一入口（推荐）：
 ```bash
-./test/run_stage0_tests.sh python /path/to/local/model
+python scripts/run_tests.py --suite all
 ```
 
-说明：
-1. `run_stage0_tests.sh` 默认 `RUN_PARITY=auto`，当传入模型路径时会自动跑 `test_core_parity.py`。
-2. 若仅做快速回归可设 `RUN_PARITY=0`。
+底层测试执行器：`pytest`。`scripts/run_tests.py` 仅负责按阶段和策略拼装 pytest 命令。
 
-基础命令（按阶段执行）：
+统一入口参数说明：
+1. `--suite {stage0,stage1,stage2,all}`：选择执行阶段。
+2. `--model-path /path/to/local/model`：提供本地模型路径（用于 parity/HF 相关测试）。
+3. `--run-parity {auto,always,never}`：parity 策略。
+4. `--run-hf {auto,always,never}`：阶段0中 HF 依赖测试（`test_infer.py`）策略。
+
+推荐命令：
 ```bash
-pytest -q test/test_infer.py
-pytest -q test/test_core_model_api.py
-pytest -q test/test_core_decode_batch.py
-pytest -q test/test_core_output_api.py
-pytest -q test/test_kv_cache.py
-pytest -q test/test_qwen2_adapter.py
-pytest -q test/test_model_registry.py
-python test/test_core_parity.py --model /path/to/local/model
-python test/test_offline_parity.py --model /path/to/local/model --test
+# 快速回归（不跑 parity，不跑 HF 依赖）
+python scripts/run_tests.py --suite all --run-parity never --run-hf never
+
+# 阶段0（带本地模型，自动跑 parity/HF）
+python scripts/run_tests.py --suite stage0 --model-path /path/to/local/model --run-parity auto --run-hf auto
+
+# 阶段1（带本地模型，自动跑 offline parity）
+python scripts/run_tests.py --suite stage1 --model-path /path/to/local/model --run-parity auto
+
+# 阶段2（sampling + online）
+python scripts/run_tests.py --suite stage2
 ```
+
+测试编排统一入口：
+1. `scripts/run_tests.py`（唯一入口）。
 
 在线与采样（阶段 2 起）：
 ```bash
 pytest -q test/test_sampling.py
 pytest -q test/test_online.py
+pytest -q test/test_online_stream_isolation.py
+pytest -q test/test_online_real_model_multisession.py --model-path /path/to/local/model
+```
+
+直接全量 pytest（可选）：
+```bash
+PYTHONPATH=python python -m pytest -q
 ```
 
 ## 5. 环境与复现要求
@@ -132,14 +153,27 @@ pytest -q test/test_online.py
 2. 无 blocker 级缺陷（崩溃、错误返回码、跨序列污染、输出错行）。
 3. 阶段新增能力不破坏前一阶段基线测试。
 
-### 6.1 当前状态（阶段0收敛后）
+### 6.1 当前状态（阶段2收敛后）
 
 1. 阶段0已通过全量测试与 parity 对拍。
-2. 后续回归默认从 `run_stage0_tests.sh` 开始，失败再下钻单测。
+2. 阶段1已通过离线全量测试；有模型路径时通过 `test_offline_parity.py` 对拍。
+3. 阶段2核心能力已落地：采样链、在线接口、SSE、取消、多会话并发隔离回归。
+4. 后续回归默认从 `scripts/run_tests.py` 开始，失败再下钻单测。
+5. 下一重点为阶段3吞吐优化（连续批处理、前缀缓存、投机）。
 
-## 7. 回归规则
+## 7. 实施问题复盘（阶段2）
+
+1. 问题：流式接口偶发缺少最后 `is_finished=true` 终止块。
+2. 解决：在 `AsyncLLMEngine.stream` 的超时分支补发终止 chunk，并加回归测试。
+3. 问题：多线程真实模型并发下出现段错误（析构路径）。
+4. 解决：显式 `close` 链 + C++ `Context` 生命周期修正（初始化、引用语义、跨线程析构风险规避）。
+5. 问题：并发首请求 Tokenizer 初始化偶发异常。
+6. 解决：Tokenizer 延迟初始化加锁，Worker 增加编码/解码降级路径。
+
+## 8. 回归规则
 
 1. 改动 `src/llaisys/model.cc` 或 `include/llaisys/models/model.h`：重跑阶段 0 全量 Core API 用例。
 2. 改动 `src/llaisys/qwen2/qwen2_model.*`：重跑 Core API + KV + infer 基线。
 3. 改动 `python/llaisys/models/qwen2.py`：重跑 adapter + infer/offline。
 4. 改动 `engine/server`：重跑 offline/online/sampling 对应用例。
+5. 改动 `scripts/run_tests.py`：至少重跑 `--suite stage0 --run-parity never --run-hf never` 与 `--suite stage1 --run-parity never`。

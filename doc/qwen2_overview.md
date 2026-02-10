@@ -60,7 +60,27 @@ llaisys/
 
 1. Python 侧已落地离线主链路：`LLM -> EngineClient -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 2. 已落地状态机与统一输出结构（含 `finish_reason/status/usage`），并支持离线 `stream()`。
-3. 在线专属组件（`AsyncLLMEngine/API Server`）仍属于阶段2目标，当前仅保留接口分层约束。
+3. 在线专属组件已落地：`AsyncLLMEngine + OpenAIServer + HTTPServer + WebUI`，并已接入阶段2回归测试。
+
+### 2.1.1 Stage2 当前落地（As-Built）
+
+说明：以下是阶段2新增且已在源码落地的关键模块。
+
+1. Server：
+   - `python/llaisys/server/async_engine.py`
+   - `python/llaisys/server/openai_server.py`
+   - `python/llaisys/server/http_server.py`
+   - `python/llaisys/server/schemas.py`
+   - `python/llaisys/server/__main__.py`
+2. Sampling：
+   - `python/llaisys/engine/sampling.py`（argmax/top-k/top-p/temperature）
+3. 并发与流式隔离回归：
+   - `test/test_online_stream_isolation.py`
+   - `test/test_online_real_model_multisession.py`
+4. WebUI：
+   - `webui/index.html`
+   - `webui/app.js`
+   - `webui/styles.css`
 
 ### 2.2 目标目录（Target Refactor）
 
@@ -1187,38 +1207,36 @@ Engine 内 argmax + offline完整实现。
 - `test/test_llm_entrypoint.py`：`LLM` 入口契约（token兼容、prompt/prompts、batch params、stream）。
 - `test/test_offline_parity.py`：Engine 离线链路与 `transformers` 对拍（single + multi-seq，有本地模型时执行）。
 
-阶段1实现原则（瘦实现，不瘦边界）：
+阶段1实现原则（已落地，作为约束保留）：
 
 1. 允许把 `EngineClient/OutputProcessor` 等类在同进程场景合并到 `LLMEngine`，减少代码层级与样板。
 2. 不允许删除以下在线前置契约：`submit/step/cancel` 语义、请求状态机、`Scheduler -> Worker` 边界、统一输出结构。
 3. 阶段1以离线可交付为目标，online 专属能力可延后到阶段2，但接口语义必须提前保留。
 
-阶段1剩余工作清单（用于评审裁剪）：
-
-- 必做（建议纳入阶段1验收）：
-  - `LLM.generate` 离线接口收口：支持 `prompt/prompts + SamplingParams`，不只接受 token ids。
-  - Engine 请求循环收口：从“单次 generate 内部直跑”升级为 `submit -> step -> collect` 的统一离线执行路径。
-  - 停止条件补齐：在 `eos/max_new_tokens/stop_token_ids` 基础上增加 `stop string`（含 UTF-8 增量拼接语义）。
-  - 输出对象补齐：`token_ids/text/finish_reason/status/usage` 一致返回，离线与后续在线复用同一结构。
-  - 状态机落地一致性：`waiting/running/finished_*` 在主路径可观测，`waiting_for_remote_kvs/preempted` 明确为“预留但未激活”或补最小触发逻辑。
-  - 阶段1回归闭环：`test_offline + test_llm_entrypoint + test_engine_state_machine + test_engine_model_registry` 固定执行；有模型时追加 `test_offline_parity`。
-
-- 可选（可推迟到阶段2）：
-  - 离线批量 prompts 的高层接口（多请求统一 submit/step 复用）。
-  - 无（当前代码已提供离线 `stream()` 迭代器，返回 token/text 增量与结束信号）。
-
-阶段1完成判定（建议）：
+阶段1完成判定（已满足）：
 
 1. 离线主入口统一为 `LLM -> EngineClient -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 2. Core 仍只返回 `logits/output_ids`，采样不下沉到 Core。
 3. 状态机与输出对象在离线场景可稳定复现并有测试覆盖。
-### 6.3 阶段 2：
-Engine 采样链（top-k/top-p/temperature）+ online完整实现。
-- `test/test_online.py`：在线并发、流式、取消。
-- `test/test_sampling.py`：采样链行为。
-### 6.4 阶段 3：
-连续批处理 + 前缀缓存 + 投机（提升吞吐与时延）。
+4. 阶段1回归闭环已稳定：`test_offline + test_llm_entrypoint + test_engine_state_machine + test_engine_model_registry`；有模型时追加 `test_offline_parity`。
+### 6.3 阶段 2（整体功能闭环）：
+当前状态：阶段2核心功能已落地并通过回归（以当前源码为准）。
+- Engine 采样链：`top-k/top-p/temperature` 已实现。
+- online 完整最小闭环：HTTP/OpenAI 兼容入口、SSE 流式、取消请求已实现。
+- Web UI 最小可用：多会话、流式展示、取消、调试面板已实现。
+- 端到端路径已打通：`WebUI -> Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+- 阶段2验收测试（As-Built）：
+  - `test/test_sampling.py`
+  - `test/test_online.py`
+  - `test/test_online_http.py`
+  - `test/test_online_stream_isolation.py`
+  - `test/test_online_real_model_multisession.py`（需本地模型）
+### 6.4 阶段 3（性能优化）：
+在阶段2整体功能稳定后，再做吞吐/时延优化。
+- 连续批处理 + 前缀缓存 + 投机（提升吞吐与时延）。
 - 连续批处理 benchmark：吞吐收益验证。
+- 前缀缓存命中率与收益验证。
+- 投机解码回退正确性与收益验证。
 ### 6.5 全阶段要求：
 接口稳定，主线接口保持 `llaisysModel*` 统一命名与语义。
 全阶段回归要求：新增能力不得破坏通用接口与既有测试基线。
@@ -1228,3 +1246,52 @@ Engine 采样链（top-k/top-p/temperature）+ online完整实现。
 
 1. `memory_update -> re-reserve` 自动链路（含内存形态变化后的图重保留策略）。
 2. 完整 `PP -> TG(split_only) -> PP` 三段预留细节。
+
+## 8. 阶段2复盘（问题与修复）
+
+### 8.1 问题：流式终止包偶发缺失
+
+现象：
+
+1. 某些请求流最后没有 `is_finished=true`，前端只能等 `[DONE]` 或超时。
+
+修复：
+
+1. 在 `AsyncLLMEngine.stream` 超时分支发现请求已完成时，主动补发终止 chunk。
+2. 增加在线流式隔离与终止语义回归测试。
+
+### 8.2 问题：多线程并发场景下 Segmentation fault
+
+现象：
+
+1. 真实模型并发流式测试中，创建或释放模型阶段出现段错误。
+
+修复：
+
+1. Python 侧引入显式 `close()` 链路，不再依赖 `__del__` 进行 native destroy。
+2. C++ `Context` 修复：
+   - `_current_runtime` 显式初始化；
+   - `setDevice` 使用引用语义；
+   - `context()` 改为线程局部常驻对象，避免线程退出析构导致 Runtime 悬挂引用。
+
+说明：
+
+1. 当前策略优先稳定性，代价是每线程一个有界常驻 Context；后续可在阶段3前做可回收重构。
+
+### 8.3 问题：并发首请求 Tokenizer 初始化异常
+
+现象：
+
+1. 并发首请求时，`AutoTokenizer` 导入/初始化偶发失败。
+
+修复：
+
+1. Qwen2 tokenizer 延迟初始化加锁。
+2. Worker 增加编码/解码异常降级路径，避免请求直接失败。
+
+## 9. 后续优化路线（阶段3）
+
+1. 采样参数从“同 ubatch 统一”升级为“每请求独立采样”。
+2. 在不改接口前提下加强连续批处理策略与吞吐优化。
+3. 引入前缀缓存命中与回退机制，并补齐命中率/收益指标。
+4. 抽象统一 metrics 导出接口（QPS、TTFT、TPOT、队列长度、KV占用）。

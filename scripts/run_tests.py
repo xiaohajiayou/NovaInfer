@@ -34,6 +34,8 @@ STAGE2_PYTEST_FILES = [
     "test/test_sampling.py",
     "test/test_online.py",
     "test/test_online_http.py",
+    "test/test_online_stream_isolation.py",
+    "test/test_online_real_model_multisession.py",
 ]
 
 

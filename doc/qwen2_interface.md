@@ -1,4 +1,4 @@
-# Qwen2 接口设计（阶段0，多模型统一接口版）
+# Qwen2 接口设计（阶段0~2，多模型统一接口版）
 
 本文档定义阶段0需要落地的 Core 对外接口与结构体。  
 阶段0口径：对外只暴露通用多模型 API（工厂模式）；`qwen2` 仅作为一个 `model_type` 实现。
@@ -247,3 +247,67 @@ KV 返回码：
 
 1. `memory_update -> re-reserve` 自动链路相关公开接口。
 2. 完整 `PP -> TG(split_only) -> PP` 三段预留策略开关或参数。
+
+## 9. 阶段2 Python/Server 接口契约（As-Built）
+
+说明：
+
+1. 本节为当前源码已实现的 Python 层接口，用于 offline/online 集成。
+2. Core 主线仍是 `llaisysModel*`，本节不替代 C API，只补“上层如何调用”。
+
+### 9.1 Engine 入口（Python）
+
+关键类与方法：
+
+1. `python/llaisys/entrypoints/llm.py`
+   - `LLM.generate(...)`
+   - `LLM.stream(...)`
+   - `LLM.submit(...) / LLM.step() / LLM.collect(...) / LLM.cancel(...)`
+   - `LLM.close()`
+2. `python/llaisys/server/async_engine.py`
+   - `AsyncLLMEngine.submit(...) / collect(...) / cancel(...)`
+   - `AsyncLLMEngine.stream(...) / generate(...)`
+   - `AsyncLLMEngine.is_finished(...) / get_request_status(...)`
+   - `AsyncLLMEngine.close()`
+
+约束：
+
+1. `LLMEngine.step()` 当前支持单步多请求合批执行（continuous batching 基础形态）。
+2. 同一 ubatch 当前使用统一采样参数；每请求独立采样参数为后续增强项。
+
+### 9.2 OpenAI 兼容服务接口（Python）
+
+服务入口：
+
+1. `python -m llaisys.server --model-path ... --device cpu --host 127.0.0.1 --port 8000 [--verbose]`
+
+HTTP 路由（As-Built）：
+
+1. `GET /health`
+2. `POST /v1/chat/completions`
+3. `POST /v1/requests/{request_id}/cancel`
+
+流式协议：
+
+1. SSE `data: {json}\n\n`
+2. 结束标记 `data: [DONE]\n\n`
+3. chunk 关键字段：`request_id`、`token_id`、`is_finished`、`choices[0].delta.content`
+
+### 9.3 WebUI 对接接口（As-Built）
+
+1. WebUI 作为静态站点运行：`python -m http.server 8081 -d webui`。
+2. 前端请求固定调用 `POST /v1/chat/completions`（`stream=true`）。
+3. 支持多会话切换、流式渲染、取消请求与调试日志输出。
+
+## 10. 生命周期与并发契约（阶段2补充）
+
+1. 模型与引擎对象应显式 `close()`，避免依赖 `__del__` 触发 native 资源释放。
+2. 推荐关闭顺序：`HTTPServer.stop() -> OpenAIServer.close() -> AsyncLLMEngine.close() -> LLMEngine.close() -> Worker.close() -> ModelRunner.close()`。
+3. `Qwen2` tokenizer 为延迟初始化并带锁，允许并发请求下安全首用。
+4. 若 tokenizer 初始化失败，Worker 会走降级编码路径，保证请求不会因导入异常直接中断。
+
+## 11. 已知差异与后续接口计划
+
+1. 目前 OpenAI 路由仅覆盖 chat-completions，`/v1/completions` 与 embeddings 为后续扩展。
+2. `sampling_params` 目前是请求级；同批不同请求采样参数并行应用未完全落地。
+3. 监控接口当前以日志为主，标准 metrics 导出接口（Prometheus 等）为下一步。

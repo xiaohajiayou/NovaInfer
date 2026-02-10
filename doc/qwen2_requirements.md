@@ -179,7 +179,7 @@
 2. 阶段 0 对拍口径：`test/test_infer.py --test` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
 3. 阶段 0 退出条件：进入阶段1前，离线主流程必须切换为 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 4. 阶段 1：优先保证离线推理闭环与 Engine 内 argmax 验证（Core 仅返回 logits）。
-   - 阶段1建议最小交付：`LLM.generate`（prompt入口）+ Engine 状态机主路径 + stop string + 统一输出对象（含 finish_reason/status/usage）。
+   - 阶段1已完成口径：`LLM.generate`（prompt入口）+ Engine 状态机主路径 + stop string + 统一输出对象（含 finish_reason/status/usage）。
    - `waiting_for_remote_kvs/preempted` 可作为预留状态，但需在文档中明确“未激活”。
    - 允许实现瘦身（同进程合并类），但不得移除 `submit/step/cancel` 语义、请求状态机、`Scheduler -> Worker` 边界与统一输出结构。
 5. 阶段 2：在 Engine 层扩展 sampling（top-k/top-p/temperature）与在线推理能力。
@@ -205,7 +205,66 @@
 8. 增加 `test_sampling.py`：验证采样策略可配置且行为一致。
 9. 增加连续批处理的测试，验证连续批处理可显著提升吞吐。
 
-### 8.1 当前验收状态（更新于阶段0收敛后）
+### 8.1 当前验收状态（更新于阶段2收敛后）
 
-1. 阶段0验收通过（含 `run_stage0_tests.sh` 全量与 parity 对拍）。
-2. 下一里程碑为阶段1（Engine 离线闭环），不再新增阶段0范围内的结构性改动。
+1. 阶段0验收通过（含 `scripts/run_tests.py --suite stage0` 全量与 parity 对拍）。
+2. 阶段1验收通过（`scripts/run_tests.py --suite stage1`；有模型时追加 `test_offline_parity`）。
+3. 阶段2核心功能闭环已完成（sampling + online + WebUI 多会话基础能力）。
+4. 阶段3进入前提：阶段2并发稳定性回归长期通过，线上接口语义冻结。
+
+### 8.2 阶段2验收标准（As-Built）
+
+必须满足：
+
+1. `test/test_sampling.py` 通过：`argmax/top-k/top-p/temperature` 行为正确。
+2. `test/test_online.py` 通过：non-stream/stream/cancel/concurrent 行为正确。
+3. `test/test_online_http.py` 通过或在受限环境下被合理 skip（socket bind 限制）。
+4. `test/test_online_stream_isolation.py` 通过：双流并发不串 `request_id`。
+5. `test/test_online_real_model_multisession.py` 在本地模型下通过：真实模型并发流式不串线。
+6. WebUI 可执行最小闭环：多会话创建、切换、流式渲染、取消请求。
+
+## 9. 实施问题与解决方案（阶段2）
+
+### 9.1 流式终止包丢失
+
+问题：
+
+1. 某些请求流在 `stream timeout + collect(done)` 路径直接返回，未输出 `is_finished=true` 终止块。
+
+方案：
+
+1. 在 `AsyncLLMEngine.stream` 超时分支补发终止 chunk。
+2. 增加并发流式隔离与终止语义回归测试。
+
+### 9.2 多会话并发时崩溃（Segmentation fault）
+
+问题：
+
+1. Python `__del__` 中直接 `llaisysModelDestroy`，GC 时机不稳定导致 native 崩溃。
+2. C++ `Context` 生命周期与多线程 `Runtime&` 引用存在悬挂风险。
+3. `Context::_current_runtime` 未初始化，`setDevice` 中运行时容器曾出现按值拷贝导致状态不一致。
+
+方案：
+
+1. 引入显式 `close` 链：`AsyncLLMEngine -> LLMEngine -> Worker -> Qwen2`。
+2. `Qwen2.__del__` 不再做 native destroy，改为显式关闭路径管理。
+3. 修复 C++ `Context` 初始化与 `setDevice` 引用语义。
+4. `context()` 调整为线程局部常驻对象，规避线程退出析构导致的 Runtime 悬挂（当前阶段接受该有界泄漏换稳定性）。
+
+### 9.3 并发首请求 Tokenizer 初始化异常
+
+问题：
+
+1. 并发首请求时，Tokenizer 延迟初始化可能触发导入/初始化竞态。
+
+方案：
+
+1. `Qwen2` tokenizer 初始化加锁。
+2. `Worker.encode_chat_messages/decode_tokens` 增加异常降级路径，确保请求不中断。
+
+## 10. 下一阶段优化路线（阶段3前）
+
+1. 把当前“同批共用采样参数”升级为“每请求独立采样参数”。
+2. 落地连续批处理吞吐优化与 benchmark 体系。
+3. 补齐前缀缓存命中与回退路径测试。
+4. 再评估 `context()` 常驻策略，收敛为可验证、可回收的跨线程 Runtime 生命周期管理。
