@@ -1,6 +1,6 @@
 import llaisys
 import torch
-from test_utils import *
+from test.test_utils import *
 import argparse
 
 
@@ -17,12 +17,12 @@ def test_basic_runtime_api(device_name: str = "cpu"):
     for i in range(ndev):
         print("Testing device {i}...")
         api.set_device(i)
-        test_memcpy(api, 1024 * 1024)
+        _check_memcpy(api, 1024 * 1024)
 
         print("     Passed")
 
 
-def test_memcpy(api, size_bytes: int):
+def _check_memcpy(api, size_bytes: int):
     a = torch.zeros((size_bytes,), dtype=torch.uint8, device=torch_device("cpu"))
     b = torch.ones_like(a)
     device_a = api.malloc_device(size_bytes)

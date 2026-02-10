@@ -6,7 +6,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
 import llaisys
 import torch
-from test_utils import random_tensor, check_equal, benchmark, zero_tensor
+from test.test_utils import random_tensor, check_equal, benchmark, zero_tensor
 
 
 def torch_argmax(max_idx, max_val, vals):

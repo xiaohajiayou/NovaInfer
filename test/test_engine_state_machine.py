@@ -1,12 +1,9 @@
-import io
-import sys
 
 import numpy as np
 
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import RequestStatus, SamplingParams
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 class DummyRunner:

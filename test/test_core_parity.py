@@ -1,18 +1,15 @@
-import argparse
-import io
-import sys
-import time
-from ctypes import POINTER, c_int32, c_int64, c_int8
+from __future__ import annotations
+
+from ctypes import POINTER, c_int8, c_int32, c_int64
 
 import numpy as np
+import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
 from llaisys.libllaisys.model import LlaisysBatch
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 def _torch_device(device_name: str):
@@ -27,14 +24,6 @@ def _argmax_and_top5_from_numpy(row: np.ndarray):
     token = int(np.argmax(row))
     top5 = np.argsort(row)[-5:][::-1].astype(np.int64).tolist()
     return token, top5
-
-
-def _argmax_and_top5_from_torch(row: torch.Tensor):
-    token = int(torch.argmax(row).item())
-    top5 = torch.topk(row, k=5, dim=-1).indices.detach().cpu().to(torch.int64).tolist()
-    return token, top5
-
-
 
 
 def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask):
@@ -68,7 +57,11 @@ def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask):
     n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(model_handle))
     if n_outputs == 0:
         return [], []
-    output_ids = np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model_handle), shape=(n_outputs,)).astype(np.int64).tolist()
+    output_ids = (
+        np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model_handle), shape=(n_outputs,))
+        .astype(np.int64)
+        .tolist()
+    )
     logits_rows = []
     for i in range(n_outputs):
         ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(model_handle, c_int32(i))
@@ -154,12 +147,9 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
         out_ids, out_rows = _decode_batch(handle, btok, bseq, bpos, blogits)
         for ridx, bidx in enumerate(out_ids):
             row = np.ctypeslib.as_array(out_rows[ridx], shape=(vocab,))
-            tok, top5 = _argmax_and_top5_from_numpy(row)
+            tok, _ = _argmax_and_top5_from_numpy(row)
             generated[bidx].append(tok)
-            traces[bidx].append(top5)
-
-    return generated, traces
-
+    return generated
 
 
 def _build_prompt_to_token_ids(tokenizer, prompts):
@@ -173,89 +163,31 @@ def _build_prompt_to_token_ids(tokenizer, prompts):
         prompt_ids.append(tokenizer.encode(text))
     return prompt_ids
 
-def _build_token_to_ids_text(tokenizer, token_ids):
-    texts = []
-    for ids in token_ids:
-        text = tokenizer.decode(ids)
-        texts.append(text)
-    return texts
 
-def _run_parity_case(case_name, hf_model, tokenizer, model_path, max_new_tokens, prompts):
-    prompt_ids = _build_prompt_to_token_ids(tokenizer, prompts)
-
-    t0 = time.time()
-    hf_tokens = _hf_generate_batch(hf_model, prompt_ids, max_new_tokens)
-    t1 = time.time()
-
-    llaisys_model = llaisys.models.Qwen2(model_path, llaisys.DeviceType.CPU)
-    t2 = time.time()
-    ll_tokens, ll_trace = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens)
-    t3 = time.time()
-
-    ok = True
-    for i in range(len(prompts)):
-        for step in range(max_new_tokens):
-            if hf_tokens[i][step] != ll_tokens[i][step]:
-                ok = False
-                print(
-                    f"[mismatch][{case_name}] seq={i} step={step} expected={hf_tokens[i][step]} got={ll_tokens[i][step]} "
-                    f"ll_top5={ll_trace[i][step]}"
-                )
-
-    if not ok:
-        raise AssertionError(f"core parity check failed: {case_name}")
-    
-    hf_tokens = _build_token_to_ids_text(tokenizer, hf_tokens)
-    ll_tokens = _build_token_to_ids_text(tokenizer, ll_tokens)
-    for i in range(len(prompts)):
-        print(f"[parity][{case_name}] hf_ref_tokens for seq_{i}: {hf_tokens[i]}")
-        print(f"[parity][{case_name}] our_token_ans for seq_{i}: {ll_tokens[i]}")
-
-    print(
-        f"[parity][{case_name}] passed "
-        f"(hf={t1 - t0:.2f}s, llaisys_init={t2 - t1:.2f}s, llaisys_decode={t3 - t2:.2f}s)"
-    )
-    
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, type=str)
-    parser.add_argument("--device", default="cpu", choices=["cpu"], type=str)
-    parser.add_argument("--max_new_tokens", default=5, type=int)
-    parser.add_argument("--case", default="all", choices=["single", "multi", "all"], type=str)
-    args = parser.parse_args()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+@pytest.mark.requires_model
+@pytest.mark.requires_hf
+@pytest.mark.parity
+@pytest.mark.parametrize(
+    "prompts",
+    [
+        ["Who are you?"],
+        ["Who are you?", "Explain KV cache in one sentence."],
+    ],
+)
+def test_core_parity(require_model_path, prompts):
+    tokenizer = AutoTokenizer.from_pretrained(require_model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
-    hf_model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, trust_remote_code=True)
-    hf_model.to(_torch_device(args.device))
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        require_model_path, torch_dtype=torch.bfloat16, trust_remote_code=True
+    )
+    hf_model.to(_torch_device("cpu"))
     if hf_model.generation_config.pad_token_id is None:
         hf_model.generation_config.pad_token_id = hf_model.generation_config.eos_token_id
     hf_model.eval()
 
-    if args.case in ("single", "all"):
-        _run_parity_case(
-            case_name="single-seq",
-            hf_model=hf_model,
-            tokenizer=tokenizer,
-            model_path=args.model,
-            max_new_tokens=args.max_new_tokens,
-            prompts=["Who are you?"],
-        )
+    prompt_ids = _build_prompt_to_token_ids(tokenizer, prompts)
+    hf_tokens = _hf_generate_batch(hf_model, prompt_ids, max_new_tokens=5)
 
-    if args.case in ("multi", "all"):
-        _run_parity_case(
-            case_name="multi-seq-interleaved",
-            hf_model=hf_model,
-            tokenizer=tokenizer,
-            model_path=args.model,
-            max_new_tokens=args.max_new_tokens,
-            prompts=["Who are you?", "Explain KV cache in one sentence."],
-        )
-
-    print("test_core_parity passed!")
-
-
-if __name__ == "__main__":
-    main()
+    llaisys_model = llaisys.models.Qwen2(require_model_path, llaisys.DeviceType.CPU)
+    ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
+    assert ll_tokens == hf_tokens

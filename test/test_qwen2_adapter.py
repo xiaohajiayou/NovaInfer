@@ -1,5 +1,3 @@
-import io
-import sys
 import tempfile
 from pathlib import Path
 
@@ -7,7 +5,6 @@ import json
 
 from llaisys.models import qwen2 as qwen2_mod
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 def test_qwen2_adapter_meta_parse():

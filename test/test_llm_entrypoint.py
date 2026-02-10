@@ -1,5 +1,3 @@
-import io
-import sys
 
 import numpy as np
 
@@ -7,7 +5,6 @@ from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
 from llaisys.entrypoints.llm import LLM
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 class DummyRunner:

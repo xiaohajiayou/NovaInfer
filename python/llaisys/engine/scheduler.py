@@ -27,6 +27,34 @@ class RequestScheduler:
         self._running.rotate(-1)
         return req_id
 
+    def pick_next_batch(self, max_items: int) -> list[str]:
+        if max_items <= 0:
+            return []
+
+        picked: list[str] = []
+
+        # 1) Prefill first: promote new requests into running and schedule them.
+        while self._waiting and len(picked) < max_items:
+            req_id = self._waiting.popleft()
+            self._running.append(req_id)
+            picked.append(req_id)
+
+        # 2) Fill remaining slots by decode round-robin from running queue.
+        if len(picked) >= max_items or not self._running:
+            return picked
+
+        scanned = 0
+        running_len = len(self._running)
+        while scanned < running_len and len(picked) < max_items and self._running:
+            req_id = self._running[0]
+            self._running.rotate(-1)
+            scanned += 1
+            if req_id in picked:
+                continue
+            picked.append(req_id)
+
+        return picked
+
     def finish(self, request_id: str) -> None:
         self._remove(self._waiting, request_id)
         self._remove(self._running, request_id)

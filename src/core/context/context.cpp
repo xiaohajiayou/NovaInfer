@@ -4,7 +4,7 @@
 
 namespace llaisys::core {
 
-Context::Context() {
+Context::Context() : _current_runtime(nullptr) {
     // All device types, put CPU at the end
     std::vector<llaisysDeviceType_t> device_typs;
     for (int i = 1; i < LLAISYS_DEVICE_TYPE_COUNT; i++) {
@@ -52,7 +52,7 @@ Context::~Context() {
 void Context::setDevice(llaisysDeviceType_t device_type, int device_id) {
     // If doest not match the current runtime.
     if (_current_runtime == nullptr || _current_runtime->deviceType() != device_type || _current_runtime->deviceId() != device_id) {
-        auto runtimes = _runtime_map[device_type];
+        auto &runtimes = _runtime_map[device_type];
         CHECK_ARGUMENT((size_t)device_id < runtimes.size() && device_id >= 0, "invalid device id");
         if (_current_runtime != nullptr) {
             _current_runtime->_deactivate();
@@ -72,8 +72,17 @@ Runtime &Context::runtime() {
 
 // Global API to get thread-local context.
 Context &context() {
-    thread_local Context thread_context;
-    return thread_context;
+    // NOTE:
+    // Storage holds Runtime&. In multi-thread inference, tensors can be allocated
+    // on worker threads but destroyed later on a different thread. If thread-local
+    // Context is destructed at worker thread exit, those Runtime references become
+    // dangling and model destroy can crash.
+    //
+    // Keep per-thread Context alive for process lifetime to avoid Runtime
+    // use-after-free across thread boundaries. This is a bounded leak (one Context
+    // per thread touching core runtime), acceptable for current stage.
+    thread_local Context *thread_context = new Context();
+    return *thread_context;
 }
 
 } // namespace llaisys::core

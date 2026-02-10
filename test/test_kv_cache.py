@@ -1,5 +1,3 @@
-import io
-import sys
 from ctypes import POINTER, byref, c_int, c_int8, c_int32, c_int64, c_void_p, cast
 from dataclasses import dataclass
 
@@ -10,7 +8,6 @@ from llaisys.libllaisys import LIB_LLAISYS
 from llaisys.libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 
 @dataclass(frozen=True)

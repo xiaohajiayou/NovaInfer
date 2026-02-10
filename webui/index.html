@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NovaInfer Chat</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app layout">
+      <aside class="sidebar">
+        <h2>Sessions</h2>
+        <button id="newSessionBtn" type="button">+ New Chat</button>
+        <div id="sessionList" class="session-list"></div>
+      </aside>
+
+      <section class="main-pane">
+        <header class="topbar">
+          <h1 id="sessionTitle">NovaInfer Chat</h1>
+          <div class="server">
+            <label for="serverBase">Server</label>
+            <input id="serverBase" value="http://127.0.0.1:8000" />
+          </div>
+        </header>
+
+        <section id="chatLog" class="chat-log"></section>
+
+        <section class="controls">
+          <textarea id="promptInput" placeholder="Type your message..."></textarea>
+          <div class="buttons">
+            <button id="sendBtn">Send</button>
+            <button id="cancelBtn" class="ghost" disabled>Cancel</button>
+          </div>
+        </section>
+
+        <section class="debug-panel">
+          <h2>Debug</h2>
+          <div id="debugStats" class="debug-stats">idle</div>
+          <pre id="debugLog" class="debug-log"></pre>
+        </section>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

@@ -10,6 +10,7 @@ from .model_registry import ModelRegistry
 from .output_processor import OutputProcessor
 from .scheduler import RequestScheduler
 from .types import (
+    BatchPlan,
     GenerationOutput,
     RequestState,
     RequestStatus,
@@ -70,6 +71,7 @@ class LLMEngine:
         worker: Worker | None = None,
         model_runner=None,
         model_registry: ModelRegistry | None = None,
+        max_batch_size: int = 8,
     ):
         self._worker = worker if worker is not None else Worker(
             model_type=model_type,
@@ -87,6 +89,14 @@ class LLMEngine:
         self._request_counter = 0
         self._seq_counter = 0
         self._last_request_id: str | None = None
+        self._max_batch_size = max(1, int(max_batch_size))
+
+    def close(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is not None:
+            close_fn = getattr(worker, "close", None)
+            if callable(close_fn):
+                close_fn()
 
     def submit(self, inputs: Sequence[int], sampling_params: SamplingParams) -> str:
         req = self._create_request([int(t) for t in inputs])
@@ -100,68 +110,108 @@ class LLMEngine:
         return req.request_id
 
     def step(self) -> list[GenerationOutput]:
-        req_id = self._scheduler.pick_next()
-        if req_id is None:
+        req_ids = self._scheduler.pick_next_batch(self._max_batch_size)
+        if not req_ids:
             return []
 
-        runtime = self._runtimes.get(req_id)
-        if runtime is None:
-            self._scheduler.finish(req_id)
-            return []
+        completions: list[GenerationOutput] = []
+        active: list[_RequestRuntime] = []
+        combined_tokens: list[int] = []
+        combined_logits_mask: list[int] = []
+        combined_seq_ids: list[int] = []
+        output_runtime_order: list[_RequestRuntime] = []
 
-        req = runtime.request
-        if req.status in TERMINAL_REQUEST_STATUSES:
-            self._scheduler.finish(req_id)
-            return [runtime.finished_output] if runtime.finished_output is not None else []
+        for req_id in req_ids:
+            runtime = self._runtimes.get(req_id)
+            if runtime is None:
+                self._scheduler.finish(req_id)
+                continue
 
-        if req.status == RequestStatus.WAITING:
-            self._transition(req, RequestStatus.RUNNING)
+            req = runtime.request
+            if req.status in TERMINAL_REQUEST_STATUSES:
+                self._scheduler.finish(req_id)
+                if runtime.finished_output is not None:
+                    completions.append(runtime.finished_output)
+                continue
 
-        try:
-            if not req.prompt_tokens:
-                return [self._complete_request(runtime, RequestStatus.FINISHED_IGNORED, "empty")]
+            try:
+                if req.status == RequestStatus.WAITING:
+                    self._transition(req, RequestStatus.RUNNING)
 
-            if len(req.prompt_tokens) > self._worker.max_seq_len:
-                raise ValueError("Prompt length exceeds maxseq")
+                if not req.prompt_tokens:
+                    completions.append(self._complete_request(runtime, RequestStatus.FINISHED_IGNORED, "empty"))
+                    continue
 
-            if runtime.max_new_tokens < 0:
-                runtime.max_new_tokens = self._compute_max_new(len(req.prompt_tokens), runtime.sampling_params)
-            if runtime.max_new_tokens <= 0:
-                return [self._complete_request(runtime, RequestStatus.FINISHED_LENGTH_CAPPED, "length")]
+                if len(req.prompt_tokens) > self._worker.max_seq_len:
+                    raise ValueError("Prompt length exceeds maxseq")
 
-            if not runtime.prefill_done:
-                plan = self._scheduler.build_prefill_plan(
-                    req.prompt_tokens,
-                    seq_id=runtime.seq_id,
-                )
-            else:
-                plan = self._scheduler.build_decode_plan(
-                    req.output_tokens[-1],
-                    seq_id=runtime.seq_id,
-                )
+                if runtime.max_new_tokens < 0:
+                    runtime.max_new_tokens = self._compute_max_new(len(req.prompt_tokens), runtime.sampling_params)
+                if runtime.max_new_tokens <= 0:
+                    completions.append(self._complete_request(runtime, RequestStatus.FINISHED_LENGTH_CAPPED, "length"))
+                    continue
 
-            step = self._executor.execute_step(plan, runtime.sampling_params)
-            if not step.sampled_token_ids:
-                raise RuntimeError("executor returned no sampled token")
+                if not runtime.prefill_done:
+                    tokens = [int(t) for t in req.prompt_tokens]
+                    logits_mask = [0] * len(tokens)
+                    logits_mask[-1] = 1
+                else:
+                    tokens = [int(req.output_tokens[-1])]
+                    logits_mask = [1]
 
-            token = int(step.sampled_token_ids[-1])
-            req.output_tokens.append(token)
+                seq_ids = [int(runtime.seq_id)] * len(tokens)
+
+                combined_tokens.extend(tokens)
+                combined_logits_mask.extend(logits_mask)
+                combined_seq_ids.extend(seq_ids)
+                output_runtime_order.append(runtime)
+                active.append(runtime)
+            except Exception as exc:
+                req.error = str(exc)
+                completions.append(self._complete_request(runtime, RequestStatus.FINISHED_ABORTED, "aborted"))
+
+        if not combined_tokens:
+            return completions
+
+        # Current engine keeps one sampling config for the full ubatch.
+        # Multi-request mixed sampling params can be added in a later stage.
+        first_runtime = active[0]
+        step = self._executor.execute_step(
+            BatchPlan(
+                token_ids=combined_tokens,
+                logits_mask=combined_logits_mask,
+                seq_ids=combined_seq_ids,
+            ),
+            first_runtime.sampling_params,
+        )
+
+        sampled = [int(t) for t in step.sampled_token_ids]
+        output_ids = [int(i) for i in step.output_ids] if step.output_ids else list(range(len(sampled)))
+        if len(sampled) != len(output_ids):
+            raise RuntimeError("executor returned inconsistent sampled/output sizes")
+        if len(sampled) != len(output_runtime_order):
+            raise RuntimeError("executor output size does not match planned request outputs")
+
+        runtime_by_out_idx = {out_idx: rt for out_idx, rt in zip(output_ids, output_runtime_order)}
+
+        for out_idx, token in zip(output_ids, sampled):
+            runtime = runtime_by_out_idx.get(out_idx)
+            if runtime is None:
+                continue
+            req = runtime.request
+            req.output_tokens.append(int(token))
             runtime.num_generated += 1
             runtime.prefill_done = True
 
-            finish_reason = self._maybe_finish_reason(runtime, token)
+            finish_reason = self._maybe_finish_reason(runtime, int(token))
             if finish_reason is not None:
-                return [self._complete_request(runtime, RequestStatus.FINISHED_STOPPED, finish_reason)]
+                completions.append(self._complete_request(runtime, RequestStatus.FINISHED_STOPPED, finish_reason))
+                continue
 
             if runtime.num_generated >= runtime.max_new_tokens:
-                return [self._complete_request(runtime, RequestStatus.FINISHED_LENGTH_CAPPED, "length")]
+                completions.append(self._complete_request(runtime, RequestStatus.FINISHED_LENGTH_CAPPED, "length"))
 
-            return []
-        except Exception as exc:
-            req.error = str(exc)
-            if req.status not in TERMINAL_REQUEST_STATUSES:
-                self._transition(req, RequestStatus.FINISHED_ABORTED)
-            return [self._complete_request(runtime, RequestStatus.FINISHED_ABORTED, "aborted")]
+        return completions
 
     def collect(self, request_id: str) -> GenerationOutput | None:
         runtime = self._runtimes.get(request_id)
@@ -260,6 +310,16 @@ class LLMEngine:
     def get_request_status(self, request_id: str):
         req = self._requests.get(request_id)
         return None if req is None else req.status
+
+    def get_completion_tokens(self, request_id: str) -> list[int] | None:
+        req = self._requests.get(request_id)
+        if req is None:
+            return None
+        prompt_len = len(req.prompt_tokens)
+        return [int(t) for t in req.output_tokens[prompt_len:]]
+
+    def decode_tokens(self, token_ids: Sequence[int]) -> str | None:
+        return self._worker.decode_tokens([int(t) for t in token_ids])
 
     def get_request_history(self, request_id: str):
         req = self._requests.get(request_id)

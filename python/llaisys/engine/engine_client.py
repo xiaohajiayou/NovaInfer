@@ -30,3 +30,8 @@ class EngineClient:
 
     def generate(self, inputs, sampling_params: SamplingParams) -> GenerationOutput:
         return self._engine.generate(inputs=inputs, sampling_params=sampling_params)
+
+    def close(self) -> None:
+        close_fn = getattr(self._engine, "close", None)
+        if callable(close_fn):
+            close_fn()

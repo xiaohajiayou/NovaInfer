@@ -41,6 +41,7 @@ class SamplingParams:
     top_k: int = 1
     top_p: float = 1.0
     temperature: float = 1.0
+    seed: Optional[int] = None
     stop_token_ids: Sequence[int] = field(default_factory=tuple)
     stop: Sequence[str] = field(default_factory=tuple)
 

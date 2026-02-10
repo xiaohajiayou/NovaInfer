@@ -5,7 +5,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
 import llaisys
 import torch
-from test_utils import random_tensor, check_equal, benchmark
+from test.test_utils import random_tensor, check_equal, benchmark
 
 
 def torch_self_attention(attn_val, query, key, value, scale):

@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 import json
 import os
 import re
+import threading
 
 import numpy as np
 import safetensors
@@ -219,13 +220,29 @@ class Qwen2:
         self._np_dtype = _datatype_to_numpy_dtype(meta.dtype)
         self._offline_engine = None
         self._tokenizer = None
+        self._tokenizer_lock = threading.Lock()
+        self._closed = False
 
         self._load_safetensors()
 
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        model = getattr(self, "_model", None)
+        self._model = None
+        if model:
+            LIB_LLAISYS.llaisysModelDestroy(model)
+
     def __del__(self):
-        if hasattr(self, "_model") and self._model:
-            LIB_LLAISYS.llaisysModelDestroy(self._model)
+        # Avoid native destroy in __del__. Finalizer timing during GC can race with
+        # other Python/C++ objects and cause hard crashes. Use explicit close() chain.
+        try:
             self._model = None
+            self._closed = True
+        except Exception:
+            pass
 
     # -------------------- Weight Loading --------------------
 
@@ -309,15 +326,32 @@ class Qwen2:
         return int(self._meta_info.end_token)
 
     def _get_tokenizer(self):
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
+        if self._tokenizer is not None:
+            return self._tokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
+        # Tokenizer lazy init must be thread-safe: online multi-session can call
+        # encode/decode from multiple request threads at once.
+        with self._tokenizer_lock:
+            if self._tokenizer is None:
+                try:
+                    from transformers import AutoTokenizer  # type: ignore
+                except Exception:
+                    from transformers.models.auto.tokenization_auto import AutoTokenizer  # type: ignore
+                self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
         return self._tokenizer
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str:
         tokenizer = self._get_tokenizer()
         return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+    def encode_chat_messages(self, messages: Sequence[dict]) -> list[int]:
+        tokenizer = self._get_tokenizer()
+        text = tokenizer.apply_chat_template(
+            conversation=[{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in messages],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        return [int(t) for t in tokenizer.encode(text)]
 
     def decode_batch(
         self,

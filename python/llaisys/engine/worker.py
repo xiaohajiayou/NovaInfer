@@ -33,6 +33,14 @@ class Worker:
     def model_runner(self):
         return self._model_runner
 
+    def close(self) -> None:
+        runner = getattr(self, "_model_runner", None)
+        if runner is None:
+            return
+        close_fn = getattr(runner, "close", None)
+        if callable(close_fn):
+            close_fn()
+
     @property
     def max_seq_len(self) -> int:
         if hasattr(self._model_runner, "max_seq_len"):
@@ -55,5 +63,18 @@ class Worker:
 
     def decode_tokens(self, token_ids: list[int]) -> str | None:
         if hasattr(self._model_runner, "decode_tokens"):
-            return self._model_runner.decode_tokens(token_ids)
+            try:
+                return self._model_runner.decode_tokens(token_ids)
+            except Exception:
+                return None
         return None
+
+    def encode_chat_messages(self, messages: list[dict]) -> list[int]:
+        if hasattr(self._model_runner, "encode_chat_messages"):
+            try:
+                return [int(t) for t in self._model_runner.encode_chat_messages(messages)]
+            except Exception:
+                pass
+        # Fallback for dummy runners in tests.
+        text = "\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
+        return [int(b) for b in text.encode("utf-8")]

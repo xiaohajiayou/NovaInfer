@@ -85,6 +85,11 @@ class LLM:
     def cancel(self, request_id: str) -> bool:
         return self._engine_client.cancel(request_id)
 
+    def close(self) -> None:
+        close_fn = getattr(self._engine_client, "close", None)
+        if callable(close_fn):
+            close_fn()
+
     def generate(
         self,
         inputs,
@@ -249,4 +254,12 @@ class LLM:
 
     def _encode_prompt(self, prompt: str) -> list[int]:
         tokenizer = self._get_tokenizer()
+        # Align offline string-input behavior with chat-style parity tests.
+        if hasattr(tokenizer, "apply_chat_template"):
+            text = tokenizer.apply_chat_template(
+                conversation=[{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            return tokenizer.encode(text)
         return tokenizer.encode(prompt)

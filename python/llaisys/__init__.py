@@ -22,6 +22,10 @@ def __getattr__(name):
         llm_cls = import_module(".entrypoints", __name__).LLM
         globals()[name] = llm_cls
         return llm_cls
+    if name == "server":
+        mod = import_module(".server", __name__)
+        globals()[name] = mod
+        return mod
     if name == "Qwen2":
         qwen2_cls = import_module(".models", __name__).Qwen2
         globals()[name] = qwen2_cls
@@ -36,9 +40,16 @@ def __getattr__(name):
         "EngineClient",
         "ModelRegistry",
         "create_default_registry",
+        "AsyncLLMEngine",
+        "LlaisysHTTPServer",
+        "OpenAIServer",
     ):
-        mod = import_module(".engine", __name__)
-        value = getattr(mod, name)
+        if name in ("AsyncLLMEngine", "LlaisysHTTPServer", "OpenAIServer"):
+            mod = import_module(".server", __name__)
+            value = getattr(mod, name)
+        else:
+            mod = import_module(".engine", __name__)
+            value = getattr(mod, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -54,12 +65,16 @@ __all__ = [
     "Ops",
     "models",
     "engine",
+    "server",
     "LLM",
     "Qwen2",
     "LLMEngine",
     "EngineClient",
     "ModelRegistry",
     "create_default_registry",
+    "AsyncLLMEngine",
+    "LlaisysHTTPServer",
+    "OpenAIServer",
     "SamplingParams",
     "GenerationOutput",
     "StreamChunk",
