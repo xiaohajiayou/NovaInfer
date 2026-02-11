@@ -54,8 +54,6 @@ public:
     runtime::kv_cache::KvStatus kv_seq_keep(int64_t seq_id);
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
 
-    void infer(int64_t seq_id, int64_t *token_ids, size_t ntoken);
-
 private:
     struct LayerCache {
         tensor_t k_cache;
@@ -95,7 +93,6 @@ private:
     tensor_t slice_tokens_(const tensor_t &t, size_t len) const;
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
-    void fill_pos_ids_(const tensor_t &pos_ids, size_t start, size_t len);
     void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);

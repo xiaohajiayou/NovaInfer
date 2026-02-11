@@ -39,7 +39,8 @@
 3. KV 已升级为 unified cell 语义：一个 slot 可关联多个 `seq_id`，并支持 `n_seq_id > 1` token。
 4. 多序列隔离在同一轮前向中通过 mask 生效（`seq_id` 集合交集 + `pos` 因果约束）。
 5. Engine/Server 阶段2主链路已落地（offline + online + SSE + cancel + WebUI 基础多会话）。
-6. 未实现项：`kv_seq_add(delta != 0)`、滑窗策略、阶段3性能优化（高阶连续批处理/前缀缓存收益/投机）。
+6. KV 元数据流程已引入 llama.cpp 风格 `prepare(ubatches) -> slot_info_vec`、`apply_ubatch`、`rollback_ubatch`、`update(stream_copy_info)`。
+7. 未实现项：多 stream 端到端执行路径（含跨 stream K/V tensor 流程）、滑窗策略、阶段3性能优化（高阶连续批处理/前缀缓存收益/投机）。
 
 ## 3. Core 层需求（C++）
 
@@ -69,6 +70,8 @@
 4. （可选，阶段三）滑窗注意力不改变逻辑 pos，仅通过 mask 屏蔽窗口外 token。
 5. 需提供前缀复用、释放/截断、位置平移、保留与查询等能力接口（不限定 API 名称）；由 Engine 层负责调用与编排。
 6. Core 层默认不强制每 `seq_id` 的 slot/cell 硬配额；请求公平性与限额由 Engine/Server 层负责。
+7. KV 元数据实现需对齐 llama.cpp 关键语义：`prepare/find_slot/apply_ubatch/update` 四段式流程、cell 内 `seq_set + pos` 持久化、`seq_pos_min/max` 统计可查询。
+8. 阶段2允许“单 stream 执行 + 多 stream 元数据预留”形态，但文档必须明确未打通项，避免误判为全量对齐。
 
 ### 3.4 计算图与算子
 
@@ -185,7 +188,7 @@
 ## 7. 设计约束与阶段落地
 
 1. 阶段 0：完成 Core 对齐 llama.cpp 的重构，并完成通用多模型接口抽象（统一 `LlaisysModel` 主线接口）。
-2. 阶段 0 对拍口径：`test/test_infer.py --test` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
+2. 阶段 0 对拍口径：`pytest -q test/test_infer.py --model-path /path/to/local/model` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
 3. 阶段 0 退出条件：进入阶段1前，离线主流程必须切换为 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 4. 阶段 1：优先保证离线推理闭环与 Engine 内 argmax 验证（Core 仅返回 logits）。
    - 阶段1已完成口径：`LLM.generate`（prompt入口）+ Engine 状态机主路径 + stop string + 统一输出对象（含 finish_reason/status/usage）。
@@ -202,7 +205,8 @@
 3. 已完成（权重槽位安全替换）：提供 `llaisysModelReplaceWeight`，模型适配层通过统一 API 写入权重槽位，避免重复赋值泄漏。
 4. 已完成（真实 batch decode）：`llaisysModelDecode` 单轮处理整批 token，`output_ids` 与 logits 行索引一致。
 5. 已完成（Unified KV）：slot 支持多 `seq_id` 关联；`kv_seq_cp` 语义为附加关联（共享前缀），不再强制复制新 slot。
-6. 已完成（阶段1离线主链路）：`LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core` 已落地并通过离线回归测试。
+6. 已完成（KV 流程对齐）：`KvCells`、`prepare/apply_ubatch/rollback_ubatch/update`、`seq_pos_min/max` 统计链路已落地。
+7. 已完成（阶段1离线主链路）：`LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core` 已落地并通过离线回归测试。
 
 ## 8. 验收标准
 
@@ -290,6 +294,25 @@
 现状：
 
 1. 相关核心用例已覆盖并通过（`test_core_decode_batch/test_kv_cache/test_core_output_api/test_core_model_api`）。
+
+### 9.5 KV 与 llama.cpp 对齐进展（阶段2后）
+
+问题：
+
+1. 早期 KV 设计依赖简化状态（slot 单绑定、线性分配），难以稳定支持多序列混排与覆盖写回滚。
+2. 文档口径与源码逐步偏离，出现“文档写了 free_slots_，源码已改为 KvCells”的理解断层。
+
+方案：
+
+1. 结构对齐：引入 `KvCells`，cell 保存 `pos/shift/seq_set`，并维护 `used_` 与 `seq_pos_`。
+2. 流程对齐：引入 `prepare -> apply_ubatch -> rollback_ubatch -> update`，把 slot 规划、提交、回滚、状态同步拆开。
+3. 回滚对齐：`decode` 异常路径统一调用 `rollback_ubatch`，避免“元数据提交了但前向失败”的脏状态。
+
+当前差距（已明确）：
+
+1. Qwen2 decode 仍限制单 stream 执行（`slot_info.n_stream() == 1`）。
+2. `used_slots/slot_visible_for` 当前仅使用 stream0 视图，跨 stream 可见性尚未打通。
+3. `update(stream_copy_info)` 目前是元数据级复制，尚未接入统一 K/V tensor 拷贝调度。
 
 ## 10. 下一阶段优化路线（阶段3前）
 

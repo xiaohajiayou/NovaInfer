@@ -1,13 +1,15 @@
 #pragma once
 
+#include "kv_cells.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace llaisys::runtime::kv_cache {
 
-// Internal KV operation status used in C++ layers.
 enum class KvStatus : int32_t {
     OK = 0,
     OOM_SLOT = 1,
@@ -17,168 +19,121 @@ enum class KvStatus : int32_t {
     INTERNAL_ERROR = 5,
 };
 
-/**
- * @brief Per-model KV slot allocator/metadata manager.
- *
- * This class manages a global slot pool (size = maxseq) and a per-sequence
- * logical view (pos -> slot). Tensor copy/read is handled elsewhere; this
- * class only tracks slot ownership and logical positions.
- */
 class KvCache {
 public:
-    /**
-     * @brief Construct KV cache metadata with a fixed slot capacity.
-     * @param maxseq Total number of physical KV slots available in this cache.
-     */
-    explicit KvCache(size_t maxseq);
+    struct stream_copy_info {
+        bool empty() const noexcept { return ssrc.empty(); }
+        std::vector<uint32_t> ssrc;
+        std::vector<uint32_t> sdst;
+    };
 
-    /** @brief Get total physical slot capacity. */
+    struct slot_info {
+        using idx_vec_t = std::vector<int32_t>;
+
+        int32_t s0{0};
+        int32_t s1{0};
+
+        std::vector<int64_t> strm;
+        std::vector<idx_vec_t> idxs;
+
+        int32_t head() const noexcept {
+            if (idxs.empty() || idxs[0].empty()) {
+                return -1;
+            }
+            return idxs[0][0];
+        }
+
+        void resize(size_t n) {
+            strm.resize(n);
+            idxs.resize(n);
+        }
+
+        size_t size() const noexcept {
+            if (idxs.empty()) {
+                return 0;
+            }
+            return idxs[0].size();
+        }
+
+        size_t n_stream() const noexcept { return idxs.size(); }
+        bool empty() const noexcept { return idxs.empty(); }
+
+        void clear() {
+            strm.clear();
+            idxs.clear();
+            s0 = 0;
+            s1 = 0;
+        }
+    };
+
+    using slot_info_vec_t = std::vector<slot_info>;
+
+    struct ubatch {
+        std::vector<std::vector<int64_t>> seq_sets;
+        std::vector<int64_t> pos_values;
+    };
+
+    explicit KvCache(size_t maxseq, uint32_t n_stream = 1);
+
     size_t maxseq() const noexcept { return maxseq_; }
-    /** @brief Get current number of free physical slots. */
-    size_t free_slot_count() const noexcept { return free_slots_.size(); }
+    uint32_t n_stream() const noexcept { return n_stream_; }
+    size_t free_slot_count() const noexcept;
 
-    /**
-     * @brief Allocate slots for a contiguous token range of one sequence.
-     * @param seq_id Logical sequence identifier.
-     * @param ntoken Number of new tokens to allocate.
-     * @param pos_start Logical start position for the first token.
-     * @param out_slots Optional output list of allocated slot ids.
-     * @return KvStatus::OK on success.
-     */
+    slot_info_vec_t prepare(const std::vector<ubatch> &ubatches);
+    bool update(bool do_shift, const stream_copy_info &sc_info);
+
+    slot_info find_slot(const ubatch &ubatch, bool cont) const;
+    KvStatus apply_ubatch(const slot_info &sinfo, const ubatch &ubatch);
+    void rollback_ubatch(const slot_info &sinfo, const ubatch &ubatch);
+
+    // Compatibility wrappers reserved for future runner/scheduler integrations.
     KvStatus alloc_tokens(int64_t seq_id, size_t ntoken, int64_t pos_start, std::vector<int32_t> *out_slots);
-    /**
-     * @brief Allocate one slot for a token that belongs to one/multiple sequences.
-     * @param seq_ids Sequence-id array.
-     * @param n_seq_id Number of sequence ids in seq_ids.
-     * @param pos Logical token position shared by the seq set.
-     * @param out_slot Optional output slot id.
-     * @return KvStatus::OK on success.
-     */
     KvStatus alloc_token(const int64_t *seq_ids, int32_t n_seq_id, int64_t pos, int32_t *out_slot);
+    KvStatus find_slot(const std::vector<std::vector<int64_t>> &seq_sets,
+                       const std::vector<int64_t> &pos_values,
+                       slot_info *out_sinfo) const;
+    KvStatus apply_ubatch(const std::vector<std::vector<int64_t>> &seq_sets,
+                          const std::vector<int64_t> &pos_values,
+                          const slot_info &sinfo);
+    void rollback_ubatch(const std::vector<std::vector<int64_t>> &seq_sets,
+                         const std::vector<int64_t> &pos_values,
+                         const slot_info &sinfo);
 
-    /**
-     * @brief Query all slot ids of a sequence in logical position order.
-     * @param seq_id Logical sequence identifier.
-     * @return Pointer to internal slot vector, or nullptr if seq does not exist.
-     */
     const std::vector<int32_t> *seq_slots(int64_t seq_id) const noexcept;
 
-    /**
-     * @brief Prepare copy plan from one sequence range to another sequence tail.
-     *
-     * This allocates new destination slots and returns source/destination slot
-     * mapping for upper-layer tensor copy.
-     *
-     * @param dst_seq Destination sequence id.
-     * @param src_seq Source sequence id.
-     * @param p0 Inclusive logical start pos in source sequence.
-     * @param p1 Exclusive logical end pos in source sequence.
-     * @param src_slots Optional output source slot list.
-     * @param dst_slots Optional output destination slot list.
-     * @return KvStatus::OK on success.
-     */
-    KvStatus seq_cp_prepare(int64_t dst_seq,
-                            int64_t src_seq,
-                            int64_t p0,
-                            int64_t p1,
-                            std::vector<int32_t> *src_slots,
-                            std::vector<int32_t> *dst_slots);
-
-    /**
-     * @brief Remove [p0, p1) logical range from a sequence and free those slots.
-     * @param seq_id Logical sequence identifier.
-     * @param p0 Inclusive logical start position.
-     * @param p1 Exclusive logical end position.
-     * @return KvStatus::OK on success.
-     */
+    KvStatus seq_cp(int64_t dst_seq,
+                    int64_t src_seq,
+                    int64_t p0,
+                    int64_t p1,
+                    std::vector<int32_t> *src_slots,
+                    std::vector<int32_t> *dst_slots);
     KvStatus seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
-
-    /**
-     * @brief Shift logical positions in [p0, p1) by delta.
-     * @param seq_id Logical sequence identifier.
-     * @param p0 Inclusive logical start position.
-     * @param p1 Exclusive logical end position.
-     * @param delta Position shift value.
-     * @return KvStatus::OK on success.
-     */
     KvStatus seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
-
-    /**
-     * @brief Keep only one sequence and clear all other sequences.
-     * @param seq_id Sequence id to keep.
-     * @return KvStatus::OK on success.
-     */
     KvStatus seq_keep(int64_t seq_id);
-
-    /**
-     * @brief Get max logical position of a sequence.
-     * @param seq_id Logical sequence identifier.
-     * @return Max logical position, or -1 if sequence does not exist/empty.
-     */
     int64_t seq_pos_max(int64_t seq_id) const noexcept;
 
-    /**
-     * @brief Collect all currently used slots sorted by logical position.
-     * @param out Ordered slot-id list.
-     */
     void used_slots(std::vector<int32_t> *out) const;
-
-    /**
-     * @brief Test whether one slot is visible to a query token.
-     * @param slot Physical slot id.
-     * @param seq_ids Query sequence-id set.
-     * @param n_seq_id Number of query sequence ids.
-     * @param qpos Query logical position.
-     * @return True when seq-set intersects and slot_pos <= qpos.
-     */
     bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const;
 
 private:
-    /**
-     * @brief Per-sequence metadata.
-     */
-    struct SeqState {
-        /** @brief Logical mapping: pos_to_slot[pos] = physical slot id. */
-        std::vector<int32_t> pos_to_slot;
-    };
+    uint32_t stream_for_seq_(int64_t seq_id);
+    uint32_t stream_for_seq_const_(int64_t seq_id) const;
 
-    /**
-     * @brief Ensure sequence state exists and return mutable reference.
-     * @param seq_id Logical sequence identifier.
-     * @return Mutable sequence metadata.
-     */
-    SeqState &ensure_seq_(int64_t seq_id);
+    int64_t seq_pos_max_(int64_t seq_id) const noexcept;
+    bool normalize_range_(int64_t seq_id, int64_t p0, int64_t p1, int64_t *out_p0, int64_t *out_p1) const;
+    size_t free_slot_count_stream_(uint32_t stream) const noexcept;
+    int32_t alloc_slot_(uint32_t stream, int64_t pos);
+    KvStatus validate_ubatch_(const ubatch &ub, std::vector<uint32_t> *token_streams) const;
 
-    /**
-     * @brief Allocate one physical slot and bind it to (seq_id, pos).
-     * @param seq_id Logical sequence identifier.
-     * @param pos Logical position in the sequence.
-     * @return Slot id on success, -1 if slot pool is empty.
-     */
-    int32_t alloc_slot_(int64_t pos);
-
-    /**
-     * @brief Release one physical slot back to free list.
-     * @param slot Physical slot id to free.
-     */
-    void free_slot_(int32_t slot);
-
-    /**
-     * @brief Remove one sequence and free all of its slots.
-     * @param seq_id Logical sequence identifier.
-     */
-    void clear_seq_(int64_t seq_id);
-
-    /** @brief Total physical slot capacity. */
     size_t maxseq_;
-    /** @brief Sequence table: seq_id -> sequence metadata. */
-    std::unordered_map<int64_t, SeqState> seq_states_;
-    /** @brief Free physical slot stack (LIFO). */
-    std::vector<int32_t> free_slots_;
-    /** @brief Slot owner map: slot_seq_sets_[slot] = associated seq-id set. */
-    std::vector<std::vector<int64_t>> slot_seq_sets_;
-    /** @brief Slot logical pos map: slot_pos_[slot] = logical position, -1 means free. */
-    std::vector<int64_t> slot_pos_;
+    uint32_t n_stream_;
+
+    std::vector<KvCells> v_cells_;
+    std::vector<uint32_t> v_heads_;
+
+    mutable std::unordered_map<int64_t, uint32_t> seq_to_stream_;
+    mutable std::unordered_map<int64_t, std::vector<int32_t>> seq_slots_cache_;
+    mutable std::unordered_set<int64_t> seq_slots_dirty_;
 };
 
 } // namespace llaisys::runtime::kv_cache

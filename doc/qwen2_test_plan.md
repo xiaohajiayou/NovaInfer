@@ -21,7 +21,7 @@
 ### 2.1 阶段 0（Core 重构 + 通用多模型 API）
 
 必须通过：
-1. 既有基线：`test/test_infer.py --test`
+1. 既有基线：`pytest -q test/test_infer.py --model-path /path/to/local/model`
 2. `test/test_core_model_api.py`：`create/decode/get_logits*/kv` 行为。
 3. `test/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确（含 `n_seq_id > 1` 共享 token 用例）。
 4. `test/test_core_output_api.py`：`GetLogits/GetLogitsIth/NOutputs/OutputIds` 与 `batch.logits` 对齐。

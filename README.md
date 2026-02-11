@@ -14,9 +14,135 @@ Core (C++) current state:
 
 Known limits (still true):
 
-- `kv_seq_add` with `delta != 0` is not implemented (returns `INVALID_POS`).
 - Sliding-window KV policy is not implemented.
 - current masked attention path is correctness-first; performance optimization is stage-3 scope.
+
+## System Architecture & Sequence
+
+### Layered Architecture
+
+```mermaid
+flowchart LR
+  subgraph Client
+    UI[Web UI]
+    CLI[curl / SDK]
+  end
+
+  subgraph Server["Python Server Layer"]
+    HTTP[HttpServer / OpenAIServer]
+    AENG[AsyncLLMEngine]
+  end
+
+  subgraph Engine["Python Engine Layer"]
+    ENG[LLMEngine]
+    SCH[RequestScheduler]
+    EXE[Executor]
+    WRK[Worker]
+    RUN[Model Runner<br/>python/llaisys/models/qwen2.py]
+  end
+
+  subgraph Core["C++ Core Layer"]
+    CAPI[llaisysModel* C API]
+    DEC[Qwen2Model::decode]
+    KV[KvCache + KvCells]
+    OPS[Workspace + Ops + OutputBuffer]
+  end
+
+  UI --> HTTP
+  CLI --> HTTP
+  HTTP --> AENG --> ENG
+  ENG --> SCH --> EXE --> WRK --> RUN --> CAPI --> DEC
+  DEC --> KV
+  DEC --> OPS
+```
+
+### Offline Sequence (`LLM.generate`)
+
+```mermaid
+sequenceDiagram
+  participant App as App / Script
+  participant LLM as llaisys.LLM
+  participant E as LLMEngine
+  participant S as Scheduler
+  participant X as Executor
+  participant W as Worker
+  participant R as Qwen2 Runner
+  participant C as C++ Core
+
+  App->>LLM: generate(inputs, sampling_params)
+  LLM->>E: submit request
+  loop each decode step
+    E->>S: build_plan()
+    S-->>E: BatchPlan
+    E->>X: execute(plan)
+    X->>W: run(plan)
+    W->>R: decode_batch(...)
+    R->>C: llaisysModelDecode(batch)
+    C-->>R: logits + output_ids
+    R-->>W: logits rows
+    W-->>X: logits rows
+    X-->>E: sampled token(s)
+  end
+  E-->>LLM: final output
+  LLM-->>App: token_ids / text / finish_reason
+```
+
+### Online Streaming Sequence (SSE)
+
+```mermaid
+sequenceDiagram
+  participant U as WebUI / Client
+  participant API as OpenAIServer
+  participant AE as AsyncLLMEngine
+  participant ENG as LLMEngine
+  participant WRK as Worker + Runner
+  participant CORE as C++ Core
+
+  U->>API: POST /v1/chat/completions (stream=true)
+  API->>AE: submit(request)
+  AE->>ENG: enqueue(request)
+
+  loop each decode step
+    ENG->>WRK: execute next plan
+    WRK->>CORE: llaisysModelDecode(batch)
+    CORE-->>WRK: logits
+    WRK-->>ENG: sampled token
+    ENG-->>AE: chunk(delta, token_id)
+    AE-->>API: stream chunk
+    API-->>U: SSE data: {...}
+  end
+
+  ENG-->>AE: finished
+  AE-->>API: final chunk + [DONE]
+  API-->>U: stream closed
+
+  opt cancel request
+    U->>API: POST /v1/requests/{id}/cancel
+    API->>AE: cancel(id)
+    AE->>ENG: mark request aborted
+  end
+```
+
+### Core Decode Internal Sequence
+
+```mermaid
+sequenceDiagram
+  participant D as Qwen2Model::decode
+  participant K as KvCache
+  participant O as Attention/MLP Ops
+  participant B as OutputBuffer
+
+  D->>K: prepare(ubatch)
+  D->>K: apply_ubatch(slot_info, ubatch)
+  D->>K: used_slots() + slot_visible_for()
+  D->>O: embedding -> blocks -> lm_head
+  O-->>D: logits tensor
+  D->>B: append rows by logits mask
+
+  alt exception
+    D->>K: rollback_ubatch(slot_info, ubatch)
+  end
+```
 
 ## Quick Start
 

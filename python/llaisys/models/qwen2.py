@@ -211,11 +211,9 @@ class Qwen2:
         self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params))
         if not self._model:
             raise RuntimeError("Failed to create Qwen2 model instance")
-        weights_ptr = LIB_LLAISYS.llaisysModelWeights(self._model)
-        self._weights_ptr = cast(weights_ptr, POINTER(LlaisysQwen2Weights))
-        if not self._weights_ptr:
+        weights_ptr = cast(LIB_LLAISYS.llaisysModelWeights(self._model), POINTER(LlaisysQwen2Weights))
+        if not weights_ptr:
             raise RuntimeError("Failed to acquire Qwen2 weight slots")
-        self._weights: LlaisysQwen2Weights = self._weights_ptr.contents
 
         self._np_dtype = _datatype_to_numpy_dtype(meta.dtype)
         self._offline_engine = None
@@ -426,17 +424,6 @@ class Qwen2:
             logits_rows.append(np.array(row, copy=True))
 
         return output_ids, logits_rows
-
-    def _infer(self, token_ids: Sequence[int]) -> int:
-        _, logits_rows = self.decode_batch(token_ids=token_ids)
-        if not logits_rows:
-            raise RuntimeError("Decode returned no logits rows")
-        logits = logits_rows[-1]
-        next_token = int(np.argmax(logits))
-
-        if next_token < 0 or next_token >= self._meta_info.voc:
-            raise RuntimeError(f"Invalid token id returned from infer: {next_token}")
-        return next_token
 
     def generate(
         self,

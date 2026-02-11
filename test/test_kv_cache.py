@@ -133,11 +133,12 @@ def test_kv_seq_basic_ops():
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(10))) == 0
 
         assert int(LIB_LLAISYS.llaisysModelKvSeqAdd(model, c_int64(20), c_int64(0), c_int64(1), c_int64(0))) == 0
-        assert int(LIB_LLAISYS.llaisysModelKvSeqAdd(model, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 3
+        assert int(LIB_LLAISYS.llaisysModelKvSeqAdd(model, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(20))) == 1
 
         assert int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(20))) == 0
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(10))) == -1
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(20))) == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(20))) == 1
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(30))) == -1
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
@@ -153,7 +154,25 @@ def test_kv_slot_exhaustion_returns_decode_oom():
         LIB_LLAISYS.llaisysModelDestroy(model)
 
 
+def test_kv_seq_cp_then_rm_does_not_break_src():
+    model = _create_model()
+    try:
+        assert _decode(model, [1, 2], [7, 7]) == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqCp(model, c_int64(8), c_int64(7), c_int64(0), c_int64(2))) == 0
+
+        # Remove one logical position from dst seq only.
+        assert int(LIB_LLAISYS.llaisysModelKvSeqRm(model, c_int64(8), c_int64(0), c_int64(1))) == 0
+
+        # Source sequence must remain intact.
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(7))) == 1
+        assert _decode(model, [3], [7]) == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(7))) == 2
+    finally:
+        LIB_LLAISYS.llaisysModelDestroy(model)
+
+
 if __name__ == "__main__":
     test_kv_seq_basic_ops()
     test_kv_slot_exhaustion_returns_decode_oom()
+    test_kv_seq_cp_then_rm_does_not_break_src()
     print("\033[92mtest_kv_cache passed!\033[0m")

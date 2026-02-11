@@ -217,7 +217,7 @@ KV 语义补充（As-Built）：
 
 1. `llaisysModelKvSeqCp(dst, src, p0, p1)` 当前为“共享前缀关联”语义：dst 附加 src 命中的 slot 关联，不强制复制新 slot。
 2. `llaisysModelKvSeqRm` 会移除 seq 与 slot 关联；当 slot 无剩余 seq 关联时释放物理 slot。
-3. `llaisysModelKvSeqAdd` 仅支持 `delta == 0`；`delta != 0` 目前返回 `INVALID_POS`（后续实现）。
+3. `llaisysModelKvSeqAdd` 已支持 `delta != 0` 的位置平移语义（按 `[p0, p1)` 对命中 cell 执行 `pos += delta`）。
 
 ## 4. 调用契约
 
@@ -326,4 +326,4 @@ HTTP 路由（As-Built）：
 1. 目前 OpenAI 路由仅覆盖 chat-completions，`/v1/completions` 与 embeddings 为后续扩展。
 2. `sampling_params` 目前是请求级；同批不同请求采样参数并行应用未完全落地。
 3. 监控接口当前以日志为主，标准 metrics 导出接口（Prometheus 等）为下一步。
-4. Core 已实现 unified KV + mask 隔离，但 `kv_seq_add(delta != 0)`、滑窗与性能优化接口仍在后续阶段。
+4. Core 已实现 unified KV + mask 隔离与 `kv_seq_add(delta)` 位置平移；滑窗与性能优化接口仍在后续阶段。

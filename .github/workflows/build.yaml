@@ -12,13 +12,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-latest, macos-latest]
         type: [release]
     runs-on: ${{ matrix.os }}
+    env:
+      CI_MODEL_ID: Qwen/Qwen2-0.5B-Instruct
+      CI_MODEL_DIR: ${{ github.workspace }}/.ci-model
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
 
     - name: checkout code
       uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
 
     - name: install xmake
       uses: xmake-io/github-action-setup-xmake@v1
@@ -32,29 +42,52 @@ jobs:
     
     - name: Install Python
       run: | 
+        python -m pip install --upgrade pip
         cd python
         pip install .
         cd ..
+        pip install pytest huggingface_hub
 
-    - name: Assignment-0
+    - name: Run test suites
       run: |
-        python test/test_runtime.py --device cpu
+        python scripts/run_tests.py --suite all --run-parity never --run-hf never
 
-    - name: Assignment-1
-      run: |
-        python test/test_tensor.py
-    
-    - name: Assignment-2
-      run: |
-        python test/ops/add.py 
-        python test/ops/argmax.py
-        python test/ops/embedding.py
-        python test/ops/linear.py 
-        python test/ops/rms_norm.py
-        python test/ops/rope.py
-        python test/ops/self_attention.py
-        python test/ops/swiglu.py
+    - name: Cache HF model
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.CI_MODEL_DIR }}
+          ${{ env.HF_HOME }}
+        key: hf-${{ runner.os }}-qwen2-0_5b-instruct-v1
 
-    - name: Assignment-3
+    - name: Download real model for CI
+      shell: bash
       run: |
-        python test/test_infer.py --test
+        python - <<'PY'
+        import os
+        from huggingface_hub import snapshot_download
+
+        repo_id = os.environ["CI_MODEL_ID"]
+        local_dir = os.environ["CI_MODEL_DIR"]
+        os.makedirs(local_dir, exist_ok=True)
+        snapshot_download(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            local_dir_use_symlinks=False,
+            token=os.environ.get("HF_TOKEN") or None,
+        )
+        print(f"model ready: {local_dir}")
+        PY
+
+    - name: Run test_infer smoke (all OS)
+      shell: bash
+      run: |
+        python -m pytest -q test/test_infer.py -k smoke --model-path "$CI_MODEL_DIR"
+
+    - name: Run real-model parity and online tests
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        python scripts/run_tests.py --suite stage0 --model-path "$CI_MODEL_DIR" --run-parity always --run-hf always
+        python scripts/run_tests.py --suite stage1 --model-path "$CI_MODEL_DIR" --run-parity always
+        python -m pytest -q test/test_online_real_model_multisession.py --model-path "$CI_MODEL_DIR"

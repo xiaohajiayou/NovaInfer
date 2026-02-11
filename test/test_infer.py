@@ -123,3 +123,27 @@ def test_infer_parity(require_model_path):
         temperature=temperature,
     )
     assert mr_tokens == hf_tokens
+
+
+@pytest.mark.requires_model
+def test_infer_smoke(require_model_path):
+    model_path = require_model_path
+    prompt = "hello"
+    max_steps = 2
+    top_p, top_k, temperature = 1.0, 1, 1.0
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model_runner = llaisys.models.Qwen2(
+        model_path=model_path,
+        device=llaisys_device("cpu"),
+    )
+    out_tokens = llaisys_model_runner_infer(
+        prompt,
+        tokenizer,
+        model_runner,
+        max_new_tokens=max_steps,
+        top_p=top_p,
+        top_k=top_k,
+        temperature=temperature,
+    )
+    assert len(out_tokens) > 0

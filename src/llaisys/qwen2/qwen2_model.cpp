@@ -221,16 +221,6 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
     workspace_->reserve(ntoken);
 }
 
-void Qwen2Model::fill_pos_ids_(const tensor_t &pos_ids, size_t start, size_t len) {
-    ASSERT(pos_ids->dtype() == LLAISYS_DTYPE_I64, "Qwen2: pos_ids dtype must be int64");
-    ASSERT(pos_ids->shape()[0] == len, "Qwen2: pos_ids length mismatch");
-
-    int64_t *ptr = reinterpret_cast<int64_t *>(pos_ids->data());
-    for (size_t i = 0; i < len; ++i) {
-        ptr[i] = static_cast<int64_t>(start + i);
-    }
-}
-
 void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values) {
     ASSERT(pos_ids->dtype() == LLAISYS_DTYPE_I64, "Qwen2: pos_ids dtype must be int64");
     ASSERT(pos_ids->shape()[0] == pos_values.size(), "Qwen2: pos_ids length mismatch");
@@ -278,114 +268,6 @@ tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::ve
     return buffer->slice(0, 0, len);
 }
 
-void Qwen2Model::infer(int64_t seq_id, int64_t *token_ids, size_t ntoken) {
-    CHECK_ARGUMENT(token_ids != nullptr, "Qwen2: token_ids must not be null");
-    CHECK_ARGUMENT(ntoken > 0, "Qwen2: ntoken must be > 0");
-
-    validate_or_die_();
-    ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
-    const size_t pos_start = static_cast<size_t>(kv_cache_->seq_pos_max(seq_id) + 1);
-    CHECK_ARGUMENT(pos_start + ntoken <= meta_.maxseq, "Qwen2: sequence max context exceeded");
-    CHECK_ARGUMENT(kv_cache_->free_slot_count() >= ntoken, "Qwen2: no free KV slots");
-
-    ensure_workspace_(ntoken);
-    const auto &ws = workspace_->view();
-
-    const size_t nh = meta_.nh;
-    const size_t nkvh = meta_.nkvh;
-    const size_t dh = meta_.dh;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
-
-    // Build input token tensor.
-    tensor_t input_ids = make_tensor({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
-    input_ids->load(token_ids);
-
-    tensor_t hidden = slice_tokens_(ws.hidden, ntoken);
-    ops::embedding(hidden, input_ids, weights_.in_embed->tensor);
-
-    tensor_t pos_ids = slice_tokens_(ws.pos_ids, ntoken);
-    fill_pos_ids_(pos_ids, pos_start, ntoken);
-
-    std::vector<int32_t> new_slots;
-    const KvStatus rc = kv_cache_->alloc_tokens(seq_id, ntoken, static_cast<int64_t>(pos_start), &new_slots);
-    CHECK_ARGUMENT(rc == KvStatus::OK, "Qwen2: no free KV slots");
-    const std::vector<int32_t> *seq_slots = kv_cache_->seq_slots(seq_id);
-    ASSERT(seq_slots != nullptr, "Qwen2: missing seq slots after alloc");
-    const size_t kvlen = seq_slots->size();
-
-    for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
-        // Attention RMSNorm.
-        tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
-        ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
-
-        // Q/K/V projections: weight=[out,in], bias=[out].
-        tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
-        tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
-        tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
-
-        ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor,
-                    bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
-        ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor,
-                    bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
-        ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor,
-                    bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
-
-        tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
-        tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
-        tensor_t v_new_3d = view_2d_to_3d_(v_proj, ntoken, nkvh, dh);
-
-        // RoPE on new tokens only.
-        tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
-        tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
-        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
-        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
-
-        // Update KV cache with new tokens at routed slots.
-        for (size_t i = 0; i < ntoken; ++i) {
-            copy_token_into_cache_(caches_[layer].k_cache, new_slots[i], rope_k, i);
-            copy_token_into_cache_(caches_[layer].v_cache, new_slots[i], v_new_3d, i);
-        }
-        tensor_t k_full = gather_cache_by_slots_(caches_[layer].k_cache, *seq_slots, kvlen, ws.k_ctx);
-        tensor_t v_full = gather_cache_by_slots_(caches_[layer].v_cache, *seq_slots, kvlen, ws.v_ctx);
-
-        // Attention.
-        tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
-        ops::self_attention(attn_out, rope_q, k_full, v_full, scale);
-
-        tensor_t attn_out_2d = attn_out->view({ntoken, nh * dh});
-
-        tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
-        ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
-        ops::add(hidden, hidden, attn_proj);
-
-        // MLP RMSNorm.
-        tensor_t mlp_normed = slice_tokens_(ws.mlp_normed, ntoken);
-        ops::rms_norm(mlp_normed, hidden, weights_.mlp_norm_w[layer]->tensor, meta_.epsilon);
-
-        // SwiGLU.
-        tensor_t gate = slice_tokens_(ws.gate, ntoken);
-        tensor_t up = slice_tokens_(ws.up, ntoken);
-        ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
-        ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
-
-        tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
-        ops::swiglu(swiglu, gate, up);
-
-        tensor_t down = slice_tokens_(ws.down, ntoken);
-        ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
-        ops::add(hidden, hidden, down);
-    }
-
-    // Final norm + logits.
-    tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
-    ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
-
-    tensor_t logits = slice_tokens_(ws.logits, ntoken);
-    ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
-
-    // Decode path exposes logits rows; sampling is performed by upper layers.
-}
-
 bool Qwen2Model::validate_decode_batch_(const LlaisysBatch &batch) const {
     if (batch.n_tokens <= 0) {
         return false;
@@ -431,6 +313,12 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
     output_->clear();
     output_->reserve_rows(ntoken);
 
+    std::vector<std::vector<int64_t>> seq_sets(ntoken);
+    std::vector<int64_t> pos_values(ntoken);
+    llaisys::runtime::kv_cache::KvCache::ubatch kv_ubatch;
+    llaisys::runtime::kv_cache::KvCache::slot_info slot_info;
+    bool kv_applied = false;
+
     try {
         validate_or_die_();
         ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
@@ -439,8 +327,6 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
         const auto &ws = workspace_->view();
 
         std::vector<int64_t> tokens(ntoken);
-        std::vector<int64_t> pos_values(ntoken);
-        std::vector<std::vector<int64_t>> seq_sets(ntoken);
         std::vector<int32_t> nseq_values(ntoken, 0);
 
         std::unordered_map<int64_t, int64_t> next_pos_by_seq;
@@ -493,13 +379,24 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
             }
         }
 
-        CHECK_ARGUMENT(kv_cache_->free_slot_count() >= ntoken, "Qwen2: no free KV slots");
-
-        std::vector<int32_t> new_slots(ntoken, -1);
-        for (size_t i = 0; i < ntoken; ++i) {
-            const KvStatus rc = kv_cache_->alloc_token(seq_sets[i].data(), nseq_values[i], pos_values[i], &new_slots[i]);
-            CHECK_ARGUMENT(rc == KvStatus::OK, "Qwen2: no free KV slots");
+        kv_ubatch.seq_sets = seq_sets;
+        kv_ubatch.pos_values = pos_values;
+        auto sinfos = kv_cache_->prepare({kv_ubatch});
+        if (sinfos.empty()) {
+            return 1;
         }
+        slot_info = sinfos[0];
+        const KvStatus apply_rc = kv_cache_->apply_ubatch(slot_info, kv_ubatch);
+        if (apply_rc == KvStatus::OOM_SLOT) {
+            return 1;
+        }
+        if (apply_rc != KvStatus::OK) {
+            return -1;
+        }
+        CHECK_ARGUMENT(slot_info.n_stream() == 1, "Qwen2: unsupported slot_info stream shape");
+        CHECK_ARGUMENT(slot_info.size() == ntoken, "Qwen2: slot_info size mismatch");
+        const auto &slot_idxs = slot_info.idxs[0];
+        kv_applied = true;
 
         tensor_t input_ids = make_tensor({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
         input_ids->load(tokens.data());
@@ -558,8 +455,8 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
             ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
 
             for (size_t i = 0; i < ntoken; ++i) {
-                copy_token_into_cache_(caches_[layer].k_cache, new_slots[i], rope_k, i);
-                copy_token_into_cache_(caches_[layer].v_cache, new_slots[i], v_new_3d, i);
+                copy_token_into_cache_(caches_[layer].k_cache, slot_idxs[i], rope_k, i);
+                copy_token_into_cache_(caches_[layer].v_cache, slot_idxs[i], v_new_3d, i);
             }
 
             tensor_t k_full = gather_cache_by_slots_(caches_[layer].k_cache, used_slots, kvlen, ws.k_ctx);
@@ -604,8 +501,14 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
 
         return 0;
     } catch (const std::invalid_argument &) {
+        if (kv_applied) {
+            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
+        }
         return 1;
     } catch (...) {
+        if (kv_applied) {
+            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
+        }
         return -2;
     }
 }
@@ -630,7 +533,7 @@ KvStatus Qwen2Model::kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int
     ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
     std::vector<int32_t> src_slots;
     std::vector<int32_t> dst_slots;
-    const KvStatus rc = kv_cache_->seq_cp_prepare(dst_seq, src_seq, p0, p1, &src_slots, &dst_slots);
+    const KvStatus rc = kv_cache_->seq_cp(dst_seq, src_seq, p0, p1, &src_slots, &dst_slots);
     if (rc != KvStatus::OK) {
         return rc;
     }

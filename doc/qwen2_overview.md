@@ -90,8 +90,9 @@ llaisys/
    - `src/llaisys/qwen2/qwen2_model.cpp` 中 `decode()` 已改为单次 batch 前向执行；
    - 删除“每个 token 调一次 `infer(...,1)`”的伪批处理主路径。
 2. Unified KV：
-   - `src/llaisys/runtime/kv_cache/kv_cache.hpp/.cpp` 增加 `alloc_token/used_slots/slot_visible_for`；
-   - slot 元数据改为 `slot_seq_sets_`（一个 slot 可关联多个 seq）。
+   - `src/llaisys/runtime/kv_cache/kv_cells.hpp/.cpp` 引入 `KvCells`（cell 元信息 `pos/shift/seq_set`）；
+   - `src/llaisys/runtime/kv_cache/kv_cache.hpp/.cpp` 引入 `prepare/apply_ubatch/rollback_ubatch/update` 流程；
+   - slot 支持多 `seq_id` 关联，并维护 `seq_pos_min/max` 统计。
 3. 多序列混排 mask：
    - 新增 `ops::self_attention_masked`，并接入 Qwen2 decode 主路径；
    - 可见性规则为“seq 集合交集 + 因果 pos 约束”。
@@ -99,7 +100,7 @@ llaisys/
    - 对外 C API 不变（仍是 `llaisysModel*`）；
    - Python Engine/ModelRunner 调用链无需改签名。
 5. 当前遗留项：
-   - `kv_seq_add(delta != 0)` 仍未实现；
+   - 多 stream 执行路径尚未打通到 Qwen2 decode（当前仍单 stream）；
    - 滑窗策略与阶段3性能优化尚未开始。
 
 ### 2.2 目标目录（Target Refactor）
@@ -334,17 +335,24 @@ Core 公共实现约束（所有 4.1.x 默认遵循）：
 实现设计（As-Built）：
 
 1. 在 `src/llaisys/runtime/kv_cache/kv_cache.hpp` 实现 `KvCache`：
-   - 维护 `seq_id -> pos_to_slot`；
-   - 维护 `free_slots_` 与 `slot_seq_sets_/slot_pos_`（一个 slot 可关联多个 `seq_id`）；
-   - 提供 `alloc_tokens/alloc_token/used_slots/slot_visible_for/seq_cp_prepare/seq_rm/seq_add/seq_keep/seq_pos_max`。
-2. `Qwen2Model` 只持有 `std::unique_ptr<KvCache>`，模型层不再直接持有 `seq_states_/free_slots_` 元数据。
-3. `decode` 路径使用 `alloc_token(seq_ids, n_seq_id, pos)`，支持 `n_seq_id > 1` token。
-4. `kv_seq_cp` 在当前实现中采用“附加 seq 关联”的共享语义（`dst_slots == src_slots`），模型层在检测到同 slot 时跳过 K/V 内存拷贝。
+   - 核心状态是 `v_cells_ + v_heads_`，按 stream 管理 cell 数组与分配游标；
+   - `v_cells_` 的元素类型是 `KvCells`，cell 元信息为 `{pos, shift, seq_set}`；
+   - 维护 `seq_to_stream_`（序列归属 stream）和 `seq_slots_cache_`（按 pos 排序的序列 slot 视图缓存）；
+   - 对外提供两套接口：llama 风格 `prepare/find_slot/apply_ubatch/rollback_ubatch/update`，以及兼容包装 `alloc_token/alloc_tokens`。
+2. 在 `src/llaisys/runtime/kv_cache/kv_cells.hpp` 实现 `KvCells`：
+   - `used_` 追踪当前已占用 cell；
+   - `seq_pos_` 维护 `seq_id -> (pos -> ref_count)`，用于 `seq_pos_min/max` 常数级查询；
+   - `seq_add/seq_rm/seq_keep/pos_add` 保持 cell 集合和统计一致性。
+3. `Qwen2Model` 只持有 `std::unique_ptr<KvCache>`，模型层不再持有 slot/cell 元数据。
+4. `decode` 路径支持 `n_seq_id > 1` token，输入先转为 `ubatch{seq_sets, pos_values}`，再走 `prepare + apply_ubatch`。
+5. `kv_seq_cp` 语义：
+   - 同 stream：对命中 cell 直接附加 `dst_seq` 关联（共享 slot）；
+   - 跨 stream：复制 cell 元数据到目标 stream，对应 K/V tensor 拷贝由模型层按 `src_slots/dst_slots` 执行。
 
 目标演进（Target）：
 
 1. 当引入第二模型并出现接口分歧时，再评估抽象 `IKvCache` 接口；当前 `KvCache` 已满足阶段2功能口径。
-2. `kv_seq_add(delta != 0)` 与滑窗复用策略仍保留为后续阶段实现。
+2. 多 stream 主路径目前只完成 KV 元数据层；Qwen2 decode 的 K/V gather/mask 仍走单 stream 口径（见 4.1.16 未对齐项）。
 
 验收：
 
@@ -384,13 +392,15 @@ void copy_into_cache_slot_(tensor_t &cache, size_t slot_idx, const tensor_t &src
 ```
 
 2. `decode` 单轮流程：
-   - 先根据 batch 校验 `seq_id/pos`；
-   - 再调用 `alloc_token()` 为每个 token 分配/关联 slot；
-   - 然后按 `new_slots` 批量写入每层 K/V；
-   - 最后用 `used_slots()` 拉取全局可见 cell 集。
+   - 先根据 batch 构造 `ubatch{seq_sets, pos_values}` 并校验逻辑 pos；
+   - 调用 `prepare({ubatch})` 做 slot 规划（内部会临时 `apply_ubatch` 后回滚）；
+   - 调用 `apply_ubatch(slot_info, ubatch)` 正式提交本轮 cell 元数据；
+   - 按 `slot_info.idxs` 把新 token 的 K/V 写入对应物理 cell；
+   - 用 `used_slots()` 取可见 cell，构建 attention mask 并执行前向；
+   - 失败路径统一 `rollback_ubatch(slot_info, ubatch)`，保证元数据回滚。
 3. attention 读路径已按 cell 可见性过滤：
    - `slot_visible_for(slot, seq_ids, n_seq_id, qpos)`。
-4. 当前实现是“先分配再执行”路径，失败即整轮 `decode` 返回错误码（无上层 commit 步骤）。
+4. 当前实现是“先规划再提交”路径，失败即整轮 `decode` 返回错误码，且 rollback 生效。
 
 验收：
 
@@ -433,7 +443,7 @@ enum class KvStatus {
 ```
 
 2. 默认策略：无空闲 cell 时直接 `OOM_SLOT`，不自动踢出其他序列，不自动 `seq_rm`。
-3. `decode` 若任一 token `find_slots` 失败，整批失败返回（本轮不 commit）。
+3. `decode` 若 `prepare/find_slot` 无法为本轮 ubatch 分配足够 slot，整批失败返回（本轮不 commit）。
 4. C API 对外返回 `int`，0=成功，非0=错误码，错误码与 `KvStatus` 一一映射。
 5. 不在 Core 中做 `seq_id` 级限额检查；公平性与配额控制由 Engine/Server 层实现。
 
@@ -483,7 +493,7 @@ int64_t kv_seq_pos_max(int64_t seq_id) const;
 验收：
 
 1. 每个 API 都有单测覆盖边界区间、空区间、无命中区间。
-2. `kv_seq_rm` 后空 cell 可再次被 `find_slots` 分配。
+2. `kv_seq_rm` 后空 cell 可再次被 `find_slot/prepare` 分配。
 3. `kv_seq_add` 后 attention 按新 `pos` 生效。
 
 #### 4.1.10 需求 3.3.1：计算图覆盖范围
@@ -618,13 +628,19 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 2. batch 输入采用 SoA 连续数组（`token/pos/n_seq_id/seq_id/logits`）。
 3. 物理 cell/slot 和逻辑 pos 分离。
 4. 多序列隔离靠 `seq_id + pos` mask（`self_attention_masked` 已接入）。
-5. 资源不足默认失败，回收依赖显式 `seq_*`。
-6. Core 不做 per-seq 硬配额；请求公平性在 Engine/Server 处理。
-7. Workspace 采用 runtime 组件 `reserve + view`（已落地）；`graph_reserve` 属于后续 `runtime/graph`。
-8. 运行期图执行目前在模型内组织；`can_reuse/build+alloc` 的统一骨架属于后续 `runtime/graph`。
-9. 输出缓冲已抽到 runtime/output；显式 `output_reserve(n_outputs)` API 为可选增强。
-10. 对外只使用 `LlaisysModel` 通用接口；模型差异通过 `model_type + meta` 处理。
-11. `n_seq_id > 1` token 已在 decode 主路径支持（Unified KV）。
+5. KV 元数据结构对齐到 `KvCells`（cell 内 `seq_set + pos + shift`）并维护 `seq_pos_min/max` 统计。
+6. `prepare(ubatches) -> slot_info_vec`、`apply_ubatch()`、`rollback_ubatch()`、`update(do_shift, stream_copy_info)` 已落地。
+7. 覆盖写路径会先回收旧 cell 的序列关联，再按新 token 写入并修复序列位置区间。
+8. 资源不足默认失败，回收依赖显式 `seq_*`；Core 不做 per-seq 硬配额。
+9. Workspace 采用 runtime 组件 `reserve + view`；输出缓冲已抽到 `runtime/output`。
+10. 对外主线为 `LlaisysModel` 通用接口；`n_seq_id > 1` token 已在 decode 主路径支持。
+
+当前未完全对齐项（Target）：
+
+1. 多 stream 仍未打通到 Qwen2 decode 主路径：当前 `decode` 仍要求 `slot_info.n_stream() == 1`。
+2. `used_slots()` 与 `slot_visible_for()` 当前仅读取 stream0，尚未扩展为跨 stream 视图。
+3. `update(stream_copy_info)` 目前只更新 KV 元数据；跨 stream 的 K/V tensor 批量拷贝与调度尚未并入统一流程。
+4. `find_slot(cont=true)` 的连续块策略、SWA 相关复用分支尚未接入主执行路径（本期禁用滑窗）。
 
 ### 4.2 infer Engine（Python）
 
@@ -1214,9 +1230,9 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 ## 6. 交付验收
 ### 6.1 阶段 0：
 完成 Core 对齐 llama.cpp 的重构，落地通用多模型 API（`LlaisysModel`），实现完整的runtime能力、多序列推理能力。
-- `test/test_infer.py --test` 定义为 ModelRunner 级对拍（`decode_batch + argmax` 对齐 `transformers`），不经过 Engine 层。
+- `pytest -q test/test_infer.py --model-path /path/to/local/model` 定义为 ModelRunner 级对拍（`decode_batch + argmax` 对齐 `transformers`），不经过 Engine 层。
 - 退出条件：进入阶段1前，离线主流程必须切换到 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
-- 必须通过此前已有全部测试（包含 `test/test_infer.py --test`）。
+- 必须通过此前已有全部测试（包含 `pytest -q test/test_infer.py --model-path /path/to/local/model`）。
 - `test/test_core_decode_batch.py`：验证 SoA batch/decode 路径在单序列场景与多序列场景下的正确性。
 -  `test/test_core_output_api.py`：验证 `GetLogits/GetLogitsIth/NOutputs/OutputIds` 行为一致、行数与 `logits` 标记一致。
 -  `test/test_kv_cache.py`：KV slot/cell 语义、`seq_id + pos` 隔离、`kv_seq_*` 接口行为。
