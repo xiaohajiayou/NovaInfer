@@ -9,6 +9,9 @@
 2. 为阶段0测试引入了 `LLAISYS_MODEL_TYPE_MOCK`（测试路由模型），不影响 `qwen2` 主线接口语义。
 3. `include/llaisys/runtime/kv_cache.h` 属于目标头文件，当前仓库尚未落地该文件；KV 状态码语义目前由 `model.h` 文档约定与实现保持一致。
 4. 已提供 `llaisysModelReplaceWeight`，用于安全替换权重槽位（同句柄 no-op，异句柄先释放旧权重）。
+5. `llaisysModelDecode` 已是“真 batch 执行”语义（单轮前向处理整批 token）。
+6. 已支持 `n_seq_id > 1` token（一个 token 绑定多个 `seq_id`）。
+7. KV 已是 unified slot 语义：一个 slot 可绑定多个 `seq_id`。
 
 对齐范围说明：
 
@@ -147,6 +150,12 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
 3. 采样由上层 Engine/Executor 基于 `GetLogitsIth` 返回结果执行。
 4. 阶段0兼容期允许模型适配层临时使用离线路径 argmax（仅用于旧测试兼容），不改变 `decode` 主路径职责。
 
+`Decode` 输入约束（As-Built）：
+
+1. `n_seq_id[i] >= 1`（不再限制必须为 1）。
+2. 对于一个 token 的 seq 集，若显式提供 `pos[i]`，必须与该 seq 集当前可推进位置一致。
+3. `batch.logits` 仍仅控制“是否返回该 token 的 logits 行”，不改变 KV 写入与前向执行。
+
 ### 3.2 通用 Batch 辅助接口
 
 ```c
@@ -203,6 +212,12 @@ KV 返回码：
 4. `3`：INVALID_POS
 5. `4`：EMPTY_RANGE
 6. `5`：INTERNAL_ERROR
+
+KV 语义补充（As-Built）：
+
+1. `llaisysModelKvSeqCp(dst, src, p0, p1)` 当前为“共享前缀关联”语义：dst 附加 src 命中的 slot 关联，不强制复制新 slot。
+2. `llaisysModelKvSeqRm` 会移除 seq 与 slot 关联；当 slot 无剩余 seq 关联时释放物理 slot。
+3. `llaisysModelKvSeqAdd` 仅支持 `delta == 0`；`delta != 0` 目前返回 `INVALID_POS`（后续实现）。
 
 ## 4. 调用契约
 
@@ -311,3 +326,4 @@ HTTP 路由（As-Built）：
 1. 目前 OpenAI 路由仅覆盖 chat-completions，`/v1/completions` 与 embeddings 为后续扩展。
 2. `sampling_params` 目前是请求级；同批不同请求采样参数并行应用未完全落地。
 3. 监控接口当前以日志为主，标准 metrics 导出接口（Prometheus 等）为下一步。
+4. Core 已实现 unified KV + mask 隔离，但 `kv_seq_add(delta != 0)`、滑窗与性能优化接口仍在后续阶段。

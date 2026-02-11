@@ -82,6 +82,26 @@ llaisys/
    - `webui/app.js`
    - `webui/styles.css`
 
+### 2.1.2 Core 架构修正（As-Built，2026-02-11）
+
+本轮针对阶段0/2之间的核心偏差已完成修正，关键点如下：
+
+1. 真正 batch decode：
+   - `src/llaisys/qwen2/qwen2_model.cpp` 中 `decode()` 已改为单次 batch 前向执行；
+   - 删除“每个 token 调一次 `infer(...,1)`”的伪批处理主路径。
+2. Unified KV：
+   - `src/llaisys/runtime/kv_cache/kv_cache.hpp/.cpp` 增加 `alloc_token/used_slots/slot_visible_for`；
+   - slot 元数据改为 `slot_seq_sets_`（一个 slot 可关联多个 seq）。
+3. 多序列混排 mask：
+   - 新增 `ops::self_attention_masked`，并接入 Qwen2 decode 主路径；
+   - 可见性规则为“seq 集合交集 + 因果 pos 约束”。
+4. 行为兼容性：
+   - 对外 C API 不变（仍是 `llaisysModel*`）；
+   - Python Engine/ModelRunner 调用链无需改签名。
+5. 当前遗留项：
+   - `kv_seq_add(delta != 0)` 仍未实现；
+   - 滑窗策略与阶段3性能优化尚未开始。
+
 ### 2.2 目标目录（Target Refactor）
 
 说明：以下为目标态目录。当前阶段0已完成 `runtime/{workspace,kv_cache,output,weights}` 拆分；`runtime/graph` 与 `src/llaisys/models/{model.hpp,model.cpp}` 仍为后续演进项。
@@ -315,19 +335,21 @@ Core 公共实现约束（所有 4.1.x 默认遵循）：
 
 1. 在 `src/llaisys/runtime/kv_cache/kv_cache.hpp` 实现 `KvCache`：
    - 维护 `seq_id -> pos_to_slot`；
-   - 维护 `free_slots_` 与 `slot_seq_/slot_pos_`；
-   - 提供 `alloc_tokens/seq_slots/seq_cp_prepare/seq_rm/seq_add/seq_keep/seq_pos_max`。
+   - 维护 `free_slots_` 与 `slot_seq_sets_/slot_pos_`（一个 slot 可关联多个 `seq_id`）；
+   - 提供 `alloc_tokens/alloc_token/used_slots/slot_visible_for/seq_cp_prepare/seq_rm/seq_add/seq_keep/seq_pos_max`。
 2. `Qwen2Model` 只持有 `std::unique_ptr<KvCache>`，模型层不再直接持有 `seq_states_/free_slots_` 元数据。
-3. `kv_seq_cp` 由 `KvCache` 先给出 `src_slots/dst_slots`，模型层仅负责按 slots 做每层 K/V tensor 拷贝。
+3. `decode` 路径使用 `alloc_token(seq_ids, n_seq_id, pos)`，支持 `n_seq_id > 1` token。
+4. `kv_seq_cp` 在当前实现中采用“附加 seq 关联”的共享语义（`dst_slots == src_slots`），模型层在检测到同 slot 时跳过 K/V 内存拷贝。
 
 目标演进（Target）：
 
-1. 若后续引入 `n_seq_id > 1` 的 cell 共享语义，再升级到 `IKvCache + cell<->seq_set` 抽象。
+1. 当引入第二模型并出现接口分歧时，再评估抽象 `IKvCache` 接口；当前 `KvCache` 已满足阶段2功能口径。
+2. `kv_seq_add(delta != 0)` 与滑窗复用策略仍保留为后续阶段实现。
 
 验收：
 
 1. 能打印 `cell[idx] = {seq_ids, pos, used}` 诊断信息。
-2. `IKvCache` 可同时维护多个 `seq_id` 的 `pos_max`，并在重建统计后保持一致。
+2. 可同时维护多个 `seq_id` 的 `pos_max`，并在共享 slot 场景保持一致。
 3. 模型层不可直接改写 cell 元数据。
 
 #### 4.1.4 需求 3.1.4：输出 buffer 管理
@@ -353,23 +375,22 @@ Core 公共实现约束（所有 4.1.x 默认遵循）：
 
 #### 4.1.5 需求 3.2.1：slot/cell + 逻辑 pos
 
-实现设计：
+实现设计（As-Built）：
 
-1. 替换线性写入接口，按 `SlotInfo.idxs` 写入：
+1. KV 写入已按显式 slot 执行（而非隐式线性位移）：
 
 ```cpp
 void copy_into_cache_slot_(tensor_t &cache, size_t slot_idx, const tensor_t &src_row, size_t row_idx);
 ```
 
-2. 执行采用两阶段，避免半写入状态：
-   - 阶段 A：`find_slots(ubatch) -> SlotInfo`（只做规划，不改元数据）；
-   - 阶段 B：按 `idxs` 写 K/V 后 `commit_slots(ubatch, slots)`（原子更新元数据）。
-3. `seq_pos_stat`（`pos_min/pos_max/n_cells`）由 KV 组件维护，`Qwen2Model` 只通过查询接口读取。
-4. attention 读路径以 cell 为准：
-   - 先拿候选 cell 集（used cells）；
-   - 再过滤 `cell_has_any_seq(idx, q.seq_id_set)`（query 的 seq 集与 cell 的 seq 集有交集）；
-   - 最后做 causal 判断 `cell_pos(idx) <= q.pos`。
-5. `prefill/decode` 在 Core 内不分两套写 cache 代码，统一走 “batch(SoA) + SlotInfo”。
+2. `decode` 单轮流程：
+   - 先根据 batch 校验 `seq_id/pos`；
+   - 再调用 `alloc_token()` 为每个 token 分配/关联 slot；
+   - 然后按 `new_slots` 批量写入每层 K/V；
+   - 最后用 `used_slots()` 拉取全局可见 cell 集。
+3. attention 读路径已按 cell 可见性过滤：
+   - `slot_visible_for(slot, seq_ids, n_seq_id, qpos)`。
+4. 当前实现是“先分配再执行”路径，失败即整轮 `decode` 返回错误码（无上层 commit 步骤）。
 
 验收：
 
@@ -379,14 +400,15 @@ void copy_into_cache_slot_(tensor_t &cache, size_t slot_idx, const tensor_t &src
 
 #### 4.1.6 需求 3.2.2：多序列混排隔离
 
-实现设计：
+实现设计（As-Built）：
 
-1. 仅保留统一 mask 路径，不采用按 `seq_id` 分组执行的过渡实现。
+1. 已采用统一 mask 路径，不再按 `seq_id` 分组执行。
 2. mask 判定条件与 llama.cpp 语义对齐：
    - 集合隔离：`intersect(q.seq_ids, kv.seq_ids) != empty`；
    - causal：`kv.pos <= q.pos`。
-3. 对 `n_seq_id > 1` 的 query token，任一命中即视为可见（多 `seq_id` 视作等价集合）。
-4. `self_attention` 接口应接收 mask 或可推导 mask 的元信息，避免在调度层做分组绕行。
+3. `n_seq_id > 1` query token 已支持，任一命中即可见。
+4. `self_attention` 已新增 masked 接口并在 Qwen2 decode 主路径接入：
+   - `ops::self_attention_masked(...)`。
 
 验收：
 
@@ -529,15 +551,15 @@ void check_block_shapes_(...) const;
 
 #### 4.1.12 需求 3.3.3：RoPE 与 KV 对齐
 
-实现设计：
+实现设计（As-Built）：
 
-1. `fill_pos_ids_()` 改为按 batch 的 `pos` 列填充：
+1. 当前位置填充函数已改为按 batch 明确位置值写入：
 
 ```cpp
-void fill_pos_ids_from_batch_(const tensor_t &pos_ids, const UBatchView &ubatch);
+void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
 ```
 
-2. 禁止再用 `cur_len_ + i` 生成 pos；仅在 `batch.pos == NULL` 时按 `seq_pos_max(seq)+1` 自动补位。
+2. 禁止再用 `cur_len_ + i` 推导 pos；当 `batch.pos == NULL` 时，按 `seq_pos_max(seq)+1` 推导并校验。
 
 验收：
 
@@ -545,7 +567,7 @@ void fill_pos_ids_from_batch_(const tensor_t &pos_ids, const UBatchView &ubatch)
 
 #### 4.1.13 需求 3.3.4：batch/ubatch 路径
 
-实现设计：
+实现设计（As-Built）：
 
 1. 新增对齐 llama.cpp 的主入口（通用模型 API）：
 
@@ -557,7 +579,7 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 ```
 
 2. 模型执行统一走 `llaisysModelDecode`，不定义模型专用 `Decode` 公共入口。
-3. 每次 `decode` 处理一个 batch；内部可拆多个 ubatch 执行，外部只关心单次返回状态码。
+3. 每次 `decode` 处理一个 batch，当前实现为“单轮前向执行整个 batch”（不再逐 token `infer` 循环）。
 4. 状态码语义对齐 llama.cpp：`0=success`、`1=no KV slot`、`2=aborted`、`-1=invalid input`、`<-1=fatal`。
 5. 历史单序列调用由 Python 适配层在本地转换为 `llaisysBatchGetOne`/`llaisysModelDecode`，不再新增 C 层专用入口。
 
@@ -595,13 +617,14 @@ void llaisysBatchFree(struct LlaisysBatch batch);
 1. 输入是 token 列表，不是 `[B,T]`。
 2. batch 输入采用 SoA 连续数组（`token/pos/n_seq_id/seq_id/logits`）。
 3. 物理 cell/slot 和逻辑 pos 分离。
-4. 多序列隔离靠 `seq_id + pos` mask。
+4. 多序列隔离靠 `seq_id + pos` mask（`self_attention_masked` 已接入）。
 5. 资源不足默认失败，回收依赖显式 `seq_*`。
 6. Core 不做 per-seq 硬配额；请求公平性在 Engine/Server 处理。
 7. Workspace 采用 runtime 组件 `reserve + view`（已落地）；`graph_reserve` 属于后续 `runtime/graph`。
 8. 运行期图执行目前在模型内组织；`can_reuse/build+alloc` 的统一骨架属于后续 `runtime/graph`。
 9. 输出缓冲已抽到 runtime/output；显式 `output_reserve(n_outputs)` API 为可选增强。
 10. 对外只使用 `LlaisysModel` 通用接口；模型差异通过 `model_type + meta` 处理。
+11. `n_seq_id > 1` token 已在 decode 主路径支持（Unified KV）。
 
 ### 4.2 infer Engine（Python）
 
@@ -1201,6 +1224,7 @@ Client -> API Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> 
 -  `test/test_model_registry.py`：多模型注册与按 `model` 字段路由验证（至少覆盖 qwen2 + 一个 mock 模型）。
 -  `test/test_qwen2_adapter.py`：验证 `python/llaisys/models/qwen2.py` 基于通用 C API 的适配行为。
 -  `test/test_core_parity.py`：与 `transformers` 在 batch+argmax 路径做逐步 next-token 对拍（有本地模型时必跑）。
+- 里程碑补充（已完成）：`decode` 真 batch 执行、Unified KV（slot 可多 `seq_id`）、`self_attention_masked` 隔离路径。
 ### 6.2 阶段 1：
 Engine 内 argmax + offline完整实现。
 - `test/test_offline.py`：离线一致性与流式/非流式行为。
@@ -1225,6 +1249,7 @@ Engine 内 argmax + offline完整实现。
 - online 完整最小闭环：HTTP/OpenAI 兼容入口、SSE 流式、取消请求已实现。
 - Web UI 最小可用：多会话、流式展示、取消、调试面板已实现。
 - 端到端路径已打通：`WebUI -> Server -> AsyncLLMEngine -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
+- Core 架构修正已纳入阶段2稳定基线：多序列混排在单轮前向执行并通过 mask 隔离。
 - 阶段2验收测试（As-Built）：
   - `test/test_sampling.py`
   - `test/test_online.py`

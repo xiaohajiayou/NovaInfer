@@ -32,6 +32,15 @@
 4. Core 层（C++）：负责 batch/ubatch 执行、KV-Cache 管理与算子计算。
 5. 多模型抽象层：提供模型无关的创建/执行/输出/KV 接口，模型私有 API 仅用于内部扩展，不作为主线对外协议。
 
+### 2.1 当前实现状态（As-Built，2026-02-11）
+
+1. Core 主线接口已统一到 `llaisysModel*`，并覆盖 `create/decode/logits/kv_seq_*`。
+2. `Qwen2Model::decode` 已改为真正 batch 执行（单轮图执行处理整批 token），不再逐 token 调 `infer(..., 1)`。
+3. KV 已升级为 unified cell 语义：一个 slot 可关联多个 `seq_id`，并支持 `n_seq_id > 1` token。
+4. 多序列隔离在同一轮前向中通过 mask 生效（`seq_id` 集合交集 + `pos` 因果约束）。
+5. Engine/Server 阶段2主链路已落地（offline + online + SSE + cancel + WebUI 基础多会话）。
+6. 未实现项：`kv_seq_add(delta != 0)`、滑窗策略、阶段3性能优化（高阶连续批处理/前缀缓存收益/投机）。
+
 ## 3. Core 层需求（C++）
 
 ### 3.1 通用模型接口（阶段0必须）
@@ -191,7 +200,9 @@
 1. 已完成（功能闭环）：通用 `LlaisysModel` 主线接口、多序列 SoA decode、`kv_seq_*`、`GetLogits*` 输出接口、`qwen2 + mock` 路由、阶段0核心测试脚本。
 2. 已完成（Core 目录重构）：`workspace/kv_cache/output/weights` 已拆分到 `src/llaisys/runtime/`，`qwen2_model.cpp` 仅保留模型专有执行逻辑与算子编排。
 3. 已完成（权重槽位安全替换）：提供 `llaisysModelReplaceWeight`，模型适配层通过统一 API 写入权重槽位，避免重复赋值泄漏。
-4. 已完成（阶段1离线主链路）：`LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core` 已落地并通过离线回归测试。
+4. 已完成（真实 batch decode）：`llaisysModelDecode` 单轮处理整批 token，`output_ids` 与 logits 行索引一致。
+5. 已完成（Unified KV）：slot 支持多 `seq_id` 关联；`kv_seq_cp` 语义为附加关联（共享前缀），不再强制复制新 slot。
+6. 已完成（阶段1离线主链路）：`LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core` 已落地并通过离线回归测试。
 
 ## 8. 验收标准
 
@@ -210,7 +221,8 @@
 1. 阶段0验收通过（含 `scripts/run_tests.py --suite stage0` 全量与 parity 对拍）。
 2. 阶段1验收通过（`scripts/run_tests.py --suite stage1`；有模型时追加 `test_offline_parity`）。
 3. 阶段2核心功能闭环已完成（sampling + online + WebUI 多会话基础能力）。
-4. 阶段3进入前提：阶段2并发稳定性回归长期通过，线上接口语义冻结。
+4. 阶段2后 Core 架构修正已完成：真实 batch decode + unified KV + 单轮 mask 隔离。
+5. 阶段3进入前提：阶段2并发稳定性回归长期通过，线上接口语义冻结。
 
 ### 8.2 阶段2验收标准（As-Built）
 
@@ -261,6 +273,23 @@
 
 1. `Qwen2` tokenizer 初始化加锁。
 2. `Worker.encode_chat_messages/decode_tokens` 增加异常降级路径，确保请求不中断。
+
+### 9.4 Core 伪批处理问题（已修复）
+
+问题：
+
+1. 历史实现中 `decode` 虽接收 batch，但内部逐 token 调 `infer(..., 1)`，不是真正 batch 执行。
+2. 历史 KV 元数据是单 slot-单 seq 绑定，无法表达一个 token 同属多个 `seq_id` 的 unified 语义。
+
+方案：
+
+1. `decode` 改为单次 batch 前向：整批 token 在一轮计算图中执行。
+2. KV 升级为 unified cell：`alloc_token(seq_ids, n_seq_id, pos)`。
+3. attention 增加 mask 路径，按 `seq_id` 集合交集与 `pos` 做可见性判断。
+
+现状：
+
+1. 相关核心用例已覆盖并通过（`test_core_decode_batch/test_kv_cache/test_core_output_api/test_core_model_api`）。
 
 ## 10. 下一阶段优化路线（阶段3前）
 

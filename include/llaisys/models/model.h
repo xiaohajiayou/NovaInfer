@@ -50,8 +50,13 @@ __C {
     __export int32_t llaisysModelNOutputs(struct LlaisysModel *model);
     __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
 
-    // KV status:
-    // 0 OK, 1 OOM_SLOT, 2 INVALID_SEQ, 3 INVALID_POS, 4 EMPTY_RANGE, 5 INTERNAL_ERROR
+    // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):
+    // 0: OK
+    // 1: OOM_SLOT
+    // 2: INVALID_SEQ
+    // 3: INVALID_POS
+    // 4: EMPTY_RANGE
+    // 5: INTERNAL_ERROR
     __export int llaisysModelKvSeqCp(struct LlaisysModel *model, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
     __export int llaisysModelKvSeqRm(struct LlaisysModel *model, int64_t seq_id, int64_t p0, int64_t p1);
     __export int llaisysModelKvSeqAdd(struct LlaisysModel *model, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);

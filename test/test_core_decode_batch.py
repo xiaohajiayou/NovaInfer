@@ -106,9 +106,13 @@ def _make_batch(tokens, logits_mask, seq_ids=None, pos=None):
         seq_ptr_buf = (POINTER(c_int64) * n)()
         raw_rows = []
         for i, sid in enumerate(seq_ids):
-            row = (c_int64 * 1)(sid)
+            if isinstance(sid, (list, tuple)):
+                seq_list = [int(x) for x in sid]
+            else:
+                seq_list = [int(sid)]
+            row = (c_int64 * len(seq_list))(*seq_list)
             raw_rows.append(row)
-            n_seq_buf[i] = 1
+            n_seq_buf[i] = len(seq_list)
             seq_ptr_buf[i] = cast(row, POINTER(c_int64))
         _make_batch._raw_rows = raw_rows  # keep refs alive
 
@@ -166,7 +170,26 @@ def test_multi_seq_interleaved_decode():
         LIB_LLAISYS.llaisysModelDestroy(model)
 
 
+def test_multi_seq_set_decode():
+    model = _create_model()
+    try:
+        batch = _make_batch(
+            tokens=[10, 11, 12],
+            logits_mask=[1, 1, 1],
+            seq_ids=[1, 2, (1, 2)],
+            pos=[0, 0, 1],
+        )
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        assert status == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(1))) == 1
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(2))) == 1
+        assert int(LIB_LLAISYS.llaisysModelNOutputs(model)) == 3
+    finally:
+        LIB_LLAISYS.llaisysModelDestroy(model)
+
+
 if __name__ == "__main__":
     test_single_seq_decode_mask()
     test_multi_seq_interleaved_decode()
+    test_multi_seq_set_decode()
     print("\033[92mtest_core_decode_batch passed!\033[0m")

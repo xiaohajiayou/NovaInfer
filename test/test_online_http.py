@@ -11,6 +11,9 @@ from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.http_server import LlaisysHTTPServer
 from llaisys.server.openai_server import OpenAIServer
 
+# Disable environment proxy for localhost tests; CI/dev shells may inject HTTP_PROXY.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class DummyRunner:
     def __init__(self):
@@ -58,7 +61,7 @@ def _post_json(url: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with _NO_PROXY_OPENER.open(req, timeout=5) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -104,7 +107,7 @@ def test_http_chat_completion_stream_sse():
             method="POST",
         )
         seen_done = False
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _NO_PROXY_OPENER.open(req, timeout=10) as resp:
             for raw in resp:
                 line = raw.decode("utf-8").strip()
                 if not line.startswith("data: "):

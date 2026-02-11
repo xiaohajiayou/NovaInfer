@@ -7,6 +7,7 @@ namespace llaisys::runtime::workspace {
 
 namespace {
 
+// Small helper to keep allocation call-site concise.
 tensor_t make_tensor(const std::vector<size_t> &shape,
                      llaisysDataType_t dtype,
                      llaisysDeviceType_t device_type,
@@ -38,6 +39,7 @@ Qwen2Workspace::Qwen2Workspace(size_t hs,
       device_id_(device_id) {}
 
 Qwen2Workspace::Layout Qwen2Workspace::build_layout_(size_t ntoken) const {
+    // All offsets are counted in elements (not bytes).
     Layout layout{};
     size_t off = 0;
     layout.hidden = off;
@@ -101,6 +103,7 @@ tensor_t Qwen2Workspace::slice_i64_(const Layout &layout,
 
 void Qwen2Workspace::reserve(size_t ntoken) {
     CHECK_ARGUMENT(ntoken > 0, "workspace: ntoken must be > 0");
+    // Grow-only: reuse current arenas when capacity already satisfies request.
     if (token_cap_ >= ntoken && main_arena_ != nullptr && i64_arena_ != nullptr) {
         return;
     }
@@ -111,6 +114,7 @@ void Qwen2Workspace::reserve(size_t ntoken) {
     main_arena_ = make_tensor({layout.total_main}, dtype_, device_type_, device_id_);
     i64_arena_ = make_tensor({layout.total_i64}, LLAISYS_DTYPE_I64, device_type_, device_id_);
 
+    // Materialize all tensor views once after (re)allocation.
     view_.hidden = slice_main_(layout, layout.hidden, token_cap_ * hs_, {token_cap_, hs_});
     view_.normed = slice_main_(layout, layout.normed, token_cap_ * hs_, {token_cap_, hs_});
     view_.q_proj = slice_main_(layout, layout.q_proj, token_cap_ * (nh_ * dh_), {token_cap_, nh_ * dh_});

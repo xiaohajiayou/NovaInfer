@@ -23,7 +23,7 @@
 必须通过：
 1. 既有基线：`test/test_infer.py --test`
 2. `test/test_core_model_api.py`：`create/decode/get_logits*/kv` 行为。
-3. `test/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确。
+3. `test/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确（含 `n_seq_id > 1` 共享 token 用例）。
 4. `test/test_core_output_api.py`：`GetLogits/GetLogitsIth/NOutputs/OutputIds` 与 `batch.logits` 对齐。
 5. `test/test_kv_cache.py`：`seq_id + pos` 隔离、`kv_seq_*` 返回码与行为。
 6. `test/test_qwen2_adapter.py`：`python/llaisys/models/qwen2.py` 基于通用 C API 可用。
@@ -101,6 +101,17 @@
 python scripts/run_tests.py --suite all
 ```
 
+本地原生库前置要求（重要）：
+
+```bash
+xmake -y
+xmake install
+```
+
+说明：
+1. Python 默认加载 `python/llaisys/libllaisys/libllaisys.so`（或 `.dylib`）。
+2. 仅执行 `xmake` 可能只更新 `build/...` 下产物，未同步到 Python 实际加载路径。
+
 底层测试执行器：`pytest`。`scripts/run_tests.py` 仅负责按阶段和策略拼装 pytest 命令。
 
 统一入口参数说明：
@@ -160,6 +171,7 @@ PYTHONPATH=python python -m pytest -q
 3. 阶段2核心能力已落地：采样链、在线接口、SSE、取消、多会话并发隔离回归。
 4. 后续回归默认从 `scripts/run_tests.py` 开始，失败再下钻单测。
 5. 下一重点为阶段3吞吐优化（连续批处理、前缀缓存、投机）。
+6. Core 架构修正已完成：`decode` 真 batch 执行 + unified KV + 单轮 mask 隔离；对应核心回归已通过。
 
 ## 7. 实施问题复盘（阶段2）
 
@@ -169,6 +181,11 @@ PYTHONPATH=python python -m pytest -q
 4. 解决：显式 `close` 链 + C++ `Context` 生命周期修正（初始化、引用语义、跨线程析构风险规避）。
 5. 问题：并发首请求 Tokenizer 初始化偶发异常。
 6. 解决：Tokenizer 延迟初始化加锁，Worker 增加编码/解码降级路径。
+7. 问题：`test/test_online_http.py` 在部分环境报 `http.client.RemoteDisconnected`，且服务端无 traceback。
+8. 根因：测试进程受到环境代理变量影响（`HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`），请求未稳定直连本地 `127.0.0.1` 测试服务。
+9. 解决：在 `test/test_online_http.py` 中使用无代理 opener（`urllib.request.ProxyHandler({})`），强制 localhost 直连；README 增加排障说明。
+10. 问题：Core 曾存在“伪批处理”路径（`decode` 逐 token 调 `infer`），与动态批处理设计不一致。
+11. 解决：将 `decode` 改为单轮 batch 前向，并在 `KvCache` 引入 unified slot 语义（支持一个 token 关联多个 `seq_id`）。
 
 ## 8. 回归规则
 

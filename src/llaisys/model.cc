@@ -12,6 +12,11 @@
 namespace {
 
 using llaisys::models::qwen2::Qwen2Model;
+using KvStatus = llaisys::runtime::kv_cache::KvStatus;
+
+int to_kv_code(KvStatus status) {
+    return static_cast<int>(status);
+}
 
 class MockModel {
 public:
@@ -75,57 +80,57 @@ public:
         return output_ids_.empty() ? nullptr : output_ids_.data();
     }
 
-    int kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
+    KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
         auto it = seq_pos_max_.find(src_seq);
         if (it == seq_pos_max_.end()) {
-            return 2;
+            return KvStatus::INVALID_SEQ;
         }
         if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return 3;
+            return KvStatus::INVALID_POS;
         }
         if (p0 == p1) {
-            return 4;
+            return KvStatus::EMPTY_RANGE;
         }
         seq_pos_max_[dst_seq] = static_cast<int64_t>(p1 - p0 - 1);
-        return 0;
+        return KvStatus::OK;
     }
-    int kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
+    KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
         auto it = seq_pos_max_.find(seq_id);
         if (it == seq_pos_max_.end()) {
-            return 2;
+            return KvStatus::INVALID_SEQ;
         }
         if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return 3;
+            return KvStatus::INVALID_POS;
         }
         if (p0 == p1) {
-            return 4;
+            return KvStatus::EMPTY_RANGE;
         }
         if (p0 == 0 && p1 == it->second + 1) {
             seq_pos_max_.erase(it);
         } else {
             it->second = p0 - 1;
         }
-        return 0;
+        return KvStatus::OK;
     }
-    int kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
+    KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
         auto it = seq_pos_max_.find(seq_id);
         if (it == seq_pos_max_.end()) {
-            return 2;
+            return KvStatus::INVALID_SEQ;
         }
         if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return 3;
+            return KvStatus::INVALID_POS;
         }
         if (p0 == p1) {
-            return 4;
+            return KvStatus::EMPTY_RANGE;
         }
         if (delta != 0) {
-            return 3;
+            return KvStatus::INVALID_POS;
         }
-        return 0;
+        return KvStatus::OK;
     }
-    int kv_seq_keep(int64_t seq_id) {
+    KvStatus kv_seq_keep(int64_t seq_id) {
         if (seq_pos_max_.find(seq_id) == seq_pos_max_.end()) {
-            return 2;
+            return KvStatus::INVALID_SEQ;
         }
         std::vector<int64_t> remove_keys;
         remove_keys.reserve(seq_pos_max_.size());
@@ -137,7 +142,7 @@ public:
         for (const int64_t k : remove_keys) {
             seq_pos_max_.erase(k);
         }
-        return 0;
+        return KvStatus::OK;
     }
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept {
         auto it = seq_pos_max_.find(seq_id);
@@ -462,57 +467,73 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model) {
 
 __export int llaisysModelKvSeqCp(struct LlaisysModel *model, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
     if (model == nullptr || model->impl == nullptr) {
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
     switch (model->impl->type) {
     case LLAISYS_MODEL_TYPE_QWEN2:
-        return model->impl->qwen2 ? model->impl->qwen2->kv_seq_cp(dst_seq, src_seq, p0, p1) : 5;
+        return model->impl->qwen2
+                   ? to_kv_code(model->impl->qwen2->kv_seq_cp(dst_seq, src_seq, p0, p1))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     case LLAISYS_MODEL_TYPE_MOCK:
-        return model->impl->mock ? model->impl->mock->kv_seq_cp(dst_seq, src_seq, p0, p1) : 5;
+        return model->impl->mock
+                   ? to_kv_code(model->impl->mock->kv_seq_cp(dst_seq, src_seq, p0, p1))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     default:
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
 }
 
 __export int llaisysModelKvSeqRm(struct LlaisysModel *model, int64_t seq_id, int64_t p0, int64_t p1) {
     if (model == nullptr || model->impl == nullptr) {
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
     switch (model->impl->type) {
     case LLAISYS_MODEL_TYPE_QWEN2:
-        return model->impl->qwen2 ? model->impl->qwen2->kv_seq_rm(seq_id, p0, p1) : 5;
+        return model->impl->qwen2
+                   ? to_kv_code(model->impl->qwen2->kv_seq_rm(seq_id, p0, p1))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     case LLAISYS_MODEL_TYPE_MOCK:
-        return model->impl->mock ? model->impl->mock->kv_seq_rm(seq_id, p0, p1) : 5;
+        return model->impl->mock
+                   ? to_kv_code(model->impl->mock->kv_seq_rm(seq_id, p0, p1))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     default:
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
 }
 
 __export int llaisysModelKvSeqAdd(struct LlaisysModel *model, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
     if (model == nullptr || model->impl == nullptr) {
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
     switch (model->impl->type) {
     case LLAISYS_MODEL_TYPE_QWEN2:
-        return model->impl->qwen2 ? model->impl->qwen2->kv_seq_add(seq_id, p0, p1, delta) : 5;
+        return model->impl->qwen2
+                   ? to_kv_code(model->impl->qwen2->kv_seq_add(seq_id, p0, p1, delta))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     case LLAISYS_MODEL_TYPE_MOCK:
-        return model->impl->mock ? model->impl->mock->kv_seq_add(seq_id, p0, p1, delta) : 5;
+        return model->impl->mock
+                   ? to_kv_code(model->impl->mock->kv_seq_add(seq_id, p0, p1, delta))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     default:
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
 }
 
 __export int llaisysModelKvSeqKeep(struct LlaisysModel *model, int64_t seq_id) {
     if (model == nullptr || model->impl == nullptr) {
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
     switch (model->impl->type) {
     case LLAISYS_MODEL_TYPE_QWEN2:
-        return model->impl->qwen2 ? model->impl->qwen2->kv_seq_keep(seq_id) : 5;
+        return model->impl->qwen2
+                   ? to_kv_code(model->impl->qwen2->kv_seq_keep(seq_id))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     case LLAISYS_MODEL_TYPE_MOCK:
-        return model->impl->mock ? model->impl->mock->kv_seq_keep(seq_id) : 5;
+        return model->impl->mock
+                   ? to_kv_code(model->impl->mock->kv_seq_keep(seq_id))
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
     default:
-        return 5;
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
 }
 

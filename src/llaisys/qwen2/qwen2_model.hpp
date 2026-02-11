@@ -20,6 +20,7 @@
 #include "../../utils/check.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -47,10 +48,10 @@ public:
     int32_t n_outputs() const noexcept;
     const int32_t *output_ids() const noexcept;
 
-    int kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
-    int kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
-    int kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
-    int kv_seq_keep(int64_t seq_id);
+    runtime::kv_cache::KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
+    runtime::kv_cache::KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
+    runtime::kv_cache::KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
+    runtime::kv_cache::KvStatus kv_seq_keep(int64_t seq_id);
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
 
     void infer(int64_t seq_id, int64_t *token_ids, size_t ntoken);
@@ -95,6 +96,7 @@ private:
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
     void fill_pos_ids_(const tensor_t &pos_ids, size_t start, size_t len);
+    void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
 

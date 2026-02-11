@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -58,6 +59,19 @@ class LlaisysHTTPServer:
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+                self.wfile.flush()
+
+            def _safe_write_json(self, status: int, payload: dict):
+                try:
+                    self._write_json(status, payload)
+                    return
+                except Exception:
+                    # Best-effort fallback for already-broken sockets or header state.
+                    traceback.print_exc()
+                try:
+                    self.send_error(status)
+                except Exception:
+                    traceback.print_exc()
 
             def _read_json(self) -> dict:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -127,12 +141,22 @@ class LlaisysHTTPServer:
                         return
 
                     self._write_json(404, {"error": "not_found"})
-                except ValueError as exc:
-                    self._write_json(400, {"error": "bad_request", "message": str(exc)})
                 except Exception as exc:
-                    self._write_json(500, {"error": "internal_error", "message": str(exc)})
+                    traceback.print_exc()
+                    status = 400 if isinstance(exc, ValueError) else 500
+                    err = "bad_request" if status == 400 else "internal_error"
+                    self._safe_write_json(status, {"error": err, "message": str(exc)})
+                except BaseException:
+                    # Keep the server process alive and preserve traceback for debugging.
+                    traceback.print_exc()
+                    self._safe_write_json(500, {"error": "internal_error", "message": "unexpected server failure"})
 
-        self._httpd = ThreadingHTTPServer((self._host, self._port), Handler)
+        class _DebugThreadingHTTPServer(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):  # type: ignore[override]
+                traceback.print_exc()
+                return super().handle_error(request, client_address)
+
+        self._httpd = _DebugThreadingHTTPServer((self._host, self._port), Handler)
         self._port = int(self._httpd.server_address[1])
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()

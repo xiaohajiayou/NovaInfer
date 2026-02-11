@@ -9,6 +9,7 @@ namespace llaisys::runtime::output {
 
 namespace {
 
+// Convert one logits row from its runtime dtype into f32 output storage.
 void copy_row_to_f32(const std::byte *src, llaisysDataType_t dtype, size_t n, float *dst) {
     switch (dtype) {
     case LLAISYS_DTYPE_F32: {
@@ -38,11 +39,13 @@ void copy_row_to_f32(const std::byte *src, llaisysDataType_t dtype, size_t n, fl
 } // namespace
 
 void OutputBuffer::clear() {
+    // Keep allocated memory for next step; reset logical contents only.
     logits_f32_.clear();
     output_ids_.clear();
 }
 
 void OutputBuffer::reserve_rows(size_t n_rows) {
+    // Reserve payload and mapping buffers together to keep append_row amortized O(1).
     logits_f32_.reserve(n_rows * voc_);
     output_ids_.reserve(n_rows);
 }
@@ -63,6 +66,7 @@ float *OutputBuffer::logits_ith(int32_t i) noexcept {
     if (i < 0 || static_cast<size_t>(i) >= output_ids_.size()) {
         return nullptr;
     }
+    // Rows are tightly packed in row-major order.
     return logits_f32_.data() + static_cast<size_t>(i) * voc_;
 }
 
