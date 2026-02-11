@@ -24,12 +24,11 @@ def load_shared_library():
     elif sys.platform == "win32":
         libname = "llaisys.dll"
     elif sys.platform == "darwin":
-        libname = "llaisys.dylib"
+        libname = "libllaisys.dylib"
     else:
         raise RuntimeError("Unsupported platform")
 
     lib_path = os.path.join(lib_dir, libname)
-
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
 

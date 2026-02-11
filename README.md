@@ -2,13 +2,25 @@
 
 ## Quick Start
 
-### 1. Install Python package
+### 1. Build native library
+
+Linux/macOS (CPU):
+
+```bash
+xmake f -m release
+xmake
+xmake install
+```
+
+The install step copies the shared library into `python/llaisys/libllaisys/`.
+
+### 2. Install Python package
 
 ```bash
 pip install -e ./python[test]
 ```
 
-### 2. Run tests (pytest)
+### 3. Run tests (pytest)
 
 Run all default tests:
 
@@ -35,6 +47,22 @@ Run stage suites:
 python scripts/run_tests.py --suite stage0 --run-parity never --run-hf never
 python scripts/run_tests.py --suite stage1 --run-parity never
 python scripts/run_tests.py --suite stage2
+```
+
+## macOS Notes
+
+- Current macOS support is CPU-only (`--device cpu`).
+- NVIDIA/CUDA path is not available on macOS.
+- After `xmake install`, verify native library is present:
+
+```bash
+ls python/llaisys/libllaisys/libllaisys.dylib
+```
+
+- Quick sanity check:
+
+```bash
+PYTHONPATH=python python -c "import llaisys; print('ok')"
 ```
 
 ## Run Inference Services
