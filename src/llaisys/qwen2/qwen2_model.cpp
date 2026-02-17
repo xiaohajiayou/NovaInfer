@@ -79,17 +79,8 @@ void Qwen2Model::init_weight_slots_() {
 }
 
 void Qwen2Model::init_kv_cache_() {
-    caches_.clear();
-    caches_.reserve(meta_.nlayer);
-
-    const std::vector<size_t> cache_shape{meta_.maxseq, meta_.nkvh, meta_.dh};
-    for (size_t i = 0; i < meta_.nlayer; ++i) {
-        LayerCache cache{};
-        cache.k_cache = make_tensor(cache_shape, meta_.dtype, device_type_, device_id_);
-        cache.v_cache = make_tensor(cache_shape, meta_.dtype, device_type_, device_id_);
-        caches_.push_back(std::move(cache));
-    }
     kv_cache_ = std::make_unique<runtime::kv_cache::KvCache>(meta_.maxseq);
+    kv_cache_->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
 }
 
 void Qwen2Model::check_meta_invariants_() const {
@@ -454,13 +445,15 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
             ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
             ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
 
+            tensor_t layer_k_cache = kv_cache_->layer_k(layer);
+            tensor_t layer_v_cache = kv_cache_->layer_v(layer);
             for (size_t i = 0; i < ntoken; ++i) {
-                copy_token_into_cache_(caches_[layer].k_cache, slot_idxs[i], rope_k, i);
-                copy_token_into_cache_(caches_[layer].v_cache, slot_idxs[i], v_new_3d, i);
+                copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
+                copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
             }
 
-            tensor_t k_full = gather_cache_by_slots_(caches_[layer].k_cache, used_slots, kvlen, ws.k_ctx);
-            tensor_t v_full = gather_cache_by_slots_(caches_[layer].v_cache, used_slots, kvlen, ws.v_ctx);
+            tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
+            tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
 
             tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
             ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
@@ -548,10 +541,12 @@ KvStatus Qwen2Model::kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int
             continue;
         }
         for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
-            std::byte *k_dst = caches_[layer].k_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
-            std::byte *v_dst = caches_[layer].v_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
-            const std::byte *k_src = caches_[layer].k_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
-            const std::byte *v_src = caches_[layer].v_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
+            tensor_t layer_k_cache = kv_cache_->layer_k(layer);
+            tensor_t layer_v_cache = kv_cache_->layer_v(layer);
+            std::byte *k_dst = layer_k_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
+            std::byte *v_dst = layer_v_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
+            const std::byte *k_src = layer_k_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
+            const std::byte *v_src = layer_v_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
             std::memcpy(k_dst, k_src, stride_bytes);
             std::memcpy(v_dst, v_src, stride_bytes);
         }
