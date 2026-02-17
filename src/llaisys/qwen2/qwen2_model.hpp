@@ -55,11 +55,6 @@ public:
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
 
 private:
-    struct LayerCache {
-        tensor_t k_cache;
-        tensor_t v_cache;
-    };
-
     LlaisysQwen2Meta meta_{};
     llaisysDeviceType_t device_type_{LLAISYS_DEVICE_CPU};
     int device_id_{0};
@@ -67,7 +62,6 @@ private:
     LlaisysQwen2Weights weights_{};
     bool validated_{false};
 
-    std::vector<LayerCache> caches_{};
     std::unique_ptr<runtime::kv_cache::KvCache> kv_cache_{};
     std::unique_ptr<runtime::output::OutputBuffer> output_{};
     runtime::workspace::qwen2_workspace_t workspace_{};

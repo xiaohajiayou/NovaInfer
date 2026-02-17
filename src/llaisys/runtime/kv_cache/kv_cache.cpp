@@ -1,5 +1,7 @@
 #include "kv_cache.hpp"
 
+#include "../../../utils/check.hpp"
+
 #include <algorithm>
 #include <limits>
 #include <unordered_map>
@@ -13,6 +15,38 @@ KvCache::KvCache(size_t maxseq, uint32_t n_stream) : maxseq_(maxseq), n_stream_(
     for (auto &cells : v_cells_) {
         cells.resize(static_cast<uint32_t>(maxseq_));
     }
+}
+
+void KvCache::init_storage(size_t nlayer,
+                           size_t nkvh,
+                           size_t dh,
+                           llaisysDataType_t dtype,
+                           llaisysDeviceType_t device_type,
+                           int device_id) {
+    CHECK_ARGUMENT(maxseq_ > 0, "kv_cache: maxseq must be > 0");
+    CHECK_ARGUMENT(nlayer > 0, "kv_cache: nlayer must be > 0");
+    CHECK_ARGUMENT(nkvh > 0, "kv_cache: nkvh must be > 0");
+    CHECK_ARGUMENT(dh > 0, "kv_cache: dh must be > 0");
+
+    k_arena_ = Tensor::create({nlayer, maxseq_, nkvh, dh}, dtype, device_type, device_id);
+    v_arena_ = Tensor::create({nlayer, maxseq_, nkvh, dh}, dtype, device_type, device_id);
+    layers_.clear();
+    layers_.reserve(nlayer);
+    for (size_t il = 0; il < nlayer; ++il) {
+        tensor_t k_cache = k_arena_->slice(0, il, il + 1)->view({maxseq_, nkvh, dh});
+        tensor_t v_cache = v_arena_->slice(0, il, il + 1)->view({maxseq_, nkvh, dh});
+        layers_.push_back({k_cache, v_cache});
+    }
+}
+
+tensor_t KvCache::layer_k(size_t layer) const {
+    CHECK_ARGUMENT(layer < layers_.size(), "kv_cache: layer_k index out of range");
+    return layers_[layer].k_cache;
+}
+
+tensor_t KvCache::layer_v(size_t layer) const {
+    CHECK_ARGUMENT(layer < layers_.size(), "kv_cache: layer_v index out of range");
+    return layers_[layer].v_cache;
 }
 
 size_t KvCache::free_slot_count_stream_(uint32_t stream) const noexcept {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kv_cells.hpp"
+#include "../../../tensor/tensor.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,11 @@ enum class KvStatus : int32_t {
 
 class KvCache {
 public:
+    struct LayerCache {
+        tensor_t k_cache;
+        tensor_t v_cache;
+    };
+
     struct stream_copy_info {
         bool empty() const noexcept { return ssrc.empty(); }
         std::vector<uint32_t> ssrc;
@@ -78,6 +84,16 @@ public:
     size_t maxseq() const noexcept { return maxseq_; }
     uint32_t n_stream() const noexcept { return n_stream_; }
     size_t free_slot_count() const noexcept;
+    size_t n_layer() const noexcept { return layers_.size(); }
+
+    void init_storage(size_t nlayer,
+                      size_t nkvh,
+                      size_t dh,
+                      llaisysDataType_t dtype,
+                      llaisysDeviceType_t device_type,
+                      int device_id);
+    tensor_t layer_k(size_t layer) const;
+    tensor_t layer_v(size_t layer) const;
 
     slot_info_vec_t prepare(const std::vector<ubatch> &ubatches);
     bool update(bool do_shift, const stream_copy_info &sc_info);
@@ -127,6 +143,10 @@ private:
 
     size_t maxseq_;
     uint32_t n_stream_;
+
+    tensor_t k_arena_;
+    tensor_t v_arena_;
+    std::vector<LayerCache> layers_;
 
     std::vector<KvCells> v_cells_;
     std::vector<uint32_t> v_heads_;
