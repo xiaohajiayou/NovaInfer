@@ -91,6 +91,33 @@ python scripts/bench_kv_layout.py \
 | 2026-02-xx | DeepSeek-R1-Distill-Qwen-1.5B | cpu | slot | 8 | 3 | 512 | 512 | 1024 | 32768 | 8 |  |  |  |  |
 | 2026-02-xx | DeepSeek-R1-Distill-Qwen-1.5B | cpu | block | 8 | 3 | 512 | 512 | 1024 | 32768 | 8 |  |  |  |  |
 
+基线实测记录（末版，持续追加）：
+| Date | Model | Device | Layout | num_prompts | rounds | max_input_len | max_output_len | max_model_len | kv_capacity_tokens | OMP_NUM_THREADS | completion_tokens | seconds | tokens/s | avg_req_latency_ms |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2026-02-18 | DeepSeek-R1-Distill-Qwen-1.5B | cpu | slot | 4 | 1 | N/A | N/A | 4096 | 4096 | 8 | 1292 | 557.2898 | 2.3184 | 139322.45 |
+| 2026-02-18 | DeepSeek-R1-Distill-Qwen-1.5B | cpu | block | 4 | 1 | N/A | N/A | 4096 | 4096 | 8 | 1292 | 449.6949 | 2.8731 | 112423.74 |
+
+对比结论：
+1. `speedup(block/slot)=1.2393x`
+
+M1 首次实测基线（已记录）：
+1. 测试日期：2026-02-18
+2. 命令参数：
+   - `layout=both`
+   - `block_size=16`
+   - `num_prompts=4`
+   - `rounds=1`
+   - `seed=0`
+   - `max_model_len=4096`
+   - `kv_cache_capacity_tokens=4096`
+   - `OMP_NUM_THREADS=8`
+   - `OMP_PROC_BIND=spread`
+   - `OMP_PLACES=cores`
+3. 结果：
+   - SLOT: `completion_tokens=1292`, `seconds=557.2898`, `tokens/s=2.3184`, `avg_req_latency_ms=139322.45`
+   - BLOCK: `completion_tokens=1292`, `seconds=449.6949`, `tokens/s=2.8731`, `avg_req_latency_ms=112423.74`
+   - `speedup(block/slot)=1.2393x`
+
 ### M2: 连续批处理收敛（调度主线）
 
 1. `StepPlan` 彻底 request-aware：

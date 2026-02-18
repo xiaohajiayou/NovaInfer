@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..libllaisys import DeviceType
+from ..libllaisys.model import KvCacheLayout
 from .model_registry import ModelRegistry, create_default_registry
 from .types import BatchPlan
 
@@ -15,19 +16,37 @@ class Worker:
         model_type: str = "qwen2",
         model_path: Path | str | None = None,
         device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: int | None = None,
+        kv_cache_capacity_tokens: int | None = None,
         model_runner=None,
         model_registry: ModelRegistry | None = None,
     ):
         self._model_type = model_type
         self._model_path = Path(model_path) if model_path is not None else None
         self._device = device
+        self._kv_cache_layout = kv_cache_layout
+        self._kv_cache_block_size = int(kv_cache_block_size)
+        self._max_model_len = int(max_model_len) if max_model_len is not None else None
+        self._kv_cache_capacity_tokens = (
+            int(kv_cache_capacity_tokens) if kv_cache_capacity_tokens is not None else None
+        )
         self._model_registry = model_registry if model_registry is not None else create_default_registry()
         self._model_runner = model_runner if model_runner is not None else self._create_model_runner()
 
     def _create_model_runner(self):
         if self._model_path is None:
             raise ValueError("model_path is required when model_runner is not provided")
-        return self._model_registry.create(self._model_type, self._model_path, self._device)
+        return self._model_registry.create(
+            self._model_type,
+            self._model_path,
+            self._device,
+            kv_cache_layout=self._kv_cache_layout,
+            kv_cache_block_size=self._kv_cache_block_size,
+            max_model_len=self._max_model_len,
+            kv_cache_capacity_tokens=self._kv_cache_capacity_tokens,
+        )
 
     @property
     def model_runner(self):
@@ -60,6 +79,17 @@ class Worker:
             seq_ids=plan.seq_ids,
             logits_mask=plan.logits_mask,
         )
+
+    def free_request(self, seq_id: int) -> None:
+        # Capability probing to avoid coupling engine lifecycle to one runner API.
+        for fn_name in ("request_free", "free_request", "kv_request_free"):
+            fn = getattr(self._model_runner, fn_name, None)
+            if callable(fn):
+                try:
+                    fn(int(seq_id))
+                except Exception:
+                    pass
+                return
 
     def decode_tokens(self, token_ids: list[int]) -> str | None:
         if hasattr(self._model_runner, "decode_tokens"):

@@ -16,7 +16,7 @@ import torch
 from ctypes import POINTER, byref, cast, c_int, c_int8, c_int32, c_int64, c_void_p
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
-from ..libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
+from ..libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from ..tensor import Tensor
 
@@ -126,7 +126,7 @@ def _read_config(model_path: Path) -> dict:
         return json.load(f)
 
 
-def _parse_meta(model_path: Path) -> _MetaInfo:
+def _parse_meta(model_path: Path, max_model_len: Optional[int] = None) -> _MetaInfo:
     cfg = _read_config(model_path)
 
     dtype = _torch_dtype_to_datatype(cfg.get("torch_dtype"))
@@ -148,7 +148,7 @@ def _parse_meta(model_path: Path) -> _MetaInfo:
     cfg_maxseq = int(cfg["max_position_embeddings"])
     # KV-cache memory grows linearly with maxseq and can easily reach multiple GB.
     # Cap it by default to keep the stage-1 implementation stable on typical machines.
-    cap_maxseq = int(os.getenv("LLAISYS_MAXSEQ", "4096"))
+    cap_maxseq = int(max_model_len) if max_model_len is not None else int(os.getenv("LLAISYS_MAXSEQ", "4096"))
     maxseq = min(cfg_maxseq, cap_maxseq)
 
     return _MetaInfo(
@@ -192,13 +192,23 @@ def _device_ids(device_id: int = 0):
 class Qwen2:
     """Qwen2 model wrapper backed by the LLAISYS C++ runtime."""
 
-    def __init__(self, model_path: Path | str, device: DeviceType = DeviceType.CPU):
+    def __init__(
+        self,
+        model_path: Path | str,
+        device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: Optional[int] = None,
+        kv_cache_capacity_tokens: Optional[int] = None,
+    ):
         self._model_path = Path(model_path)
         self._device = device
 
-        meta = _parse_meta(self._model_path)
+        meta = _parse_meta(self._model_path, max_model_len=max_model_len)
         self._meta_info = meta
         self._meta_struct = _build_meta_struct(meta)
+        self._max_model_len = int(meta.maxseq)
+        self._kv_cache_capacity_tokens = int(kv_cache_capacity_tokens) if kv_cache_capacity_tokens else int(meta.maxseq)
 
         dev_ids, ndev = _device_ids(0)
         create_params = LlaisysModelCreateParams(
@@ -207,6 +217,10 @@ class Qwen2:
             device,
             dev_ids,
             ndev,
+            int(kv_cache_layout),
+            int(kv_cache_block_size),
+            int(self._max_model_len),
+            int(self._kv_cache_capacity_tokens),
         )
         self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params))
         if not self._model:
@@ -317,7 +331,7 @@ class Qwen2:
 
     @property
     def max_seq_len(self) -> int:
-        return int(self._meta_info.maxseq)
+        return int(self._max_model_len)
 
     @property
     def end_token_id(self) -> int:

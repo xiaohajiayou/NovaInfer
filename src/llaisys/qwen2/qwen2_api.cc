@@ -17,7 +17,8 @@ struct LlaisysQwen2ModelImpl {
                                    llaisysDeviceType_t device,
                                    int *device_ids,
                                    int ndevice)
-        : model(std::make_unique<Qwen2Model>(meta, device, device_ids, ndevice)) {}
+        : model(std::make_unique<Qwen2Model>(meta, device, device_ids, ndevice,
+                                             llaisys::runtime::kv_cache::KvCacheLayout::BLOCK, 16, meta.maxseq)) {}
 
     std::unique_ptr<Qwen2Model> model;
 };

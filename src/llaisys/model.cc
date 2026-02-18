@@ -267,8 +267,32 @@ __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreate
                 delete handle;
                 return nullptr;
             }
-            const auto *meta = reinterpret_cast<const LlaisysQwen2Meta *>(params->meta);
-            handle->impl->qwen2 = std::make_unique<Qwen2Model>(*meta, params->device, params->device_ids, params->ndevice);
+
+            llaisys::runtime::kv_cache::KvCacheLayout kv_layout =
+                llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
+            if (params->kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
+                kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::SLOT;
+            } else if (params->kv_cache_layout >= 0 && params->kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
+                delete handle;
+                return nullptr;
+            }
+
+            size_t kv_block_size = 16;
+            if (params->kv_cache_block_size > 0) {
+                kv_block_size = static_cast<size_t>(params->kv_cache_block_size);
+            }
+
+            auto meta = *reinterpret_cast<const LlaisysQwen2Meta *>(params->meta);
+            if (params->max_model_len > 0) {
+                meta.maxseq = static_cast<int64_t>(params->max_model_len);
+            }
+            size_t kv_cache_capacity_tokens = static_cast<size_t>(meta.maxseq);
+            if (params->kv_cache_capacity_tokens > 0) {
+                kv_cache_capacity_tokens = static_cast<size_t>(params->kv_cache_capacity_tokens);
+            }
+            handle->impl->qwen2 =
+                std::make_unique<Qwen2Model>(meta, params->device, params->device_ids, params->ndevice, kv_layout,
+                                             kv_block_size, kv_cache_capacity_tokens);
             return handle;
         }
         case LLAISYS_MODEL_TYPE_MOCK: {

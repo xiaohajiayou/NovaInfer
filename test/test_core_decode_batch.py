@@ -5,8 +5,12 @@ import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+
+TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
+TEST_KV_BLOCK_SIZE = 16
+IS_BLOCK_LAYOUT = TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK)
 
 
 
@@ -65,6 +69,8 @@ def _create_model(meta: TinyMeta = TinyMeta()):
         llaisys.DeviceType.CPU,
         dev_ids,
         1,
+        TEST_KV_LAYOUT,
+        TEST_KV_BLOCK_SIZE,
     )
     model = LIB_LLAISYS.llaisysModelCreate(byref(params))
     if not model:
@@ -180,6 +186,9 @@ def test_multi_seq_set_decode():
             pos=[0, 0, 1],
         )
         status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        if IS_BLOCK_LAYOUT:
+            assert status == 1
+            return
         assert status == 0
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(1))) == 1
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(2))) == 1

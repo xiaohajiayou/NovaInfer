@@ -2,6 +2,11 @@
 
 本需求文档面向“离线推理 + 在线服务”两种形态，描述交付要求与验收标准，不包含实现细节；实现允许分阶段落地。
 
+> 文档状态更新（2026-02-18）  
+> 本文部分历史需求描述（尤其 KV 的 slot/unified 主线口径）与当前实现存在偏差。  
+> 若冲突，以 2.2 节“当前重构策略（2026-02）”为准。详细计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
+> 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
+
 ## 1. 目标与范围
 
 设计目标：
@@ -20,7 +25,7 @@
 
 对齐范围（统一口径）：
 
-1. Core 层按 llama.cpp 语义对齐（SoA batch、`logits/output_ids`、`kv_seq_*`、资源不足失败返回）。
+1. Core 层按“通用 SoA batch + 资源不足失败返回 + 多布局 KV（SLOT/BLOCK）”语义演进。
 2. Engine 离线链路按 vLLM/`nano-vllm` 的 `LLM.generate -> engine step` 思路对齐（阶段1落地）。
 3. Online 服务按 vLLM API Server 分层对齐（阶段2落地）；阶段0不要求 online 全链路实现。
 
@@ -36,11 +41,18 @@
 
 1. Core 主线接口已统一到 `llaisysModel*`，并覆盖 `create/decode/logits/kv_seq_*`。
 2. `Qwen2Model::decode` 已改为真正 batch 执行（单轮图执行处理整批 token），不再逐 token 调 `infer(..., 1)`。
-3. KV 已升级为 unified cell 语义：一个 slot 可关联多个 `seq_id`，并支持 `n_seq_id > 1` token。
+3. KV 已进入双实现并存阶段：SLOT 路径支持多 `seq_id` 关联，BLOCK 路径基于 block table 演进。
 4. 多序列隔离在同一轮前向中通过 mask 生效（`seq_id` 集合交集 + `pos` 因果约束）。
 5. Engine/Server 阶段2主链路已落地（offline + online + SSE + cancel + WebUI 基础多会话）。
-6. KV 元数据流程已引入 llama.cpp 风格 `prepare(ubatches) -> slot_info_vec`、`apply_ubatch`、`rollback_ubatch`、`update(stream_copy_info)`。
-7. 未实现项：多 stream 端到端执行路径（含跨 stream K/V tensor 流程）、滑窗策略、阶段3性能优化（高阶连续批处理/前缀缓存收益/投机）。
+6. KV 当前为双实现并存：`SLOT(UnifiedKvImpl)` + `BLOCK(PagedKvImpl)`，通过 `kv_cache_layout` 切换。
+7. BLOCK 模式已可用但仍在性能链路重构中（page-native attention / block sparse 未完成）。
+
+### 2.2 当前重构策略（2026-02）
+
+1. `BLOCK` 是性能主线（连续批处理、前缀缓存、后续 page attention）。
+2. `SLOT` 作为兼容/回归/性能对照模式，优先保证基础可用，不再承担主要性能演进。
+3. Python 侧现有 `engine/scheduler/executor/worker` 保留；后续调度语义向 request-state + block manager 收敛。
+4. `kv_seq_*` 继续保留兼容接口，但不作为 BLOCK 长期主语义；BLOCK 下将逐步收敛到 request 生命周期接口。
 
 ## 3. Core 层需求（C++）
 
@@ -64,14 +76,14 @@
 
 ### 3.3 KV-Cache 行为要求
 
-1. 基于 slot（cell）的物理管理，slot 记录逻辑 pos 与 seq_id。
+1. 支持双布局：`SLOT`（兼容）与 `BLOCK`（主线）。
 2. 支持多序列混排，但 attention 必须按 seq_id 严格隔离。
 3. 资源不足默认失败返回，不自动回收或截断。
 4. （可选，阶段三）滑窗注意力不改变逻辑 pos，仅通过 mask 屏蔽窗口外 token。
-5. 需提供前缀复用、释放/截断、位置平移、保留与查询等能力接口（不限定 API 名称）；由 Engine 层负责调用与编排。
+5. BLOCK 主线需提供请求级前缀复用、释放/截断、回滚与可观测接口；SLOT 仅要求基础兼容能力。
 6. Core 层默认不强制每 `seq_id` 的 slot/cell 硬配额；请求公平性与限额由 Engine/Server 层负责。
-7. KV 元数据实现需对齐 llama.cpp 关键语义：`prepare/find_slot/apply_ubatch/update` 四段式流程、cell 内 `seq_set + pos` 持久化、`seq_pos_min/max` 统计可查询。
-8. 阶段2允许“单 stream 执行 + 多 stream 元数据预留”形态，但文档必须明确未打通项，避免误判为全量对齐。
+7. 兼容期可保留 `prepare/apply_ubatch/rollback_ubatch`；目标态应收敛到 request-step 事务语义（allocate/commit/rollback/free）。
+8. 阶段2允许“单 stream 执行 + 多 stream 元数据预留”形态，但需在文档中明确未打通项，避免误判为全量对齐。
 
 ### 3.4 计算图与算子
 

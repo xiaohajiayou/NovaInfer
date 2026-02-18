@@ -3,6 +3,18 @@
 本文件定义 Qwen2 推理栈在阶段 0/1/2/3 的测试范围、执行方式、通过标准与回归规则。  
 目标：把“需求 -> 设计 -> 测试”闭环落到可执行清单，避免阶段验收口径不一致。
 
+> 文档状态更新（2026-02-18）  
+> 当前 KV 为 `SLOT/BLOCK` 双布局，且 BLOCK 为主线演进路径。  
+> 若与旧用例口径冲突，以 0.1 节“当前测试策略（2026-02）”为准。详细开发计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
+> 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
+
+## 0.1 当前测试策略（2026-02）
+
+1. 基础正确性：默认在 BLOCK 布局验证主链路。
+2. 回归与对照：关键 Core/Engine 用例保留 SLOT 对照运行。
+3. `kv_seq_*`：作为兼容接口测试，不再代表 BLOCK 主语义目标。
+4. 性能对比：统一只走 `decode` 主路径，不把 `kv_seq_*` 纳入 benchmark 口径。
+
 ## 1. 测试范围与分层
 
 1. Core（C++）：`llaisysModel*` 通用接口、SoA batch/decode、logits 输出、KV 接口。
@@ -25,7 +37,7 @@
 2. `test/test_core_model_api.py`：`create/decode/get_logits*/kv` 行为。
 3. `test/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确（含 `n_seq_id > 1` 共享 token 用例）。
 4. `test/test_core_output_api.py`：`GetLogits/GetLogitsIth/NOutputs/OutputIds` 与 `batch.logits` 对齐。
-5. `test/test_kv_cache.py`：`seq_id + pos` 隔离、`kv_seq_*` 返回码与行为。
+5. `test/test_kv_cache.py`：`seq_id + pos` 隔离、`kv_seq_*` 返回码与行为（按 SLOT/BLOCK 分支断言）。
 6. `test/test_qwen2_adapter.py`：`python/llaisys/models/qwen2.py` 基于通用 C API 可用。
 7. `test/test_model_registry.py`：多模型注册/路由（至少 `qwen2 + mock`）。
 8. `test/test_core_parity.py`：与 `transformers` 做 batch+argmax 逐步对拍（有本地模型时必跑）。
@@ -194,3 +206,16 @@ PYTHONPATH=python python -m pytest -q
 3. 改动 `python/llaisys/models/qwen2.py`：重跑 adapter + infer/offline。
 4. 改动 `engine/server`：重跑 offline/online/sampling 对应用例。
 5. 改动 `scripts/run_tests.py`：至少重跑 `--suite stage0 --run-parity never --run-hf never` 与 `--suite stage1 --run-parity never`。
+
+## 9. 性能评测口径（slot vs block）
+
+1. 统一入口：仅用 `decode` 主路径，不调用 `kv_seq_*`。
+2. 统一 workload：固定请求到达序列、prompt 长度分布、采样参数、max_new_tokens。
+3. 统一环境：同硬件、同模型、同 batch 策略、同编译参数。
+4. 指标：
+   - 吞吐：tokens/s
+   - 时延：TTFT、TPOT、P50/P95
+   - 内存：KV 占用、峰值 RSS、free block 变化
+5. 结果解释：
+   - 端到端对比可接受算子不同（方案级对比）；
+   - 需额外补“归因实验”（只换 KV 形态或只换算子）。

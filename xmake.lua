@@ -105,6 +105,10 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    if not is_plat("windows") then
+        add_ldflags("-fopenmp")
+        add_syslinks("gomp")
+    end
     add_files("src/llaisys/*.cc")
     add_files("src/llaisys/runtime/*/*.cpp")
     add_files("src/llaisys/qwen2/*.cc")

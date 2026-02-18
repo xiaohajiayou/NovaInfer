@@ -37,7 +37,10 @@ public:
     Qwen2Model(const LlaisysQwen2Meta &meta,
                llaisysDeviceType_t device,
                int *device_ids,
-               int ndevice);
+               int ndevice,
+               runtime::kv_cache::KvCacheLayout kv_layout,
+               size_t kv_block_size,
+               size_t kv_cache_capacity_tokens);
     ~Qwen2Model();
 
     LlaisysQwen2Weights *weights() noexcept { return &weights_; }
@@ -58,11 +61,14 @@ private:
     LlaisysQwen2Meta meta_{};
     llaisysDeviceType_t device_type_{LLAISYS_DEVICE_CPU};
     int device_id_{0};
+    runtime::kv_cache::KvCacheLayout kv_layout_{runtime::kv_cache::KvCacheLayout::BLOCK};
+    size_t kv_block_size_{16};
+    size_t kv_cache_capacity_tokens_{0};
 
     LlaisysQwen2Weights weights_{};
     bool validated_{false};
 
-    std::unique_ptr<runtime::kv_cache::KvCache> kv_cache_{};
+    std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache_{};
     std::unique_ptr<runtime::output::OutputBuffer> output_{};
     runtime::workspace::qwen2_workspace_t workspace_{};
 
