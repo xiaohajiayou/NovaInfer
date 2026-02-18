@@ -1,10 +1,36 @@
 #include "qwen2_model.hpp"
+#include "../runtime/kv_cache/paged_kv.hpp"
+#include "../runtime/kv_cache/unified_kv.hpp"
 
 namespace llaisys::models::qwen2 {
 
 namespace {
 
 using KvStatus = llaisys::runtime::kv_cache::KvStatus;
+using KvCacheLayout = llaisys::runtime::kv_cache::KvCacheLayout;
+using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
+
+tensor_t kv_layer_k(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
+    if (layout == KvCacheLayout::SLOT) {
+        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
+        CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not UnifiedKvImpl");
+        return impl->layer_k(layer);
+    }
+    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
+    CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
+    return impl->layer_k(layer);
+}
+
+tensor_t kv_layer_v(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
+    if (layout == KvCacheLayout::SLOT) {
+        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
+        CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not UnifiedKvImpl");
+        return impl->layer_v(layer);
+    }
+    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
+    CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
+    return impl->layer_v(layer);
+}
 
 size_t numel_from_shape(const std::vector<size_t> &shape) {
     size_t n = 1;
@@ -26,8 +52,15 @@ tensor_t make_tensor(const std::vector<size_t> &shape,
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
                        llaisysDeviceType_t device,
                        int *device_ids,
-                       int ndevice)
-    : meta_(meta), device_type_(device) {
+                       int ndevice,
+                       runtime::kv_cache::KvCacheLayout kv_layout,
+                       size_t kv_block_size,
+                       size_t kv_cache_capacity_tokens)
+    : meta_(meta),
+      device_type_(device),
+      kv_layout_(kv_layout),
+      kv_block_size_(kv_block_size),
+      kv_cache_capacity_tokens_(kv_cache_capacity_tokens) {
     CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_CPU, "Qwen2: only CPU is supported in this stage");
 
     if (device_ids != nullptr && ndevice > 0) {
@@ -79,7 +112,12 @@ void Qwen2Model::init_weight_slots_() {
 }
 
 void Qwen2Model::init_kv_cache_() {
-    kv_cache_ = std::make_unique<runtime::kv_cache::KvCache>(meta_.maxseq);
+    const size_t kv_capacity = kv_cache_capacity_tokens_ > 0 ? kv_cache_capacity_tokens_ : meta_.maxseq;
+    if (kv_layout_ == runtime::kv_cache::KvCacheLayout::SLOT) {
+        kv_cache_ = std::make_unique<runtime::kv_cache::UnifiedKvImpl>(kv_capacity, 1);
+    } else {
+        kv_cache_ = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, kv_block_size_);
+    }
     kv_cache_->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
 }
 
@@ -306,8 +344,8 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
 
     std::vector<std::vector<int64_t>> seq_sets(ntoken);
     std::vector<int64_t> pos_values(ntoken);
-    llaisys::runtime::kv_cache::KvCache::ubatch kv_ubatch;
-    llaisys::runtime::kv_cache::KvCache::slot_info slot_info;
+    llaisys::runtime::kv_cache::KvUBatch kv_ubatch;
+    llaisys::runtime::kv_cache::KvSlotInfo slot_info;
     bool kv_applied = false;
 
     try {
@@ -399,22 +437,37 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
         fill_pos_ids_from_values_(pos_ids, pos_values);
 
         std::vector<int32_t> used_slots;
-        kv_cache_->used_slots(&used_slots);
-        const size_t kvlen = used_slots.size();
-        CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
+        tensor_t attn_mask{};
+        std::vector<int32_t> attn_row_ptr;
+        std::vector<int32_t> attn_col_idx;
+        if (kv_layout_ == KvCacheLayout::BLOCK) {
+            auto *paged = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(kv_cache_.get());
+            CHECK_ARGUMENT(paged != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
 
-        tensor_t attn_mask = make_tensor({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
-        uint8_t *mask_ptr = reinterpret_cast<uint8_t *>(attn_mask->data());
-        for (size_t i = 0; i < ntoken; ++i) {
-            bool has_visible = false;
-            for (size_t k = 0; k < kvlen; ++k) {
-                const bool visible =
-                    kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
-                mask_ptr[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-                has_visible = has_visible || visible;
+            const bool ok = paged->build_attention_plan_csr(seq_sets, pos_values, &used_slots, &attn_row_ptr, &attn_col_idx);
+            CHECK_ARGUMENT(ok, "Qwen2: failed to build paged attention plan");
+            CHECK_ARGUMENT(attn_row_ptr.size() == ntoken + 1, "Qwen2: paged attention row_ptr mismatch");
+            CHECK_ARGUMENT(!attn_col_idx.empty(), "Qwen2: paged attention col_idx is empty");
+
+        } else {
+            kv_cache_->used_slots(&used_slots);
+            const size_t kvlen = used_slots.size();
+            CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
+
+            attn_mask = make_tensor({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
+            uint8_t *mask_ptr = reinterpret_cast<uint8_t *>(attn_mask->data());
+            for (size_t i = 0; i < ntoken; ++i) {
+                bool has_visible = false;
+                for (size_t k = 0; k < kvlen; ++k) {
+                    const bool visible =
+                        kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
+                    mask_ptr[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+                    has_visible = has_visible || visible;
+                }
+                CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
             }
-            CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
         }
+        const size_t kvlen = used_slots.size();
 
         const size_t nh = meta_.nh;
         const size_t nkvh = meta_.nkvh;
@@ -445,18 +498,22 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
             ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
             ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
 
-            tensor_t layer_k_cache = kv_cache_->layer_k(layer);
-            tensor_t layer_v_cache = kv_cache_->layer_v(layer);
+            tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
+            tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
             for (size_t i = 0; i < ntoken; ++i) {
                 copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
                 copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
             }
 
-            tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
-            tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
-
             tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
-            ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
+            if (kv_layout_ == KvCacheLayout::BLOCK) {
+                ops::self_attention_paged(
+                    attn_out, rope_q, layer_k_cache, layer_v_cache, used_slots, attn_row_ptr, attn_col_idx, scale);
+            } else {
+                tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
+                tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
+                ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
+            }
 
             tensor_t attn_out_2d = attn_out->view({ntoken, nh * dh});
 
@@ -541,8 +598,8 @@ KvStatus Qwen2Model::kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int
             continue;
         }
         for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
-            tensor_t layer_k_cache = kv_cache_->layer_k(layer);
-            tensor_t layer_v_cache = kv_cache_->layer_v(layer);
+            tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
+            tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
             std::byte *k_dst = layer_k_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
             std::byte *v_dst = layer_v_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
             const std::byte *k_src = layer_k_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);

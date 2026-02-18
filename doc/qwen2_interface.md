@@ -3,6 +3,20 @@
 本文档定义阶段0需要落地的 Core 对外接口与结构体。  
 阶段0口径：对外只暴露通用多模型 API（工厂模式）；`qwen2` 仅作为一个 `model_type` 实现。
 
+> 文档状态更新（2026-02-18）  
+> 本文历史描述默认把 `kv_seq_*` 作为主语义。当前实现已进入 `SLOT/BLOCK` 双布局阶段，且 BLOCK 为主线。  
+> 若冲突，以下述“0.1 当前接口口径（2026-02）”为准。详细计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
+
+## 0.1 当前接口口径（2026-02）
+
+1. `LlaisysModelCreateParams` 已包含：
+   - `kv_cache_layout`（`SLOT=0 / BLOCK=1`，`<0` 走默认 BLOCK）
+   - `kv_cache_block_size`（`<=0` 默认 `16`）
+2. `llaisysModelDecode` 仍是统一主入口；Python 正常推理路径不依赖 `llaisysModelKvSeq*`。
+3. `llaisysModelKvSeq*` 当前主要用于兼容与测试。BLOCK 下部分语义已与 SLOT 不同：
+   - `llaisysModelKvSeqRm` 在 BLOCK 下仅支持 tail truncation，非 tail 删除返回 `INVALID_POS(3)`。
+4. 当前推荐口径：BLOCK 作为性能主线，SLOT 作为兼容/回归模式。
+
 当前状态说明（As-Built）：
 
 1. 主线接口已切到通用 `llaisysModel*`。
@@ -43,6 +57,8 @@ typedef struct LlaisysModelCreateParams {
     llaisysDeviceType_t device;
     int *device_ids;
     int ndevice;
+    int32_t kv_cache_layout;        // LlaisysKvCacheLayout, <0 means default(BLOCK)
+    int32_t kv_cache_block_size;    // <=0 means default(16)
 } LlaisysModelCreateParams;
 
 struct LlaisysModel;
@@ -171,7 +187,7 @@ __export struct LlaisysBatch llaisysBatchGetOne(
 __export void llaisysBatchFree(struct LlaisysBatch batch);
 ```
 
-### 3.3 通用 KV 序列接口（`model.h`）
+### 3.3 通用 KV 序列接口（`model.h`，兼容态）
 
 ```c
 __export int llaisysModelKvSeqCp(
@@ -213,10 +229,10 @@ KV 返回码：
 5. `4`：EMPTY_RANGE
 6. `5`：INTERNAL_ERROR
 
-KV 语义补充（As-Built）：
+KV 语义补充（As-Built，2026-02）：
 
 1. `llaisysModelKvSeqCp(dst, src, p0, p1)` 当前为“共享前缀关联”语义：dst 附加 src 命中的 slot 关联，不强制复制新 slot。
-2. `llaisysModelKvSeqRm` 会移除 seq 与 slot 关联；当 slot 无剩余 seq 关联时释放物理 slot。
+2. `llaisysModelKvSeqRm` 在 SLOT 下为常规区间语义；在 BLOCK 下当前只支持 tail truncation，非 tail 返回 `INVALID_POS(3)`。
 3. `llaisysModelKvSeqAdd` 已支持 `delta != 0` 的位置平移语义（按 `[p0, p1)` 对命中 cell 执行 `pos += delta`）。
 
 ## 4. 调用契约

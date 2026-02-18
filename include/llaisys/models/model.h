@@ -11,12 +11,21 @@ __C {
         LLAISYS_MODEL_TYPE_MOCK = 2,
     } LlaisysModelType;
 
+    typedef enum LlaisysKvCacheLayout {
+        LLAISYS_KV_CACHE_LAYOUT_SLOT = 0,
+        LLAISYS_KV_CACHE_LAYOUT_BLOCK = 1,
+    } LlaisysKvCacheLayout;
+
     struct LlaisysModelCreateParams {
         LlaisysModelType model_type;
         const void *meta; // points to model-specific meta struct
         llaisysDeviceType_t device;
         int *device_ids;
         int ndevice;
+        int32_t kv_cache_layout;     // LlaisysKvCacheLayout, <0 means default(BLOCK)
+        int32_t kv_cache_block_size; // <=0 means default(16)
+        int32_t max_model_len;       // <=0 means use meta.maxseq
+        int32_t kv_cache_capacity_tokens; // <=0 means use max_model_len
     };
 
     struct LlaisysModel;

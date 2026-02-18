@@ -8,6 +8,7 @@ from ..engine.llm_engine import LLMEngine
 from ..engine.model_registry import ModelRegistry
 from ..engine.types import SamplingParams
 from ..libllaisys import DeviceType
+from ..libllaisys.model import KvCacheLayout
 
 
 class LLM:
@@ -18,6 +19,10 @@ class LLM:
         model: Path | str,
         model_type: str = "qwen2",
         device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: int | None = None,
+        kv_cache_capacity_tokens: int | None = None,
         model_registry: ModelRegistry | None = None,
     ):
         self._model_path = Path(model)
@@ -26,6 +31,10 @@ class LLM:
             model_type=model_type,
             model_path=model,
             device=device,
+            kv_cache_layout=kv_cache_layout,
+            kv_cache_block_size=kv_cache_block_size,
+            max_model_len=max_model_len,
+            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
             model_registry=model_registry,
         )
         self._engine_client = EngineClient(engine)

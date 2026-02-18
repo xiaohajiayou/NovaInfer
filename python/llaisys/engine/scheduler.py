@@ -1,85 +1,102 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
-from .types import BatchPlan
+from .block_manager import BlockManager
+from .sequence import Sequence, SequenceStatus
+
+
+@dataclass(frozen=True)
+class SchedulerOutputs:
+    scheduled_seqs: list[Sequence]
+    is_prefill: bool
 
 
 class RequestScheduler:
-    """Offline scheduler with minimal queue semantics."""
+    """vLLM-style waiting/running scheduler."""
 
-    def __init__(self):
-        self._waiting: deque[str] = deque()
-        self._running: deque[str] = deque()
+    def __init__(
+        self,
+        max_num_seqs: int = 8,
+        max_num_batched_tokens: int = 4096,
+        block_size: int = 16,
+        num_kvcache_blocks: int = 0,
+    ):
+        self.max_num_seqs = max(1, int(max_num_seqs))
+        self.max_num_batched_tokens = max(1, int(max_num_batched_tokens))
+        self.block_manager = BlockManager(num_blocks=num_kvcache_blocks, block_size=block_size)
+        self.waiting: deque[Sequence] = deque()
+        self.running: deque[Sequence] = deque()
+        self._seq_by_request: dict[str, Sequence] = {}
 
-    def submit(self, request_id: str) -> None:
-        self._waiting.append(request_id)
-
-    def pick_next(self) -> str | None:
-        # Prefill-first: new requests enter running queue before decode round-robin.
-        if self._waiting:
-            req_id = self._waiting.popleft()
-            self._running.append(req_id)
-            return req_id
-        if not self._running:
-            return None
-        req_id = self._running[0]
-        self._running.rotate(-1)
-        return req_id
-
-    def pick_next_batch(self, max_items: int) -> list[str]:
-        if max_items <= 0:
-            return []
-
-        picked: list[str] = []
-
-        # 1) Prefill first: promote new requests into running and schedule them.
-        while self._waiting and len(picked) < max_items:
-            req_id = self._waiting.popleft()
-            self._running.append(req_id)
-            picked.append(req_id)
-
-        # 2) Fill remaining slots by decode round-robin from running queue.
-        if len(picked) >= max_items or not self._running:
-            return picked
-
-        scanned = 0
-        running_len = len(self._running)
-        while scanned < running_len and len(picked) < max_items and self._running:
-            req_id = self._running[0]
-            self._running.rotate(-1)
-            scanned += 1
-            if req_id in picked:
-                continue
-            picked.append(req_id)
-
-        return picked
-
-    def finish(self, request_id: str) -> None:
-        self._remove(self._waiting, request_id)
-        self._remove(self._running, request_id)
+    def add(self, seq: Sequence) -> None:
+        self.waiting.append(seq)
+        self._seq_by_request[seq.request_id] = seq
 
     def has_work(self) -> bool:
-        return bool(self._waiting or self._running)
+        return bool(self.waiting or self.running)
+
+    def schedule(self, max_num_seqs: int | None = None) -> SchedulerOutputs | None:
+        cap = self.max_num_seqs if max_num_seqs is None else max(1, int(max_num_seqs))
+
+        # 1) Prefill first.
+        scheduled_seqs: list[Sequence] = []
+        num_batched_tokens = 0
+        while self.waiting and len(scheduled_seqs) < cap:
+            seq = self.waiting[0]
+            if (
+                num_batched_tokens + len(seq) > self.max_num_batched_tokens
+                or not self.block_manager.can_allocate(seq)
+            ):
+                break
+            self.waiting.popleft()
+            self.block_manager.allocate(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+            scheduled_seqs.append(seq)
+        if scheduled_seqs:
+            return SchedulerOutputs(scheduled_seqs=scheduled_seqs, is_prefill=True)
+
+        # 2) Decode round-robin.
+        while self.running and len(scheduled_seqs) < cap:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+
+        if not scheduled_seqs:
+            return None
+
+        self.running.extendleft(reversed(scheduled_seqs))
+        return SchedulerOutputs(scheduled_seqs=scheduled_seqs, is_prefill=False)
+
+    def finish(self, request_id: str) -> None:
+        seq = self._seq_by_request.pop(request_id, None)
+        if seq is None:
+            return
+        self._remove(self.waiting, seq)
+        self._remove(self.running, seq)
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        seq.status = SequenceStatus.FINISHED
+
+    def preempt(self, seq: Sequence) -> None:
+        seq.status = SequenceStatus.WAITING
+        if seq.block_table:
+            self.block_manager.deallocate(seq)
+        self.waiting.appendleft(seq)
 
     @staticmethod
-    def _remove(queue: deque[str], request_id: str) -> None:
+    def _remove(queue: deque[Sequence], seq: Sequence) -> None:
         try:
-            queue.remove(request_id)
+            queue.remove(seq)
         except ValueError:
             pass
-
-    def build_prefill_plan(self, prompt_tokens: list[int], seq_id: int) -> BatchPlan:
-        if not prompt_tokens:
-            raise ValueError("prompt_tokens must be non-empty")
-        logits_mask = [0] * len(prompt_tokens)
-        logits_mask[-1] = 1
-        seq_ids = [int(seq_id)] * len(prompt_tokens)
-        return BatchPlan(
-            token_ids=[int(t) for t in prompt_tokens],
-            logits_mask=logits_mask,
-            seq_ids=seq_ids,
-        )
-
-    def build_decode_plan(self, token_id: int, seq_id: int) -> BatchPlan:
-        return BatchPlan(token_ids=[int(token_id)], logits_mask=[1], seq_ids=[int(seq_id)])

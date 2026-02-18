@@ -11,6 +11,7 @@ from ..engine.llm_engine import LLMEngine
 from ..engine.model_registry import ModelRegistry
 from ..engine.types import GenerationOutput, SamplingParams, StreamChunk
 from ..libllaisys import DeviceType
+from ..libllaisys.model import KvCacheLayout
 
 
 @dataclass
@@ -31,6 +32,10 @@ class AsyncLLMEngine:
         model_type: str = "qwen2",
         model_path: Path | str | None = None,
         device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: int | None = None,
+        kv_cache_capacity_tokens: int | None = None,
         model_registry: ModelRegistry | None = None,
         engine: LLMEngine | None = None,
     ):
@@ -38,6 +43,10 @@ class AsyncLLMEngine:
             model_type=model_type,
             model_path=model_path,
             device=device,
+            kv_cache_layout=kv_cache_layout,
+            kv_cache_block_size=kv_cache_block_size,
+            max_model_len=max_model_len,
+            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
             model_registry=model_registry,
         )
         self._stream_queues: dict[str, list[Queue]] = {}

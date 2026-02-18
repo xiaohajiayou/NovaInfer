@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Dict, Sequence
 
 from ..libllaisys import DeviceType
+from ..libllaisys.model import KvCacheLayout
 from .executor import Executor
 from .model_registry import ModelRegistry
 from .output_processor import OutputProcessor
-from .scheduler import RequestScheduler
+from .sequence import Sequence as EngineSequence
+from .scheduler import RequestScheduler, SchedulerOutputs
 from .types import (
-    BatchPlan,
     GenerationOutput,
     RequestState,
     RequestStatus,
@@ -52,10 +53,9 @@ _ALLOWED_TRANSITIONS = {
 class _RequestRuntime:
     request: RequestState
     sampling_params: SamplingParams
-    seq_id: int
+    seq: EngineSequence
     max_new_tokens: int = -1
     num_generated: int = 0
-    prefill_done: bool = False
     matched_stop: str | None = None
     finished_output: GenerationOutput | None = None
 
@@ -68,6 +68,10 @@ class LLMEngine:
         model_type: str = "qwen2",
         model_path: Path | str | None = None,
         device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: int | None = None,
+        kv_cache_capacity_tokens: int | None = None,
         worker: Worker | None = None,
         model_runner=None,
         model_registry: ModelRegistry | None = None,
@@ -77,10 +81,30 @@ class LLMEngine:
             model_type=model_type,
             model_path=model_path,
             device=device,
+            kv_cache_layout=kv_cache_layout,
+            kv_cache_block_size=kv_cache_block_size,
+            max_model_len=max_model_len,
+            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
             model_runner=model_runner,
             model_registry=model_registry,
         )
-        self._scheduler = RequestScheduler()
+        eff_max_model_len = int(self._worker.max_seq_len)
+        eff_kv_capacity_tokens = (
+            int(kv_cache_capacity_tokens) if kv_cache_capacity_tokens is not None else eff_max_model_len
+        )
+        eff_kv_capacity_tokens = max(1, eff_kv_capacity_tokens)
+        eff_block_size = max(1, int(kv_cache_block_size))
+        num_kvcache_blocks = (
+            (eff_kv_capacity_tokens + eff_block_size - 1) // eff_block_size
+            if kv_cache_layout == KvCacheLayout.BLOCK
+            else 0
+        )
+        self._scheduler = RequestScheduler(
+            max_num_seqs=max_batch_size,
+            max_num_batched_tokens=eff_kv_capacity_tokens,
+            block_size=eff_block_size,
+            num_kvcache_blocks=num_kvcache_blocks,
+        )
         self._executor = Executor(self._worker)
         self._output = OutputProcessor()
 
@@ -100,28 +124,33 @@ class LLMEngine:
 
     def submit(self, inputs: Sequence[int], sampling_params: SamplingParams) -> str:
         req = self._create_request([int(t) for t in inputs])
+        seq = EngineSequence(
+            request_id=req.request_id,
+            seq_id=self._alloc_seq_id(),
+            token_ids=[int(t) for t in inputs],
+            sampling_params=sampling_params,
+            block_size=self._scheduler.block_manager.block_size,
+        )
         runtime = _RequestRuntime(
             request=req,
             sampling_params=sampling_params,
-            seq_id=self._alloc_seq_id(),
+            seq=seq,
         )
         self._runtimes[req.request_id] = runtime
-        self._scheduler.submit(req.request_id)
+        self._scheduler.add(seq)
         return req.request_id
 
     def step(self) -> list[GenerationOutput]:
-        req_ids = self._scheduler.pick_next_batch(self._max_batch_size)
-        if not req_ids:
+        sched = self._scheduler.schedule(max_num_seqs=self._max_batch_size)
+        if sched is None:
             return []
 
         completions: list[GenerationOutput] = []
         active: list[_RequestRuntime] = []
-        combined_tokens: list[int] = []
-        combined_logits_mask: list[int] = []
-        combined_seq_ids: list[int] = []
-        output_runtime_order: list[_RequestRuntime] = []
+        active_seqs: list[EngineSequence] = []
 
-        for req_id in req_ids:
+        for seq in sched.scheduled_seqs:
+            req_id = seq.request_id
             runtime = self._runtimes.get(req_id)
             if runtime is None:
                 self._scheduler.finish(req_id)
@@ -144,64 +173,39 @@ class LLMEngine:
 
                 if len(req.prompt_tokens) > self._worker.max_seq_len:
                     raise ValueError("Prompt length exceeds maxseq")
+                if len(req.prompt_tokens) > self._scheduler.max_num_batched_tokens:
+                    raise ValueError("Prompt length exceeds scheduler token budget")
 
                 if runtime.max_new_tokens < 0:
                     runtime.max_new_tokens = self._compute_max_new(len(req.prompt_tokens), runtime.sampling_params)
                 if runtime.max_new_tokens <= 0:
                     completions.append(self._complete_request(runtime, RequestStatus.FINISHED_LENGTH_CAPPED, "length"))
                     continue
-
-                if not runtime.prefill_done:
-                    tokens = [int(t) for t in req.prompt_tokens]
-                    logits_mask = [0] * len(tokens)
-                    logits_mask[-1] = 1
-                else:
-                    tokens = [int(req.output_tokens[-1])]
-                    logits_mask = [1]
-
-                seq_ids = [int(runtime.seq_id)] * len(tokens)
-
-                combined_tokens.extend(tokens)
-                combined_logits_mask.extend(logits_mask)
-                combined_seq_ids.extend(seq_ids)
-                output_runtime_order.append(runtime)
                 active.append(runtime)
+                active_seqs.append(seq)
             except Exception as exc:
                 req.error = str(exc)
                 completions.append(self._complete_request(runtime, RequestStatus.FINISHED_ABORTED, "aborted"))
 
-        if not combined_tokens:
+        if not active_seqs:
             return completions
 
-        # Current engine keeps one sampling config for the full ubatch.
-        # Multi-request mixed sampling params can be added in a later stage.
+        # Current engine keeps one sampling config for the full step.
+        # Mixed per-request sampling can be added after request-aware plan migration.
         first_runtime = active[0]
-        step = self._executor.execute_step(
-            BatchPlan(
-                token_ids=combined_tokens,
-                logits_mask=combined_logits_mask,
-                seq_ids=combined_seq_ids,
-            ),
+        sampled, sampled_req_ids = self._executor.execute_scheduler_step(
+            SchedulerOutputs(scheduled_seqs=active_seqs, is_prefill=sched.is_prefill),
             first_runtime.sampling_params,
         )
 
-        sampled = [int(t) for t in step.sampled_token_ids]
-        output_ids = [int(i) for i in step.output_ids] if step.output_ids else list(range(len(sampled)))
-        if len(sampled) != len(output_ids):
-            raise RuntimeError("executor returned inconsistent sampled/output sizes")
-        if len(sampled) != len(output_runtime_order):
-            raise RuntimeError("executor output size does not match planned request outputs")
-
-        runtime_by_out_idx = {out_idx: rt for out_idx, rt in zip(output_ids, output_runtime_order)}
-
-        for out_idx, token in zip(output_ids, sampled):
-            runtime = runtime_by_out_idx.get(out_idx)
+        for req_id, token in zip(sampled_req_ids, sampled):
+            runtime = self._runtimes.get(req_id)
             if runtime is None:
                 continue
             req = runtime.request
             req.output_tokens.append(int(token))
+            runtime.seq.append_token(int(token))
             runtime.num_generated += 1
-            runtime.prefill_done = True
 
             finish_reason = self._maybe_finish_reason(runtime, int(token))
             if finish_reason is not None:
@@ -389,6 +393,7 @@ class LLMEngine:
         )
         runtime.finished_output = output
         self._scheduler.finish(req.request_id)
+        self._worker.free_request(runtime.seq.seq_id)
         return output
 
     def _compute_max_new(self, prompt_len: int, sampling_params: SamplingParams) -> int:

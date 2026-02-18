@@ -7,8 +7,11 @@ import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+
+TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
+TEST_KV_BLOCK_SIZE = 16
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,8 @@ def create_tiny_qwen2_model(meta: TinyMeta = TinyMeta()):
         llaisys.DeviceType.CPU,
         dev_ids,
         1,
+        TEST_KV_LAYOUT,
+        TEST_KV_BLOCK_SIZE,
     )
     model = LIB_LLAISYS.llaisysModelCreate(byref(params))
     if not model:

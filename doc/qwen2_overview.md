@@ -1,5 +1,24 @@
 # Qwen2 模型概要设计
 
+> 文档状态更新（2026-02-18）  
+> 本文历史内容较多，存在与当前代码不一致的段落。若与下述“当前实现口径”冲突，以本节为准。  
+> 下一步开发计划见：`doc/qwen2_next_dev_plan_2026-02.md`。
+> 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
+
+## 0. 当前实现口径（2026-02-18）
+
+1. KV Cache 架构已拆分为两套实现并存：
+   - `SLOT`：`UnifiedKvImpl`（兼容/基线模式）
+   - `BLOCK`：`PagedKvImpl`（主线演进模式）
+2. 通用 KV 基类为 `KvCacheBase`，公共存储为 `KVStorage`，当前代码路径位于：
+   - `src/llaisys/runtime/kv_cache/kv_cache.hpp`
+   - `src/llaisys/runtime/kv_cache/unified_kv.*`
+   - `src/llaisys/runtime/kv_cache/paged_kv.*`
+3. `Qwen2Model` 当前持有 `std::unique_ptr<KvCacheBase>`，模型创建时通过 `kv_cache_layout` 选择 `SLOT/BLOCK`。
+4. BLOCK 模式目前已可用，但 `seq_rm` 仅支持 tail truncation；非 tail 删除返回 `INVALID_POS`。
+5. Python 调度层（`engine/scheduler/executor/worker`）已存在，当前仍是 Python 调度 + C++ decode 执行分层。
+6. 当前性能主线定位为 BLOCK；SLOT 保持基础可用和回归/对照用途。
+
 ## 1. 设计目标
 
 1. 基于现有 LLAISYS 的 Qwen2 推理能力，在不破坏当前测试正确性的前提下，完成 Core、Engine、Server、Client 的分层扩展。
@@ -89,10 +108,10 @@ llaisys/
 1. 真正 batch decode：
    - `src/llaisys/qwen2/qwen2_model.cpp` 中 `decode()` 已改为单次 batch 前向执行；
    - 删除“每个 token 调一次 `infer(...,1)`”的伪批处理主路径。
-2. Unified KV：
-   - `src/llaisys/runtime/kv_cache/kv_cells.hpp/.cpp` 引入 `KvCells`（cell 元信息 `pos/shift/seq_set`）；
-   - `src/llaisys/runtime/kv_cache/kv_cache.hpp/.cpp` 引入 `prepare/apply_ubatch/rollback_ubatch/update` 流程；
-   - slot 支持多 `seq_id` 关联，并维护 `seq_pos_min/max` 统计。
+2. KV 架构：
+   - 现为 `KvCacheBase + UnifiedKvImpl + PagedKvImpl`；
+   - 公共存储在 `kv_cache.hpp/.cpp` 的 `KVStorage`；
+   - `SLOT` 与 `BLOCK` 通过 `kv_cache_layout` 切换。
 3. 多序列混排 mask：
    - 新增 `ops::self_attention_masked`，并接入 Qwen2 decode 主路径；
    - 可见性规则为“seq 集合交集 + 因果 pos 约束”。
@@ -100,8 +119,9 @@ llaisys/
    - 对外 C API 不变（仍是 `llaisysModel*`）；
    - Python Engine/ModelRunner 调用链无需改签名。
 5. 当前遗留项：
-   - 多 stream 执行路径尚未打通到 Qwen2 decode（当前仍单 stream）；
-   - 滑窗策略与阶段3性能优化尚未开始。
+   - BLOCK 路径仍处于“功能可用，性能链路持续重构”阶段；
+   - page-native attention / block-sparse 尚未完成；
+   - 调度与 KV 生命周期仍在向 vLLM 风格收敛。
 
 ### 2.2 目标目录（Target Refactor）
 
@@ -264,6 +284,10 @@ Process: worker
 
 
 ## 4. 模块设计
+
+> 历史说明  
+> 本章包含阶段0~2期间的逐条需求映射，部分细节（尤其 KV 内部结构与命名）已发生演进。  
+> 若本章内容与“0. 当前实现口径（2026-02-18）”冲突，以第 0 章与 `doc/qwen2_next_dev_plan_2026-02.md` 为准。
 
 ### 4.1 infer Core（C++）
 

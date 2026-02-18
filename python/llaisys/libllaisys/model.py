@@ -22,6 +22,10 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
+class KvCacheLayout(IntEnum):
+    SLOT = 0
+    BLOCK = 1
+
 
 class LlaisysBatch(Structure):
     _fields_ = [
@@ -42,6 +46,10 @@ class LlaisysModelCreateParams(Structure):
         ("device", llaisysDeviceType_t),
         ("device_ids", POINTER(c_int)),
         ("ndevice", c_int),
+        ("kv_cache_layout", c_int32),
+        ("kv_cache_block_size", c_int32),
+        ("max_model_len", c_int32),
+        ("kv_cache_capacity_tokens", c_int32),
     ]
 
 
@@ -104,6 +112,7 @@ def load_model(lib):
 __all__ = [
     "llaisysModel_t",
     "ModelType",
+    "KvCacheLayout",
     "LlaisysBatch",
     "LlaisysModelCreateParams",
     "load_model",
