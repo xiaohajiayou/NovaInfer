@@ -12,30 +12,30 @@ ROOT = Path(__file__).resolve().parents[1]
 PYTHON = sys.executable
 
 STAGE0_PYTEST_FILES = [
-    "test/test_core_model_api.py",
-    "test/test_core_output_api.py",
-    "test/test_core_decode_batch.py",
-    "test/test_kv_cache.py",
-    "test/test_model_registry.py",
-    "test/test_qwen2_adapter.py",
-    "test/test_infer.py",
-    "test/test_core_parity.py",
+    "test/core/test_core_model_api.py",
+    "test/core/test_core_output_api.py",
+    "test/core/test_core_decode_batch.py",
+    "test/core/test_kv_cache.py",
+    "test/core/test_model_registry.py",
+    "test/core/test_qwen2_adapter.py",
+    "test/parity/test_infer.py",
+    "test/parity/test_core_parity.py",
 ]
 
 STAGE1_PYTEST_FILES = [
-    "test/test_offline.py",
-    "test/test_llm_entrypoint.py",
-    "test/test_engine_model_registry.py",
-    "test/test_engine_state_machine.py",
-    "test/test_offline_parity.py",
+    "test/offline/test_offline.py",
+    "test/offline/test_llm_entrypoint.py",
+    "test/engine/test_engine_model_registry.py",
+    "test/engine/test_engine_state_machine.py",
+    "test/parity/test_offline_parity.py",
 ]
 
 STAGE2_PYTEST_FILES = [
-    "test/test_sampling.py",
-    "test/test_online.py",
-    "test/test_online_http.py",
-    "test/test_online_stream_isolation.py",
-    "test/test_online_real_model_multisession.py",
+    "test/engine/test_sampling.py",
+    "test/online/test_online.py",
+    "test/online/test_online_http.py",
+    "test/online/test_online_stream_isolation.py",
+    "test/online/test_online_real_model_multisession.py",
 ]
 
 
@@ -61,10 +61,10 @@ def _run_stage0(
     should_run_hf = (run_hf == "always") or (run_hf == "auto" and bool(model_path))
     should_run_parity = (run_parity == "always") or (run_parity == "auto" and bool(model_path))
     if not should_run_hf:
-        files.remove("test/test_infer.py")
+        files.remove("test/parity/test_infer.py")
         print("[skip] stage0 HF-dependent infer test")
     if not should_run_parity:
-        files.remove("test/test_core_parity.py")
+        files.remove("test/parity/test_core_parity.py")
         print("[skip] stage0 parity")
     _run_pytest(files, env, model_path=model_path)
 
@@ -73,7 +73,7 @@ def _run_stage1(env: dict[str, str], model_path: str | None, run_parity: str) ->
     files = list(STAGE1_PYTEST_FILES)
     should_run_parity = (run_parity == "always") or (run_parity == "auto" and bool(model_path))
     if not should_run_parity:
-        files.remove("test/test_offline_parity.py")
+        files.remove("test/parity/test_offline_parity.py")
         print("[skip] stage1 parity")
     _run_pytest(files, env, model_path=model_path)
 

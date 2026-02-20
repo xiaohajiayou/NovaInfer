@@ -6,6 +6,13 @@
 > 本文部分历史需求描述（尤其 KV 的 slot/unified 主线口径）与当前实现存在偏差。  
 > 若冲突，以 2.2 节“当前重构策略（2026-02）”为准。详细计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
 > 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
+> 目录口径补充（2026-02-20）：测试目录已重构到 `test/core|engine|offline|online|parity|ops|utils`。
+
+## 0.1 阅读优先级（当前 vs 历史）
+
+1. 当前执行口径优先：`doc/qwen2_next_dev_plan_2026-02.md`。
+2. 本文中包含多个 `As-Built` 段，均为历史阶段快照，不代表当前最新状态。
+3. 若本文历史段与当前执行版冲突，以“当前执行版”优先。
 
 ## 1. 目标与范围
 
@@ -37,7 +44,7 @@
 4. Core 层（C++）：负责 batch/ubatch 执行、KV-Cache 管理与算子计算。
 5. 多模型抽象层：提供模型无关的创建/执行/输出/KV 接口，模型私有 API 仅用于内部扩展，不作为主线对外协议。
 
-### 2.1 当前实现状态（As-Built，2026-02-11）
+### 2.1 历史实现快照（As-Built，2026-02-11）
 
 1. Core 主线接口已统一到 `llaisysModel*`，并覆盖 `create/decode/logits/kv_seq_*`。
 2. `Qwen2Model::decode` 已改为真正 batch 执行（单轮图执行处理整批 token），不再逐 token 调 `infer(..., 1)`。
@@ -164,6 +171,7 @@
 ### 5.1 API Server
 
 1. 提供 HTTP 服务接口与 OpenAI 兼容 API（completions/chat/completions/embeddings 基础路由）。
+   - 阶段交付口径（As-Built 2026-02）：主线先交付 `chat/completions` + SSE + cancel，`completions/embeddings` 作为后续可选扩展。
 2. 支持 SSE 流式输出，保证 token 级增量语义与正确结束信号。
 3. 支持请求取消（主动取消与超时取消），并将取消信号透传给 Engine。
 4. 支持会话管理（单用户会话、多用户并发、会话上下文复用）。
@@ -200,7 +208,7 @@
 ## 7. 设计约束与阶段落地
 
 1. 阶段 0：完成 Core 对齐 llama.cpp 的重构，并完成通用多模型接口抽象（统一 `LlaisysModel` 主线接口）。
-2. 阶段 0 对拍口径：`pytest -q test/test_infer.py --model-path /path/to/local/model` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
+2. 阶段 0 对拍口径：`pytest -q test/parity/test_infer.py --model-path /path/to/local/model` 为 ModelRunner 级 `decode_batch + argmax` 对拍，不经过 Engine。
 3. 阶段 0 退出条件：进入阶段1前，离线主流程必须切换为 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
 4. 阶段 1：优先保证离线推理闭环与 Engine 内 argmax 验证（Core 仅返回 logits）。
    - 阶段1已完成口径：`LLM.generate`（prompt入口）+ Engine 状态机主路径 + stop string + 统一输出对象（含 finish_reason/status/usage）。
@@ -210,7 +218,7 @@
 6. 阶段 3：连续批处理、前缀缓存与投机解码。
 7. 任何阶段必须保持接口稳定，不影响已有推理流程。
 
-### 7.1 阶段0当前完成度口径（As-Built）
+### 7.1 阶段0历史完成度快照（As-Built）
 
 1. 已完成（功能闭环）：通用 `LlaisysModel` 主线接口、多序列 SoA decode、`kv_seq_*`、`GetLogits*` 输出接口、`qwen2 + mock` 路由、阶段0核心测试脚本。
 2. 已完成（Core 目录重构）：`workspace/kv_cache/output/weights` 已拆分到 `src/llaisys/runtime/`，`qwen2_model.cpp` 仅保留模型专有执行逻辑与算子编排。
@@ -240,15 +248,15 @@
 4. 阶段2后 Core 架构修正已完成：真实 batch decode + unified KV + 单轮 mask 隔离。
 5. 阶段3进入前提：阶段2并发稳定性回归长期通过，线上接口语义冻结。
 
-### 8.2 阶段2验收标准（As-Built）
+### 8.2 阶段2历史验收快照（As-Built）
 
 必须满足：
 
-1. `test/test_sampling.py` 通过：`argmax/top-k/top-p/temperature` 行为正确。
-2. `test/test_online.py` 通过：non-stream/stream/cancel/concurrent 行为正确。
-3. `test/test_online_http.py` 通过或在受限环境下被合理 skip（socket bind 限制）。
-4. `test/test_online_stream_isolation.py` 通过：双流并发不串 `request_id`。
-5. `test/test_online_real_model_multisession.py` 在本地模型下通过：真实模型并发流式不串线。
+1. `test/engine/test_sampling.py` 通过：`argmax/top-k/top-p/temperature` 行为正确。
+2. `test/online/test_online.py` 通过：non-stream/stream/cancel/concurrent 行为正确。
+3. `test/online/test_online_http.py` 通过或在受限环境下被合理 skip（socket bind 限制）。
+4. `test/online/test_online_stream_isolation.py` 通过：双流并发不串 `request_id`。
+5. `test/online/test_online_real_model_multisession.py` 在本地模型下通过：真实模型并发流式不串线。
 6. WebUI 可执行最小闭环：多会话创建、切换、流式渲染、取消请求。
 
 ## 9. 实施问题与解决方案（阶段2）

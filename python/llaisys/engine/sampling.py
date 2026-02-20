@@ -19,6 +19,22 @@ class Sampler:
             sampled.append(self._sample_one(np.asarray(row, dtype=np.float64), params, row_idx))
         return sampled
 
+    def sample_per_row(self, logits_rows: Sequence[np.ndarray], params_rows: Sequence[SamplingParams]) -> list[int]:
+        if len(logits_rows) != len(params_rows):
+            raise ValueError("logits_rows and params_rows size mismatch")
+        sampled: list[int] = []
+        for row_idx, (row, params) in enumerate(zip(logits_rows, params_rows)):
+            sampled.append(self._sample_one(np.asarray(row, dtype=np.float64), params, row_idx))
+        return sampled
+
+    def sample_per_row(self, logits_rows: Sequence[np.ndarray], params_rows: Sequence[SamplingParams]) -> list[int]:
+        if len(logits_rows) != len(params_rows):
+            raise ValueError("logits_rows and params_rows size mismatch")
+        sampled: list[int] = []
+        for row_idx, (row, params) in enumerate(zip(logits_rows, params_rows)):
+            sampled.append(self._sample_one(np.asarray(row, dtype=np.float64), params, row_idx))
+        return sampled
+
     def _sample_one(self, logits: np.ndarray, params: SamplingParams, row_idx: int) -> int:
         if logits.ndim != 1:
             raise ValueError("logits row must be 1D")

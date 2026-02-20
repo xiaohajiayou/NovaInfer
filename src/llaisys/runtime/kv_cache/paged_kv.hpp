@@ -74,16 +74,8 @@ public:
     KvSlotInfoVec prepare(const std::vector<KvUBatch> &ubatches) override;
     KvStatus apply_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
     void rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
-
-    KvStatus seq_cp(int64_t dst_seq,
-                    int64_t src_seq,
-                    int64_t p0,
-                    int64_t p1,
-                    std::vector<int32_t> *src_slots,
-                    std::vector<int32_t> *dst_slots) override;
-    KvStatus seq_rm(int64_t seq_id, int64_t p0, int64_t p1) override;
-    KvStatus seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) override;
-    KvStatus seq_keep(int64_t seq_id) override;
+    KvStatus request_free(int64_t seq_id) override;
+    KvStatus reset_prefix_cache() override;
     int64_t seq_pos_max(int64_t seq_id) const noexcept override;
     void used_slots(std::vector<int32_t> *out) const override;
     bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const override;
@@ -101,7 +93,6 @@ private:
     int32_t compute_slot_(int32_t block_id, int32_t block_offset) const;
     uint32_t stream_for_seq_(int64_t seq_id, std::unordered_map<int64_t, uint32_t> *seq_to_stream) const;
     KvStatus validate_ubatch_(const KvUBatch &ub, std::vector<uint32_t> *token_streams) const;
-    bool normalize_range_(int64_t seq_id, int64_t p0, int64_t p1, int64_t *out_p0, int64_t *out_p1) const;
 
     struct ShadowState {
         BlockPool pool;

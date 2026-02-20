@@ -34,6 +34,13 @@ namespace llaisys::models::qwen2 {
 
 class Qwen2Model {
 public:
+    struct KvStatsSnapshot {
+        int64_t capacity_tokens{0};
+        int64_t used_tokens{0};
+        int64_t free_tokens{0};
+        int64_t peak_used_tokens{0};
+    };
+
     Qwen2Model(const LlaisysQwen2Meta &meta,
                llaisysDeviceType_t device,
                int *device_ids,
@@ -51,11 +58,18 @@ public:
     int32_t n_outputs() const noexcept;
     const int32_t *output_ids() const noexcept;
 
+    // KV management APIs exposed through C wrapper:
+    // - SLOT layout: kv_seq_* are fully implemented.
+    // - BLOCK layout: kv_seq_* are compatibility APIs and may return INTERNAL_ERROR
+    //   if the underlying KV implementation does not support that operation.
     runtime::kv_cache::KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
     runtime::kv_cache::KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
     runtime::kv_cache::KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
     runtime::kv_cache::KvStatus kv_seq_keep(int64_t seq_id);
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
+    runtime::kv_cache::KvStatus request_free(int64_t seq_id);
+    runtime::kv_cache::KvStatus kv_reset_prefix_cache();
+    bool kv_stats(KvStatsSnapshot *out) const noexcept;
 
 private:
     LlaisysQwen2Meta meta_{};
@@ -83,7 +97,6 @@ private:
     tensor_t zero_bias_logits_{};
 
     bool validate_decode_batch_(const LlaisysBatch &batch) const;
-    void append_output_logits_row_(size_t row_idx, int32_t output_id);
 
     void init_weight_slots_();
     void init_kv_cache_();
@@ -98,6 +111,29 @@ private:
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
 
     tensor_t create_zero_tensor_(const std::vector<size_t> &shape, llaisysDataType_t dtype) const;
+    void run_layers_and_collect_(const LlaisysBatch &batch,
+                                 size_t ntoken,
+                                 tensor_t hidden,
+                                 tensor_t pos_ids,
+                                 const std::vector<int32_t> &slot_idxs,
+                                 const std::vector<int32_t> &used_slots,
+                                 tensor_t attn_mask,
+                                 const std::vector<int32_t> &attn_row_ptr,
+                                 const std::vector<int32_t> &attn_col_idx,
+                                 bool paged_attention);
+    int32_t decode_slot_path_(const LlaisysBatch &batch,
+                              size_t ntoken,
+                              const std::vector<std::vector<int64_t>> &seq_sets,
+                              const std::vector<int64_t> &pos_values,
+                              const std::vector<int32_t> &nseq_values,
+                              tensor_t hidden,
+                              tensor_t pos_ids);
+    int32_t decode_block_path_(const LlaisysBatch &batch,
+                               size_t ntoken,
+                               const std::vector<int64_t> &seq_ids_flat,
+                               const std::vector<int64_t> &pos_values,
+                               tensor_t hidden,
+                               tensor_t pos_ids);
 
     void check_meta_invariants_() const;
     void check_tensor_(const llaisysTensor_t handle,
@@ -107,6 +143,7 @@ private:
     tensor_t bias_or_zero_(llaisysTensor_t handle, const tensor_t &zero_bias) const;
 
     void destroy_weights_();
+    mutable int64_t kv_peak_used_tokens_{0};
 };
 
 } // namespace llaisys::models::qwen2

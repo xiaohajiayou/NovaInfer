@@ -684,6 +684,14 @@ void UnifiedKvImpl::rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ub)
     seq_slots_dirty_.clear();
 }
 
+KvStatus UnifiedKvImpl::request_free(int64_t seq_id) {
+    const int64_t pmax = seq_pos_max_(seq_id);
+    if (pmax < 0) {
+        return KvStatus::INVALID_SEQ;
+    }
+    return seq_rm(seq_id, 0, pmax + 1);
+}
+
 KvStatus UnifiedKvImpl::seq_cp(int64_t dst_seq,
                                int64_t src_seq,
                                int64_t p0,

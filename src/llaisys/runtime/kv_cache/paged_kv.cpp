@@ -199,24 +199,6 @@ KvStatus PagedKvImpl::validate_ubatch_(const KvUBatch &ub, std::vector<uint32_t>
     return KvStatus::OK;
 }
 
-bool PagedKvImpl::normalize_range_(int64_t seq_id, int64_t p0, int64_t p1, int64_t *out_p0, int64_t *out_p1) const {
-    if (out_p0 == nullptr || out_p1 == nullptr) {
-        return false;
-    }
-    const int64_t pmax = seq_pos_max(seq_id);
-    if (pmax < 0) {
-        return false;
-    }
-    int64_t begin = p0 < 0 ? 0 : p0;
-    int64_t end = p1 < 0 ? (pmax + 1) : p1;
-    if (begin > end) {
-        return false;
-    }
-    *out_p0 = begin;
-    *out_p1 = end;
-    return true;
-}
-
 PagedKvImpl::ShadowState PagedKvImpl::clone_state_() const {
     ShadowState s(nblocks_);
     CHECK_ARGUMENT(block_pool_ != nullptr, "paged_kv: block_pool is not initialized");
@@ -399,138 +381,40 @@ void PagedKvImpl::rollback_ubatch(const KvSlotInfo &, const KvUBatch &ubatch) {
     }
 }
 
-KvStatus PagedKvImpl::seq_cp(int64_t dst_seq,
-                             int64_t src_seq,
-                             int64_t p0,
-                             int64_t p1,
-                             std::vector<int32_t> *src_slots,
-                             std::vector<int32_t> *dst_slots) {
-    int64_t begin = -1;
-    int64_t end = -1;
-    if (!normalize_range_(src_seq, p0, p1, &begin, &end)) {
-        return KvStatus::INVALID_POS;
-    }
-    if (begin == end) {
-        return KvStatus::EMPTY_RANGE;
-    }
-
-    auto it_src = req_to_blocks_.find(src_seq);
-    if (it_src == req_to_blocks_.end()) {
-        return KvStatus::INVALID_SEQ;
-    }
-    auto &dst_blocks = req_to_blocks_[dst_seq];
-    auto &dst_table_ptr = block_tables_[dst_seq];
-    if (!dst_table_ptr) {
-        dst_table_ptr = std::make_unique<BlockTable>(block_size_);
-    }
-    auto &dst_table = *dst_table_ptr;
-
-    (void) stream_for_seq_(src_seq, &seq_to_stream_);
-    (void) stream_for_seq_(dst_seq, &seq_to_stream_);
-
-    if (src_slots) {
-        src_slots->clear();
-    }
-    if (dst_slots) {
-        dst_slots->clear();
-    }
-
-    for (int64_t pos = begin; pos < end; ++pos) {
-        const size_t bidx = static_cast<size_t>(pos) / block_size_;
-        const int32_t off = static_cast<int32_t>(static_cast<size_t>(pos) % block_size_);
-        if (bidx >= it_src->second.size()) {
-            return KvStatus::INVALID_POS;
-        }
-        const int32_t block_id = it_src->second[bidx];
-        while (dst_blocks.size() <= bidx) {
-            dst_blocks.push_back(block_id);
-            dst_table.append_block(block_id);
-            block_pool_->incref(block_id);
-        }
-        dst_table.set_max_pos(pos);
-        const int32_t slot = compute_slot_(block_id, off);
-        if (src_slots) {
-            src_slots->push_back(slot);
-        }
-        if (dst_slots) {
-            dst_slots->push_back(slot);
-        }
-    }
-    return KvStatus::OK;
-}
-
-KvStatus PagedKvImpl::seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
-    int64_t begin = -1;
-    int64_t end = -1;
-    if (!normalize_range_(seq_id, p0, p1, &begin, &end)) {
-        return KvStatus::INVALID_POS;
-    }
-    if (begin == end) {
-        return KvStatus::EMPTY_RANGE;
-    }
-
-    auto it_table = block_tables_.find(seq_id);
+KvStatus PagedKvImpl::request_free(int64_t seq_id) {
     auto it_blocks = req_to_blocks_.find(seq_id);
-    if (it_table == block_tables_.end() || it_blocks == req_to_blocks_.end() || !it_table->second) {
-        return KvStatus::INVALID_SEQ;
-    }
-
-    const int64_t pmax = it_table->second->max_pos();
-    if (end != pmax + 1) {
-        // Current paged metadata model only supports tail-truncation removal.
-        // Reject non-tail removal explicitly instead of silently doing nothing.
-        return KvStatus::INVALID_POS;
-    }
-
-    const int64_t new_max = begin - 1;
-    const size_t keep_blocks = (new_max < 0) ? 0 : (static_cast<size_t>(new_max) / block_size_ + 1);
-    while (it_blocks->second.size() > keep_blocks) {
-        const int32_t bid = it_blocks->second.back();
-        it_blocks->second.pop_back();
-        it_table->second->pop_back_block();
-        block_pool_->decref(bid);
-    }
-    it_table->second->set_max_pos(new_max);
-    return KvStatus::OK;
-}
-
-KvStatus PagedKvImpl::seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-    int64_t begin = -1;
-    int64_t end = -1;
-    if (!normalize_range_(seq_id, p0, p1, &begin, &end)) {
-        return KvStatus::INVALID_POS;
-    }
-    if (begin == end) {
-        return KvStatus::EMPTY_RANGE;
-    }
-
     auto it_table = block_tables_.find(seq_id);
-    if (it_table == block_tables_.end() || !it_table->second) {
+    if (it_blocks == req_to_blocks_.end() && it_table == block_tables_.end()) {
         return KvStatus::INVALID_SEQ;
     }
-    if (end != it_table->second->max_pos() + 1) {
-        return KvStatus::INVALID_POS;
+    if (it_blocks != req_to_blocks_.end()) {
+        for (const int32_t bid : it_blocks->second) {
+            block_pool_->decref(bid);
+        }
+        req_to_blocks_.erase(it_blocks);
     }
-    if (delta != 0) {
-        return KvStatus::INVALID_POS;
+    if (it_table != block_tables_.end()) {
+        block_tables_.erase(it_table);
     }
+    seq_to_stream_.erase(seq_id);
     return KvStatus::OK;
 }
 
-KvStatus PagedKvImpl::seq_keep(int64_t seq_id) {
-    if (seq_pos_max(seq_id) < 0) {
-        return KvStatus::INVALID_SEQ;
+KvStatus PagedKvImpl::reset_prefix_cache() {
+    if (!block_pool_) {
+        return KvStatus::INTERNAL_ERROR;
     }
-    std::vector<int64_t> remove;
-    remove.reserve(req_to_blocks_.size());
-    for (const auto &[sid, _] : req_to_blocks_) {
-        if (sid != seq_id) {
-            remove.push_back(sid);
-        }
+    // Align with vLLM-style safety: only allow reset when no active request
+    // holds KV blocks.
+    if (block_pool_->num_free_blocks() != block_pool_->num_blocks()) {
+        return KvStatus::INTERNAL_ERROR;
     }
-    for (int64_t sid : remove) {
-        (void) seq_rm(sid, 0, -1);
-    }
+
+    // Clear runtime request metadata so future scheduling starts from a clean
+    // state. BLOCK prefix hash index currently lives in Python BlockManager.
+    req_to_blocks_.clear();
+    seq_to_stream_.clear();
+    block_tables_.clear();
     return KvStatus::OK;
 }
 

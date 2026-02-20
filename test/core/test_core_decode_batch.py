@@ -1,12 +1,13 @@
-from ctypes import POINTER, byref, c_int, c_int8, c_int32, c_int64, c_void_p, cast
+from ctypes import POINTER, byref, c_int, c_int32, c_int64, c_void_p, cast
 from dataclasses import dataclass
 
 import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+from test.utils.batch_builders import BlockBatchState, build_decode_batch
 
 TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
@@ -99,45 +100,23 @@ def _create_model(meta: TinyMeta = TinyMeta()):
     return model
 
 
-def _make_batch(tokens, logits_mask, seq_ids=None, pos=None):
-    n = len(tokens)
-    token_buf = (c_int64 * n)(*tokens)
-    logits_buf = None if logits_mask is None else (c_int8 * n)(*logits_mask)
-    pos_buf = None if pos is None else (c_int64 * n)(*pos)
-
-    n_seq_buf = None
-    seq_ptr_buf = None
-    if seq_ids is not None:
-        n_seq_buf = (c_int32 * n)()
-        seq_ptr_buf = (POINTER(c_int64) * n)()
-        raw_rows = []
-        for i, sid in enumerate(seq_ids):
-            if isinstance(sid, (list, tuple)):
-                seq_list = [int(x) for x in sid]
-            else:
-                seq_list = [int(sid)]
-            row = (c_int64 * len(seq_list))(*seq_list)
-            raw_rows.append(row)
-            n_seq_buf[i] = len(seq_list)
-            seq_ptr_buf[i] = cast(row, POINTER(c_int64))
-        _make_batch._raw_rows = raw_rows  # keep refs alive
-
-    return LlaisysBatch(
-        n_tokens=c_int32(n),
-        token=token_buf,
-        embd=None,
-        pos=pos_buf,
-        n_seq_id=n_seq_buf,
-        seq_id=seq_ptr_buf,
-        logits=logits_buf,
+def _make_batch(tokens, logits_mask, seq_ids=None, pos=None, block_state: BlockBatchState | None = None):
+    return build_decode_batch(
+        tokens,
+        logits_mask=logits_mask,
+        seq_ids=seq_ids,
+        pos_ids=pos,
+        layout=KvCacheLayout(TEST_KV_LAYOUT),
+        block_size=TEST_KV_BLOCK_SIZE,
+        block_state=block_state,
     )
 
 
 def test_single_seq_decode_mask():
     model = _create_model()
     try:
-        batch = _make_batch([1, 2, 3], [0, 1, 1])
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        built = _make_batch([1, 2, 3], [0, 1, 1])
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
         assert status == 0
         assert int(LIB_LLAISYS.llaisysModelNOutputs(model)) == 2
         output_ids = np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model), shape=(2,))
@@ -149,16 +128,22 @@ def test_single_seq_decode_mask():
 def test_multi_seq_interleaved_decode():
     model = _create_model()
     try:
+        block_state = BlockBatchState()
         batch1 = _make_batch(
             tokens=[10, 11, 12, 13],
             logits_mask=[1, 1, 1, 1],
             seq_ids=[100, 200, 100, 200],
             pos=[0, 0, 1, 1],
+            block_state=block_state,
         )
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch1))
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch1.batch))
         assert status == 0
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == 1
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == 1
+        if IS_BLOCK_LAYOUT:
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == -1
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == -1
+        else:
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == 1
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == 1
         output_ids = np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model), shape=(4,))
         assert output_ids.tolist() == [0, 1, 2, 3]
 
@@ -167,11 +152,16 @@ def test_multi_seq_interleaved_decode():
             logits_mask=[1, 1],
             seq_ids=[100, 200],
             pos=[2, 2],
+            block_state=block_state,
         )
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch2))
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch2.batch))
         assert status == 0
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == 2
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == 2
+        if IS_BLOCK_LAYOUT:
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == -1
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == -1
+        else:
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(100))) == 2
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(200))) == 2
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
 
@@ -179,15 +169,15 @@ def test_multi_seq_interleaved_decode():
 def test_multi_seq_set_decode():
     model = _create_model()
     try:
-        batch = _make_batch(
+        built = _make_batch(
             tokens=[10, 11, 12],
             logits_mask=[1, 1, 1],
             seq_ids=[1, 2, (1, 2)],
             pos=[0, 0, 1],
         )
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
         if IS_BLOCK_LAYOUT:
-            assert status == 1
+            assert status == -1
             return
         assert status == 0
         assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(1))) == 1

@@ -82,7 +82,7 @@ jobs:
     - name: Run test_infer smoke (all OS)
       shell: bash
       run: |
-        python -m pytest -q test/test_infer.py -k smoke --model-path "$CI_MODEL_DIR"
+        python -m pytest -q test/parity/test_infer.py -k smoke --model-path "$CI_MODEL_DIR"
 
     - name: Run real-model parity and online tests
       if: matrix.os == 'ubuntu-latest'
@@ -90,4 +90,4 @@ jobs:
       run: |
         python scripts/run_tests.py --suite stage0 --model-path "$CI_MODEL_DIR" --run-parity always --run-hf always
         python scripts/run_tests.py --suite stage1 --model-path "$CI_MODEL_DIR" --run-parity always
-        python -m pytest -q test/test_online_real_model_multisession.py --model-path "$CI_MODEL_DIR"
+        python -m pytest -q test/online/test_online_real_model_multisession.py --model-path "$CI_MODEL_DIR"

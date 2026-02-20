@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ctypes import POINTER, c_int8, c_int32, c_int64
+from ctypes import c_int32
 
 import numpy as np
 import pytest
@@ -9,7 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import LlaisysBatch
+from llaisys.libllaisys.model import KvCacheLayout
+from test.utils.batch_builders import BlockBatchState, build_decode_batch
 
 
 def _torch_device(device_name: str):
@@ -26,31 +27,17 @@ def _argmax_and_top5_from_numpy(row: np.ndarray):
     return token, top5
 
 
-def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask):
-    n = len(tokens)
-    token_buf = (c_int64 * n)(*tokens)
-    pos_buf = (c_int64 * n)(*poss)
-    logits_buf = (c_int8 * n)(*logits_mask)
-
-    n_seq_buf = (c_int32 * n)()
-    seq_ptr_buf = (POINTER(c_int64) * n)()
-    seq_rows = []
-    for i, sid in enumerate(seq_ids):
-        row = (c_int64 * 1)(sid)
-        seq_rows.append(row)
-        n_seq_buf[i] = 1
-        seq_ptr_buf[i] = row
-
-    batch = LlaisysBatch(
-        n_tokens=c_int32(n),
-        token=token_buf,
-        embd=None,
-        pos=pos_buf,
-        n_seq_id=n_seq_buf,
-        seq_id=seq_ptr_buf,
-        logits=logits_buf,
+def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask, *, is_block_layout=False, block_state=None, block_size=16):
+    built = build_decode_batch(
+        tokens,
+        logits_mask=logits_mask,
+        seq_ids=seq_ids,
+        pos_ids=poss,
+        layout=KvCacheLayout.BLOCK if is_block_layout else KvCacheLayout.SLOT,
+        block_size=block_size,
+        block_state=block_state,
     )
-    status = int(LIB_LLAISYS.llaisysModelDecode(model_handle, batch))
+    status = int(LIB_LLAISYS.llaisysModelDecode(model_handle, built.batch))
     if status != 0:
         raise RuntimeError(f"llaisysModelDecode failed with status={status}")
 
@@ -106,6 +93,9 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
     traces = [[] for _ in range(len(prompt_ids))]
     vocab = int(llaisys_model._meta_info.voc)
     handle = llaisys_model._model
+    is_block_layout = int(llaisys_model._kv_cache_layout) == int(KvCacheLayout.BLOCK)
+    block_size = int(getattr(llaisys_model, "_kv_cache_block_size", 16))
+    block_state = BlockBatchState()
 
     max_prompt = max(len(x) for x in prompt_ids)
     for t in range(max_prompt):
@@ -121,7 +111,16 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
                 bpos.append(t)
                 blogits.append(1 if t == len(ids) - 1 else 0)
                 bidx_to_seq.append(i)
-        out_ids, out_rows = _decode_batch(handle, btok, bseq, bpos, blogits)
+        out_ids, out_rows = _decode_batch(
+            handle,
+            btok,
+            bseq,
+            bpos,
+            blogits,
+            is_block_layout=is_block_layout,
+            block_state=block_state,
+            block_size=block_size,
+        )
         for ridx, bidx in enumerate(out_ids):
             seq_i = bidx_to_seq[bidx]
             row = np.ctypeslib.as_array(out_rows[ridx], shape=(vocab,))
@@ -144,7 +143,16 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
             bpos.append(len(ids) + step - 1)
             blogits.append(1)
 
-        out_ids, out_rows = _decode_batch(handle, btok, bseq, bpos, blogits)
+        out_ids, out_rows = _decode_batch(
+            handle,
+            btok,
+            bseq,
+            bpos,
+            blogits,
+            is_block_layout=is_block_layout,
+            block_state=block_state,
+            block_size=block_size,
+        )
         for ridx, bidx in enumerate(out_ids):
             row = np.ctypeslib.as_array(out_rows[ridx], shape=(vocab,))
             tok, _ = _argmax_and_top5_from_numpy(row)
@@ -188,6 +196,10 @@ def test_core_parity(require_model_path, prompts):
     prompt_ids = _build_prompt_to_token_ids(tokenizer, prompts)
     hf_tokens = _hf_generate_batch(hf_model, prompt_ids, max_new_tokens=5)
 
-    llaisys_model = llaisys.models.Qwen2(require_model_path, llaisys.DeviceType.CPU)
+    llaisys_model = llaisys.models.Qwen2(
+        require_model_path,
+        llaisys.DeviceType.CPU,
+        kv_cache_auto_capacity=True,
+    )
     ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
     assert ll_tokens == hf_tokens

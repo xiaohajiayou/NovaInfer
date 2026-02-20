@@ -35,3 +35,9 @@ class EngineClient:
         close_fn = getattr(self._engine, "close", None)
         if callable(close_fn):
             close_fn()
+
+    def kv_cache_stats(self) -> dict:
+        fn = getattr(self._engine, "kv_cache_stats", None)
+        if callable(fn):
+            return fn()
+        return {}

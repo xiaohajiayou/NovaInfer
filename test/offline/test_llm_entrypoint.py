@@ -1,5 +1,6 @@
 
 import numpy as np
+import pytest
 
 from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
@@ -45,10 +46,21 @@ def _build_llm() -> LLM:
     return llm
 
 
-def test_llm_generate_token_compat():
+def test_llm_generate_token_batch_output_shape():
     llm = _build_llm()
-    out = llm.generate([1, 2], sampling_params=SamplingParams(max_new_tokens=8))
-    assert out == [1, 2, 3, 4, 5]
+    out = llm.generate([[1, 2]], sampling_params=SamplingParams(max_new_tokens=8))
+    assert isinstance(out, list)
+    assert len(out) == 1
+    row = out[0]
+    assert row["finish_reason"] == "eos_token"
+    assert row["status"] == "finished_stopped"
+    assert row["token_ids"] == [3, 4, 5]
+
+
+def test_llm_generate_rejects_legacy_token_list_input():
+    llm = _build_llm()
+    with pytest.raises(TypeError, match="inputs must be str, list\\[str\\], or list\\[list\\[int\\]\\] for batch mode"):
+        _ = llm.generate([1, 2], sampling_params=SamplingParams(max_new_tokens=8))
 
 
 def test_llm_generate_single_prompt_output_shape():
@@ -88,7 +100,8 @@ def test_llm_stream_single_prompt():
 
 
 if __name__ == "__main__":
-    test_llm_generate_token_compat()
+    test_llm_generate_token_batch_output_shape()
+    test_llm_generate_rejects_legacy_token_list_input()
     test_llm_generate_single_prompt_output_shape()
     test_llm_generate_prompt_batch_and_params_list()
     test_llm_stream_single_prompt()

@@ -42,6 +42,7 @@ def test_online_real_model_multisession_stream_isolation(require_model_path: str
     engine = LLMEngine(
         model_type="qwen2",
         model_path=require_model_path,
+        kv_cache_auto_capacity=True,
     )
     async_engine = AsyncLLMEngine(engine=engine)
     server = OpenAIServer(async_engine)

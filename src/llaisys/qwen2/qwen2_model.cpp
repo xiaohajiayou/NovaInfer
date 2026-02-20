@@ -1,6 +1,7 @@
 #include "qwen2_model.hpp"
 #include "../runtime/kv_cache/paged_kv.hpp"
 #include "../runtime/kv_cache/unified_kv.hpp"
+#include <unordered_set>
 
 namespace llaisys::models::qwen2 {
 
@@ -30,21 +31,6 @@ tensor_t kv_layer_v(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
     return impl->layer_v(layer);
-}
-
-size_t numel_from_shape(const std::vector<size_t> &shape) {
-    size_t n = 1;
-    for (size_t d : shape) {
-        n *= d;
-    }
-    return n;
-}
-
-tensor_t make_tensor(const std::vector<size_t> &shape,
-                     llaisysDataType_t dtype,
-                     llaisysDeviceType_t device_type,
-                     int device_id) {
-    return Tensor::create(shape, dtype, device_type, device_id);
 }
 
 } // namespace
@@ -141,8 +127,12 @@ void Qwen2Model::check_meta_invariants_() const {
 }
 
 tensor_t Qwen2Model::create_zero_tensor_(const std::vector<size_t> &shape, llaisysDataType_t dtype) const {
-    tensor_t t = make_tensor(shape, dtype, device_type_, device_id_);
-    const size_t nbytes = numel_from_shape(shape) * utils::dsize(dtype);
+    tensor_t t = Tensor::create(shape, dtype, device_type_, device_id_);
+    size_t numel = 1;
+    for (size_t d : shape) {
+        numel *= d;
+    }
+    const size_t nbytes = numel * utils::dsize(dtype);
     std::vector<std::byte> zeros(nbytes, std::byte{0});
     t->load(zeros.data());
     return t;
@@ -235,6 +225,7 @@ tensor_t Qwen2Model::view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead,
 
 void Qwen2Model::ensure_workspace_(size_t ntoken) {
     if (!workspace_) {
+        const size_t kv_capacity = kv_cache_capacity_tokens_ > 0 ? kv_cache_capacity_tokens_ : meta_.maxseq;
         workspace_ = std::make_unique<runtime::workspace::Qwen2Workspace>(
             meta_.hs,
             meta_.nh,
@@ -242,7 +233,7 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
             meta_.dh,
             meta_.di,
             meta_.voc,
-            meta_.maxseq,
+            kv_capacity,
             meta_.dtype,
             device_type_,
             device_id_);
@@ -298,6 +289,7 @@ tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::ve
 }
 
 bool Qwen2Model::validate_decode_batch_(const LlaisysBatch &batch) const {
+    // 1) Common validation for both SLOT and BLOCK layouts.
     if (batch.n_tokens <= 0) {
         return false;
     }
@@ -307,14 +299,46 @@ bool Qwen2Model::validate_decode_batch_(const LlaisysBatch &batch) const {
     if (batch.token == nullptr) {
         return false;
     }
-
     const size_t ntoken = static_cast<size_t>(batch.n_tokens);
-    for (size_t i = 0; i < ntoken; ++i) {
-        const int32_t nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
-        if (nseq <= 0) {
+
+    if (kv_layout_ == KvCacheLayout::BLOCK) {
+        // BLOCK mode requires explicit mapping inputs from scheduler/executor.
+        if (batch.slot_mapping == nullptr || batch.context_lens == nullptr || batch.batch_seq_ids == nullptr ||
+            batch.block_tables == nullptr) {
             return false;
         }
-        if (batch.seq_id != nullptr && batch.seq_id[i] == nullptr) {
+        if (batch.n_batch_seq <= 0 || batch.block_table_width <= 0) {
+            return false;
+        }
+        if (batch.pos == nullptr) {
+            return false;
+        }
+        if (batch.seq_id == nullptr) {
+            return false;
+        }
+        // BLOCK mainline follows nano-vllm semantics: one token belongs to one sequence.
+        for (size_t i = 0; i < ntoken; ++i) {
+            const int32_t nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+            if (nseq != 1 || batch.seq_id[i] == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    } else if (kv_layout_ == KvCacheLayout::SLOT) {
+        // SLOT mode: validate seq metadata and reject BLOCK-only inputs.
+        for (size_t i = 0; i < ntoken; ++i) {
+            const int32_t nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+            if (nseq <= 0) {
+                return false;
+            }
+            if (batch.seq_id != nullptr && batch.seq_id[i] == nullptr) {
+                return false;
+            }
+        }
+        const bool any_block_meta =
+            batch.slot_mapping != nullptr || batch.context_lens != nullptr || batch.batch_seq_ids != nullptr ||
+            batch.block_tables != nullptr || batch.n_batch_seq > 0 || batch.block_table_width > 0;
+        if (any_block_meta) {
             return false;
         }
     }
@@ -322,14 +346,277 @@ bool Qwen2Model::validate_decode_batch_(const LlaisysBatch &batch) const {
     return true;
 }
 
-void Qwen2Model::append_output_logits_row_(size_t row_idx, int32_t output_id) {
-    ASSERT(workspace_ != nullptr, "Qwen2: workspace is null when collecting logits");
-    ASSERT(output_ != nullptr, "Qwen2: output buffer is null");
+void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
+                                         size_t ntoken,
+                                         tensor_t hidden,
+                                         tensor_t pos_ids,
+                                         const std::vector<int32_t> &slot_idxs,
+                                         const std::vector<int32_t> &used_slots,
+                                         tensor_t attn_mask,
+                                         const std::vector<int32_t> &attn_row_ptr,
+                                         const std::vector<int32_t> &attn_col_idx,
+                                         bool paged_attention) {
+    ASSERT(workspace_ != nullptr, "Qwen2: workspace is null");
     const auto &ws = workspace_->view();
-    const size_t voc = meta_.voc;
-    const size_t row_bytes = voc * utils::dsize(meta_.dtype);
-    const std::byte *row = ws.logits->data() + row_idx * row_bytes;
-    output_->append_row(row, meta_.dtype, output_id);
+    const size_t nh = meta_.nh;
+    const size_t nkvh = meta_.nkvh;
+    const size_t dh = meta_.dh;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+    const size_t kvlen = used_slots.size();
+
+    // Shared transformer forward path. SLOT/BLOCK differ only in attention input form
+    // (dense mask vs CSR paged plan), then merge into the same per-layer pipeline.
+    for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
+        tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
+        ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
+
+        tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
+        tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
+        tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
+
+        ops::linear(
+            q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
+        ops::linear(
+            k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
+        ops::linear(
+            v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+
+        tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
+        tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
+        tensor_t v_new_3d = view_2d_to_3d_(v_proj, ntoken, nkvh, dh);
+
+        tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
+        tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
+        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
+        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+
+        tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
+        tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
+        for (size_t i = 0; i < ntoken; ++i) {
+            copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
+            copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
+        }
+
+        tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
+        if (paged_attention) {
+            ops::self_attention_paged(
+                attn_out, rope_q, layer_k_cache, layer_v_cache, used_slots, attn_row_ptr, attn_col_idx, scale);
+        } else {
+            tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
+            tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
+            ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
+        }
+
+        tensor_t attn_out_2d = attn_out->view({ntoken, nh * dh});
+
+        tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
+        ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
+        ops::add(hidden, hidden, attn_proj);
+
+        tensor_t mlp_normed = slice_tokens_(ws.mlp_normed, ntoken);
+        ops::rms_norm(mlp_normed, hidden, weights_.mlp_norm_w[layer]->tensor, meta_.epsilon);
+
+        tensor_t gate = slice_tokens_(ws.gate, ntoken);
+        tensor_t up = slice_tokens_(ws.up, ntoken);
+        ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
+        ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
+
+        tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
+        ops::swiglu(swiglu, gate, up);
+
+        tensor_t down = slice_tokens_(ws.down, ntoken);
+        ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
+        ops::add(hidden, hidden, down);
+    }
+
+    tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
+    ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
+    tensor_t logits = slice_tokens_(ws.logits, ntoken);
+    ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
+
+    for (size_t i = 0; i < ntoken; ++i) {
+        const bool collect = (batch.logits == nullptr) ? (i + 1 == ntoken) : (batch.logits[i] != 0);
+        if (collect) {
+            const size_t row_bytes = meta_.voc * utils::dsize(meta_.dtype);
+            const std::byte *row = ws.logits->data() + i * row_bytes;
+            output_->append_row(row, meta_.dtype, static_cast<int32_t>(i));
+        }
+    }
+}
+
+int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
+                                      size_t ntoken,
+                                      const std::vector<std::vector<int64_t>> &seq_sets,
+                                      const std::vector<int64_t> &pos_values,
+                                      const std::vector<int32_t> &nseq_values,
+                                      tensor_t hidden,
+                                      tensor_t pos_ids) {
+    llaisys::runtime::kv_cache::KvUBatch kv_ubatch;
+    llaisys::runtime::kv_cache::KvSlotInfo slot_info;
+    bool kv_applied = false;
+    try {
+    // SLOT path: allocate/apply physical slots first, then build a dense visibility mask.
+    std::vector<int32_t> slot_idxs;
+    slot_idxs.reserve(ntoken);
+    kv_ubatch.seq_sets = seq_sets;
+    kv_ubatch.pos_values = pos_values;
+    auto sinfos = kv_cache_->prepare({kv_ubatch});
+    if (sinfos.empty()) {
+        return 1;
+    }
+    slot_info = sinfos[0];
+    const KvStatus apply_rc = kv_cache_->apply_ubatch(slot_info, kv_ubatch);
+    if (apply_rc == KvStatus::OOM_SLOT) {
+        return 1;
+    }
+    if (apply_rc != KvStatus::OK) {
+        return -1;
+    }
+    CHECK_ARGUMENT(slot_info.n_stream() == 1, "Qwen2: unsupported slot_info stream shape");
+    CHECK_ARGUMENT(slot_info.size() == ntoken, "Qwen2: slot_info size mismatch");
+    slot_idxs = slot_info.idxs[0];
+    kv_applied = true;
+
+    std::vector<int32_t> used_slots;
+    kv_cache_->used_slots(&used_slots);
+    const size_t kvlen = used_slots.size();
+    CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
+
+    // Dense mask over global used slots; correctness-first fallback path.
+    tensor_t attn_mask = Tensor::create({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
+    uint8_t *mask_ptr = reinterpret_cast<uint8_t *>(attn_mask->data());
+    for (size_t i = 0; i < ntoken; ++i) {
+        bool has_visible = false;
+        for (size_t k = 0; k < kvlen; ++k) {
+            const bool visible = kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
+            mask_ptr[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+            has_visible = has_visible || visible;
+        }
+        CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
+    }
+
+    run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, attn_mask, {}, {}, false);
+    return 0;
+    } catch (const std::invalid_argument &) {
+        if (kv_applied) {
+            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
+        }
+        return 1;
+    } catch (...) {
+        if (kv_applied) {
+            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
+        }
+        return -2;
+    }
+}
+
+int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
+                                       size_t ntoken,
+                                       const std::vector<int64_t> &seq_ids_flat,
+                                       const std::vector<int64_t> &pos_values,
+                                       tensor_t hidden,
+                                       tensor_t pos_ids) {
+    // BLOCK path: consume caller-provided block context directly.
+    // Keep a local vector here to reuse the same run_layers_and_collect_ signature
+    // shared by SLOT and BLOCK paths.
+    std::vector<int32_t> slot_idxs;
+    slot_idxs.reserve(ntoken);
+    for (size_t i = 0; i < ntoken; ++i) {
+        slot_idxs.push_back(batch.slot_mapping[i]);
+    }
+
+    std::vector<int32_t> used_slots;
+    std::vector<int32_t> attn_row_ptr;
+    std::vector<int32_t> attn_col_idx;
+    // Step 1) Build seq_id -> row index map for block_tables/context_lens lookup.
+    const int32_t n_batch_seq = batch.n_batch_seq;
+    const int32_t width = batch.block_table_width;
+    std::unordered_map<int64_t, int32_t> seq_row;
+    seq_row.reserve(static_cast<size_t>(n_batch_seq) * 2);
+    for (int32_t r = 0; r < n_batch_seq; ++r) {
+        seq_row[batch.batch_seq_ids[r]] = r;
+    }
+
+    // Step 2) Enumerate visible physical slots for each token.
+    // token_slots[i]: raw visible slots of token i.
+    // global_slots: union of all token-visible slots, used as CSR column domain.
+    std::vector<std::unordered_set<int32_t>> token_slots(ntoken);
+    std::unordered_set<int32_t> global_slots;
+    const int64_t block_size = static_cast<int64_t>(kv_block_size_);
+    for (size_t i = 0; i < ntoken; ++i) {
+        auto &tok = token_slots[i];
+        const int64_t sid = seq_ids_flat[i];
+        // Token belongs to one seq in BLOCK mainline; map it to row.
+        auto it = seq_row.find(sid);
+        if (it == seq_row.end()) {
+            continue;
+        }
+        const int32_t row = it->second;
+        // context_lens[row] caps the visible prefix length of this sequence.
+        const int64_t clen = batch.context_lens[row];
+        if (clen <= 0) {
+            continue;
+        }
+        // Visible positions are [0, min(qpos, clen-1)].
+        const int64_t vmax = std::min<int64_t>(pos_values[i], clen - 1);
+        if (vmax < 0) {
+            continue;
+        }
+        // Convert visible logical position range to block range [0, max_bidx].
+        const int64_t max_bidx = vmax / block_size;
+        for (int64_t bidx = 0; bidx <= max_bidx; ++bidx) {
+            if (bidx >= width) {
+                break;
+            }
+            // block_tables[row, bidx] gives physical block id; -1 means padding.
+            const int32_t bid = batch.block_tables[row * width + static_cast<int32_t>(bidx)];
+            if (bid < 0) {
+                continue;
+            }
+            // For last visible block, only include offsets up to vmax%block_size.
+            const int64_t off_max = (bidx == max_bidx) ? (vmax % block_size) : (block_size - 1);
+            for (int64_t off = 0; off <= off_max; ++off) {
+                const int32_t slot = static_cast<int32_t>(static_cast<int64_t>(bid) * block_size + off);
+                tok.insert(slot);
+                global_slots.insert(slot);
+            }
+        }
+        CHECK_ARGUMENT(!tok.empty(), "Qwen2: empty attention context for token");
+    }
+    // Step 3) Materialize global slot domain as sorted used_slots.
+    used_slots.assign(global_slots.begin(), global_slots.end());
+    std::sort(used_slots.begin(), used_slots.end());
+    CHECK_ARGUMENT(!used_slots.empty(), "Qwen2: empty used_slots for block attention");
+
+    // Step 4) Build slot->column mapping in CSR domain.
+    std::unordered_map<int32_t, int32_t> slot_to_col;
+    slot_to_col.reserve(used_slots.size() * 2);
+    for (size_t c = 0; c < used_slots.size(); ++c) {
+        slot_to_col[used_slots[c]] = static_cast<int32_t>(c);
+    }
+
+    // Step 5) Build CSR row_ptr/col_idx:
+    // - one row per token
+    // - columns are indices into used_slots.
+    attn_row_ptr.assign(ntoken + 1, 0);
+    for (size_t i = 0; i < ntoken; ++i) {
+        std::vector<int32_t> cols;
+        cols.reserve(token_slots[i].size());
+        for (int32_t s : token_slots[i]) {
+            auto it = slot_to_col.find(s);
+            if (it != slot_to_col.end()) {
+                cols.push_back(it->second);
+            }
+        }
+        std::sort(cols.begin(), cols.end());
+        cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
+        CHECK_ARGUMENT(!cols.empty(), "Qwen2: empty CSR row for token");
+        attn_col_idx.insert(attn_col_idx.end(), cols.begin(), cols.end());
+        attn_row_ptr[i + 1] = static_cast<int32_t>(attn_col_idx.size());
+    }
+
+    run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, {}, attn_row_ptr, attn_col_idx, true);
+    return 0;
 }
 
 int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
@@ -343,21 +630,32 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
     output_->reserve_rows(ntoken);
 
     std::vector<std::vector<int64_t>> seq_sets(ntoken);
+    std::vector<int64_t> seq_ids_flat(ntoken, 0);
     std::vector<int64_t> pos_values(ntoken);
-    llaisys::runtime::kv_cache::KvUBatch kv_ubatch;
-    llaisys::runtime::kv_cache::KvSlotInfo slot_info;
-    bool kv_applied = false;
 
-    try {
-        validate_or_die_();
-        ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
+    // Validate static model state (weights/meta invariants) before touching runtime buffers.
+    validate_or_die_();
+    // decode() requires a live KV runtime instance.
+    ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
 
-        ensure_workspace_(ntoken);
-        const auto &ws = workspace_->view();
+    // Ensure workspace tensors are large enough for current ntoken.
+    ensure_workspace_(ntoken);
+    const auto &ws = workspace_->view();
 
-        std::vector<int64_t> tokens(ntoken);
-        std::vector<int32_t> nseq_values(ntoken, 0);
+    // Flat token ids used by embedding op.
+    std::vector<int64_t> tokens(ntoken);
+    // Number of effective sequence ids per token after de-duplication (SLOT path only).
+    std::vector<int32_t> nseq_values(ntoken, 0);
 
+    if (kv_layout_ == KvCacheLayout::BLOCK) {
+        // BLOCK mainline: one token belongs to one seq; seq/block mapping is provided by scheduler.
+        for (size_t i = 0; i < ntoken; ++i) {
+            tokens[i] = batch.token[i];
+            seq_ids_flat[i] = batch.seq_id[i][0];
+            pos_values[i] = batch.pos[i];
+        }
+    } else {
+        // SLOT path: derive per-token seq set and infer/validate positions from kv state.
         std::unordered_map<int64_t, int64_t> next_pos_by_seq;
         for (size_t i = 0; i < ntoken; ++i) {
             tokens[i] = batch.token[i];
@@ -398,6 +696,7 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
                     return -1;
                 }
             }
+
             const int64_t pos = batch.pos ? batch.pos[i] : expected_pos;
             if (pos != expected_pos) {
                 return -1;
@@ -407,160 +706,25 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
                 next_pos_by_seq[sid] = pos + 1;
             }
         }
-
-        kv_ubatch.seq_sets = seq_sets;
-        kv_ubatch.pos_values = pos_values;
-        auto sinfos = kv_cache_->prepare({kv_ubatch});
-        if (sinfos.empty()) {
-            return 1;
-        }
-        slot_info = sinfos[0];
-        const KvStatus apply_rc = kv_cache_->apply_ubatch(slot_info, kv_ubatch);
-        if (apply_rc == KvStatus::OOM_SLOT) {
-            return 1;
-        }
-        if (apply_rc != KvStatus::OK) {
-            return -1;
-        }
-        CHECK_ARGUMENT(slot_info.n_stream() == 1, "Qwen2: unsupported slot_info stream shape");
-        CHECK_ARGUMENT(slot_info.size() == ntoken, "Qwen2: slot_info size mismatch");
-        const auto &slot_idxs = slot_info.idxs[0];
-        kv_applied = true;
-
-        tensor_t input_ids = make_tensor({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
-        input_ids->load(tokens.data());
-
-        tensor_t hidden = slice_tokens_(ws.hidden, ntoken);
-        ops::embedding(hidden, input_ids, weights_.in_embed->tensor);
-
-        tensor_t pos_ids = slice_tokens_(ws.pos_ids, ntoken);
-        fill_pos_ids_from_values_(pos_ids, pos_values);
-
-        std::vector<int32_t> used_slots;
-        tensor_t attn_mask{};
-        std::vector<int32_t> attn_row_ptr;
-        std::vector<int32_t> attn_col_idx;
-        if (kv_layout_ == KvCacheLayout::BLOCK) {
-            auto *paged = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(kv_cache_.get());
-            CHECK_ARGUMENT(paged != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
-
-            const bool ok = paged->build_attention_plan_csr(seq_sets, pos_values, &used_slots, &attn_row_ptr, &attn_col_idx);
-            CHECK_ARGUMENT(ok, "Qwen2: failed to build paged attention plan");
-            CHECK_ARGUMENT(attn_row_ptr.size() == ntoken + 1, "Qwen2: paged attention row_ptr mismatch");
-            CHECK_ARGUMENT(!attn_col_idx.empty(), "Qwen2: paged attention col_idx is empty");
-
-        } else {
-            kv_cache_->used_slots(&used_slots);
-            const size_t kvlen = used_slots.size();
-            CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
-
-            attn_mask = make_tensor({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
-            uint8_t *mask_ptr = reinterpret_cast<uint8_t *>(attn_mask->data());
-            for (size_t i = 0; i < ntoken; ++i) {
-                bool has_visible = false;
-                for (size_t k = 0; k < kvlen; ++k) {
-                    const bool visible =
-                        kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
-                    mask_ptr[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-                    has_visible = has_visible || visible;
-                }
-                CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
-            }
-        }
-        const size_t kvlen = used_slots.size();
-
-        const size_t nh = meta_.nh;
-        const size_t nkvh = meta_.nkvh;
-        const size_t dh = meta_.dh;
-        const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
-
-        for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
-            tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
-            ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
-
-            tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
-            tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
-            tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
-
-            ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor,
-                        bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
-            ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor,
-                        bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
-            ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor,
-                        bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
-
-            tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
-            tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
-            tensor_t v_new_3d = view_2d_to_3d_(v_proj, ntoken, nkvh, dh);
-
-            tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
-            tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
-            ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
-            ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
-
-            tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
-            tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
-            for (size_t i = 0; i < ntoken; ++i) {
-                copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
-                copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
-            }
-
-            tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
-            if (kv_layout_ == KvCacheLayout::BLOCK) {
-                ops::self_attention_paged(
-                    attn_out, rope_q, layer_k_cache, layer_v_cache, used_slots, attn_row_ptr, attn_col_idx, scale);
-            } else {
-                tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
-                tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
-                ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
-            }
-
-            tensor_t attn_out_2d = attn_out->view({ntoken, nh * dh});
-
-            tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
-            ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
-            ops::add(hidden, hidden, attn_proj);
-
-            tensor_t mlp_normed = slice_tokens_(ws.mlp_normed, ntoken);
-            ops::rms_norm(mlp_normed, hidden, weights_.mlp_norm_w[layer]->tensor, meta_.epsilon);
-
-            tensor_t gate = slice_tokens_(ws.gate, ntoken);
-            tensor_t up = slice_tokens_(ws.up, ntoken);
-            ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
-            ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
-
-            tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
-            ops::swiglu(swiglu, gate, up);
-
-            tensor_t down = slice_tokens_(ws.down, ntoken);
-            ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
-            ops::add(hidden, hidden, down);
-        }
-
-        tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
-        ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
-        tensor_t logits = slice_tokens_(ws.logits, ntoken);
-        ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
-
-        for (size_t i = 0; i < ntoken; ++i) {
-            const bool collect = (batch.logits == nullptr) ? (i + 1 == ntoken) : (batch.logits[i] != 0);
-            if (collect) {
-                append_output_logits_row_(i, static_cast<int32_t>(i));
-            }
-        }
-
-        return 0;
-    } catch (const std::invalid_argument &) {
-        if (kv_applied) {
-            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
-        }
-        return 1;
-    } catch (...) {
-        if (kv_applied) {
-            kv_cache_->rollback_ubatch(slot_info, kv_ubatch);
-        }
-        return -2;
     }
+
+    // Build input token tensor [ntoken] and load ids.
+    tensor_t input_ids = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    input_ids->load(tokens.data());
+
+    // Project token ids to hidden states with embedding table.
+    tensor_t hidden = slice_tokens_(ws.hidden, ntoken);
+    ops::embedding(hidden, input_ids, weights_.in_embed->tensor);
+
+    // Build position ids tensor for RoPE.
+    tensor_t pos_ids = slice_tokens_(ws.pos_ids, ntoken);
+    fill_pos_ids_from_values_(pos_ids, pos_values);
+
+    // Dispatch only after all common decode state is prepared.
+    if (kv_layout_ == KvCacheLayout::BLOCK) {
+        return decode_block_path_(batch, ntoken, seq_ids_flat, pos_values, hidden, pos_ids);
+    }
+    return decode_slot_path_(batch, ntoken, seq_sets, pos_values, nseq_values, hidden, pos_ids);
 }
 
 float *Qwen2Model::logits() noexcept {
@@ -579,6 +743,12 @@ const int32_t *Qwen2Model::output_ids() const noexcept {
     return output_ ? output_->output_ids() : nullptr;
 }
 
+// ===== KV management APIs =====
+// These methods are kept together because they are all C-API-facing KV controls.
+// Runtime semantics depend on KV layout:
+// - SLOT(UnifiedKvImpl): full kv_seq_* behavior.
+// - BLOCK(PagedKvImpl): only block-native operations are guaranteed; unsupported
+//   kv_seq_* operations are delegated and may return INTERNAL_ERROR.
 KvStatus Qwen2Model::kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
     ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
     std::vector<int32_t> src_slots;
@@ -631,6 +801,33 @@ int64_t Qwen2Model::kv_seq_pos_max(int64_t seq_id) const noexcept {
         return -1;
     }
     return kv_cache_->seq_pos_max(seq_id);
+}
+
+KvStatus Qwen2Model::request_free(int64_t seq_id) {
+    ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
+    return kv_cache_->request_free(seq_id);
+}
+
+// Clear retained prefix-donor metadata in KV runtime (when supported by impl).
+KvStatus Qwen2Model::kv_reset_prefix_cache() {
+    ASSERT(kv_cache_ != nullptr, "Qwen2: kv_cache is null");
+    return kv_cache_->reset_prefix_cache();
+}
+
+bool Qwen2Model::kv_stats(KvStatsSnapshot *out) const noexcept {
+    if (out == nullptr || !kv_cache_) {
+        return false;
+    }
+    std::vector<int32_t> used_slots;
+    kv_cache_->used_slots(&used_slots);
+    out->capacity_tokens = static_cast<int64_t>(kv_cache_capacity_tokens_);
+    out->used_tokens = static_cast<int64_t>(used_slots.size());
+    out->free_tokens = std::max<int64_t>(0, out->capacity_tokens - out->used_tokens);
+    if (out->used_tokens > kv_peak_used_tokens_) {
+        kv_peak_used_tokens_ = out->used_tokens;
+    }
+    out->peak_used_tokens = kv_peak_used_tokens_;
+    return true;
 }
 
 void Qwen2Model::destroy_weights_() {
