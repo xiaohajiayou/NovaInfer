@@ -73,6 +73,7 @@ def load_llaisys_llm(model_path, device_name):
         model=model_path,
         model_type="qwen2",
         device=llaisys_device(device_name),
+        kv_cache_auto_capacity=True,
     )
 
 
@@ -85,13 +86,14 @@ def llaisys_offline_infer(
         tokenize=False,
     )
     inputs = tokenizer.encode(input_content)
-    return llm.generate(
-        inputs,
+    outputs = llm.generate(
+        [inputs],
         max_new_tokens=max_new_tokens,
         top_k=top_k,
         top_p=top_p,
         temperature=temperature,
     )
+    return outputs[0]["token_ids"]
 
 
 @pytest.mark.requires_model
@@ -103,7 +105,7 @@ def test_offline_parity_single(require_model_path):
     top_p, top_k, temperature = 1.0, 1, 1.0
     max_steps = 10
 
-    hf_tokens = hf_infer(
+    hf_tokens = hf_completion_tokens(
         prompt,
         tokenizer,
         model,

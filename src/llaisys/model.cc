@@ -152,6 +152,15 @@ public:
         return it->second;
     }
 
+    KvStatus request_free(int64_t seq_id) {
+        auto it = seq_pos_max_.find(seq_id);
+        if (it == seq_pos_max_.end()) {
+            return KvStatus::INVALID_SEQ;
+        }
+        seq_pos_max_.erase(it);
+        return KvStatus::OK;
+    }
+
 private:
     std::unordered_map<int64_t, int64_t> seq_pos_max_{};
     std::vector<float> output_logits_{};
@@ -178,6 +187,10 @@ void free_batch_storage(struct LlaisysBatch &batch) {
     delete[] batch.n_seq_id;
     delete[] batch.seq_id;
     delete[] batch.logits;
+    delete[] batch.slot_mapping;
+    delete[] batch.context_lens;
+    delete[] batch.batch_seq_ids;
+    delete[] batch.block_tables;
 
     batch.n_tokens = 0;
     batch.token = nullptr;
@@ -186,6 +199,12 @@ void free_batch_storage(struct LlaisysBatch &batch) {
     batch.n_seq_id = nullptr;
     batch.seq_id = nullptr;
     batch.logits = nullptr;
+    batch.slot_mapping = nullptr;
+    batch.context_lens = nullptr;
+    batch.batch_seq_ids = nullptr;
+    batch.block_tables = nullptr;
+    batch.n_batch_seq = 0;
+    batch.block_table_width = 0;
 }
 
 } // namespace
@@ -572,6 +591,75 @@ __export int64_t llaisysModelKvSeqPosMax(struct LlaisysModel *model, int64_t seq
         return model->impl->mock ? model->impl->mock->kv_seq_pos_max(seq_id) : -1;
     default:
         return -1;
+    }
+}
+
+__export int llaisysModelRequestFree(struct LlaisysModel *model, int64_t seq_id) {
+    if (model == nullptr || model->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+
+    const auto free_direct = [&](auto *runner) -> int {
+        if (runner == nullptr) {
+            return to_kv_code(KvStatus::INTERNAL_ERROR);
+        }
+        return to_kv_code(runner->request_free(seq_id));
+    };
+
+    switch (model->impl->type) {
+    case LLAISYS_MODEL_TYPE_QWEN2:
+        return free_direct(model->impl->qwen2.get());
+    case LLAISYS_MODEL_TYPE_MOCK:
+        return free_direct(model->impl->mock.get());
+    default:
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+}
+
+__export int llaisysModelKvStats(struct LlaisysModel *model, struct LlaisysKvStats *out_stats) {
+    if (model == nullptr || model->impl == nullptr || out_stats == nullptr) {
+        return -1;
+    }
+
+    switch (model->impl->type) {
+    case LLAISYS_MODEL_TYPE_QWEN2: {
+        if (!model->impl->qwen2) {
+            return -1;
+        }
+        Qwen2Model::KvStatsSnapshot snap{};
+        if (!model->impl->qwen2->kv_stats(&snap)) {
+            return -1;
+        }
+        out_stats->capacity_tokens = snap.capacity_tokens;
+        out_stats->used_tokens = snap.used_tokens;
+        out_stats->free_tokens = snap.free_tokens;
+        out_stats->peak_used_tokens = snap.peak_used_tokens;
+        return 0;
+    }
+    case LLAISYS_MODEL_TYPE_MOCK:
+        out_stats->capacity_tokens = 0;
+        out_stats->used_tokens = 0;
+        out_stats->free_tokens = 0;
+        out_stats->peak_used_tokens = 0;
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+__export int llaisysModelKvResetPrefixCache(struct LlaisysModel *model) {
+    if (model == nullptr || model->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    switch (model->impl->type) {
+    case LLAISYS_MODEL_TYPE_QWEN2:
+        return model->impl->qwen2
+                   ? to_kv_code(model->impl->qwen2->kv_reset_prefix_cache())
+                   : to_kv_code(KvStatus::INTERNAL_ERROR);
+    case LLAISYS_MODEL_TYPE_MOCK:
+        return to_kv_code(KvStatus::OK);
+    default:
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
 }
 

@@ -40,6 +40,8 @@ def _create_qwen2(
     kv_cache_block_size: int = 16,
     max_model_len: int | None = None,
     kv_cache_capacity_tokens: int | None = None,
+    kv_cache_auto_capacity: bool = False,
+    kv_cache_memory_utilization: float = 0.9,
 ):
     from ..models.qwen2 import Qwen2
 
@@ -50,6 +52,8 @@ def _create_qwen2(
         kv_cache_block_size=kv_cache_block_size,
         max_model_len=max_model_len,
         kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+        kv_cache_auto_capacity=kv_cache_auto_capacity,
+        kv_cache_memory_utilization=kv_cache_memory_utilization,
     )
 
 

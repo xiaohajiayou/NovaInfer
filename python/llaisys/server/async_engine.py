@@ -8,6 +8,7 @@ from typing import Sequence
 import sys
 
 from ..engine.llm_engine import LLMEngine
+from ..engine.config import EngineConfig
 from ..engine.model_registry import ModelRegistry
 from ..engine.types import GenerationOutput, SamplingParams, StreamChunk
 from ..libllaisys import DeviceType
@@ -36,19 +37,33 @@ class AsyncLLMEngine:
         kv_cache_block_size: int = 16,
         max_model_len: int | None = None,
         kv_cache_capacity_tokens: int | None = None,
+        max_num_seqs: int = 8,
+        max_num_batched_tokens: int | None = None,
+        kv_cache_auto_capacity: bool = False,
+        kv_cache_memory_utilization: float = 0.9,
         model_registry: ModelRegistry | None = None,
         engine: LLMEngine | None = None,
     ):
-        self._engine = engine if engine is not None else LLMEngine(
-            model_type=model_type,
-            model_path=model_path,
-            device=device,
-            kv_cache_layout=kv_cache_layout,
-            kv_cache_block_size=kv_cache_block_size,
-            max_model_len=max_model_len,
-            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-            model_registry=model_registry,
-        )
+        if engine is not None:
+            self._engine = engine
+        else:
+            cfg = EngineConfig(
+                model_type=model_type,
+                model_path=model_path,
+                device=device,
+                kv_cache_layout=kv_cache_layout,
+                kv_cache_block_size=kv_cache_block_size,
+                max_model_len=max_model_len,
+                kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+                max_num_seqs=max_num_seqs,
+                max_num_batched_tokens=max_num_batched_tokens,
+                kv_cache_auto_capacity=kv_cache_auto_capacity,
+                kv_cache_memory_utilization=kv_cache_memory_utilization,
+            ).normalized()
+            self._engine = LLMEngine(
+                config=cfg,
+                model_registry=model_registry,
+            )
         self._stream_queues: dict[str, list[Queue]] = {}
         self._stream_states: dict[str, _StreamState] = {}
         self._final_outputs: dict[str, GenerationOutput] = {}

@@ -42,8 +42,12 @@ def _run_once(
     device: DeviceType,
     layout: KvCacheLayout,
     block_size: int,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
     max_model_len: int,
-    kv_cache_capacity_tokens: int,
+    kv_cache_capacity_tokens: int | None,
+    kv_cache_auto_capacity: bool,
+    kv_cache_memory_utilization: float,
     prompts: list[list[int]],
     sampling_params: list[SamplingParams],
     expected_total_tokens_per_round: int,
@@ -57,13 +61,21 @@ def _run_once(
         device=device,
         kv_cache_layout=layout,
         kv_cache_block_size=block_size,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
         max_model_len=max_model_len,
         kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+        kv_cache_auto_capacity=kv_cache_auto_capacity,
+        kv_cache_memory_utilization=kv_cache_memory_utilization,
     )
+    kv_stats_last: dict = {}
     try:
         # warmup
         print(f"[bench] warmup start layout={layout_name}")
         _ = llm.generate([[1, 2, 3, 4]], sampling_params=SamplingParams(max_new_tokens=4, top_k=1, top_p=1.0, temperature=1.0))
+        kv_stats_last = llm.kv_cache_stats()
+        if kv_stats_last:
+            print(f"[bench] kv_stats_after_warmup layout={layout_name} stats={kv_stats_last}")
         print(f"[bench] warmup done layout={layout_name}")
 
         t0 = time.perf_counter()
@@ -72,9 +84,10 @@ def _run_once(
             print(f"[bench] round {i + 1}/{rounds} start layout={layout_name}")
             outs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
             total_reqs += len(outs)
+            kv_stats_last = llm.kv_cache_stats()
             print(
                 f"[bench] round {i + 1}/{rounds} done layout={layout_name} "
-                f"cum_reqs={total_reqs}"
+                f"cum_reqs={total_reqs} kv_stats={kv_stats_last}"
             )
         t1 = time.perf_counter()
     finally:
@@ -95,6 +108,7 @@ def _run_once(
         "seconds": dt,
         "tokens_per_sec": total_completion / dt,
         "avg_req_latency_ms": (dt / max(1, total_reqs)) * 1000.0,
+        "kv_cache_stats": kv_stats_last,
     }
 
 
@@ -114,6 +128,10 @@ def main() -> int:
     parser.add_argument("--max-output-len", default=1024, type=int)
     parser.add_argument("--max-model-len", default=4096, type=int)
     parser.add_argument("--kv-cache-capacity-tokens", default=4096, type=int)
+    parser.add_argument("--kv-cache-capacity-mode", default="explicit", choices=["explicit", "auto"])
+    parser.add_argument("--kv-cache-memory-utilization", default=0.9, type=float)
+    parser.add_argument("--max-num-seqs", default=8, type=int)
+    parser.add_argument("--max-num-batched-tokens", default=0, type=int)
     args = parser.parse_args()
     os.environ["OMP_NUM_THREADS"] = str(max(1, int(args.omp_num_threads)))
     os.environ["OMP_PROC_BIND"] = str(args.omp_proc_bind)
@@ -124,6 +142,9 @@ def main() -> int:
         f"num_prompts={args.num_prompts} rounds={args.rounds} seed={args.seed} "
         f"max_input_len={args.max_input_len} max_output_len={args.max_output_len} "
         f"max_model_len={args.max_model_len} kv_cache_capacity_tokens={args.kv_cache_capacity_tokens} "
+        f"kv_cache_capacity_mode={args.kv_cache_capacity_mode} "
+        f"kv_cache_memory_utilization={args.kv_cache_memory_utilization} "
+        f"max_num_seqs={args.max_num_seqs} max_num_batched_tokens={args.max_num_batched_tokens} "
         f"omp_num_threads={os.environ.get('OMP_NUM_THREADS')} "
         f"omp_proc_bind={os.environ.get('OMP_PROC_BIND')} omp_places={os.environ.get('OMP_PLACES')}"
     )
@@ -147,6 +168,13 @@ def main() -> int:
     expected_total_tokens_per_round = sum(int(sp.max_new_tokens or 0) for sp in sampling_params)
     print(f"[bench] expected_total_tokens_per_round={expected_total_tokens_per_round}")
     device = _parse_device(args.device)
+    explicit_capacity_tokens = max(1, int(args.kv_cache_capacity_tokens))
+    use_auto_capacity = str(args.kv_cache_capacity_mode) == "auto"
+    max_num_batched_tokens = (
+        max(1, int(args.max_num_batched_tokens))
+        if int(args.max_num_batched_tokens) > 0
+        else explicit_capacity_tokens
+    )
 
     slot = None
     block = None
@@ -156,8 +184,12 @@ def main() -> int:
             device=device,
             layout=KvCacheLayout.SLOT,
             block_size=int(args.block_size),
+            max_num_seqs=max(1, int(args.max_num_seqs)),
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
-            kv_cache_capacity_tokens=max(1, int(args.kv_cache_capacity_tokens)),
+            kv_cache_capacity_tokens=(None if use_auto_capacity else explicit_capacity_tokens),
+            kv_cache_auto_capacity=use_auto_capacity,
+            kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
             prompts=prompts,
             sampling_params=sampling_params,
             expected_total_tokens_per_round=expected_total_tokens_per_round,
@@ -171,8 +203,12 @@ def main() -> int:
             device=device,
             layout=KvCacheLayout.BLOCK,
             block_size=int(args.block_size),
+            max_num_seqs=max(1, int(args.max_num_seqs)),
+            max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
-            kv_cache_capacity_tokens=max(1, int(args.kv_cache_capacity_tokens)),
+            kv_cache_capacity_tokens=(None if use_auto_capacity else explicit_capacity_tokens),
+            kv_cache_auto_capacity=use_auto_capacity,
+            kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
             prompts=prompts,
             sampling_params=sampling_params,
             expected_total_tokens_per_round=expected_total_tokens_per_round,
@@ -188,3 +224,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+

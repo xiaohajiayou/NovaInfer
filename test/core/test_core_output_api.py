@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from ctypes import POINTER, byref, c_int, c_int8, c_int32, c_int64, c_void_p, cast
+from ctypes import POINTER, byref, c_int, c_int32, c_void_p, cast
 from dataclasses import dataclass
 
 import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+from test.utils.batch_builders import build_decode_batch
 
 TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
@@ -106,19 +107,15 @@ def create_tiny_qwen2_model(meta: TinyMeta = TinyMeta()):
 
 
 def _decode(model, token_ids: list[int], logits_mask: list[int]) -> None:
-    n = len(token_ids)
-    token_buf = (c_int64 * n)(*token_ids)
-    logits_buf = (c_int8 * n)(*logits_mask)
-    batch = LlaisysBatch(
-        n_tokens=c_int32(n),
-        token=token_buf,
-        embd=None,
-        pos=None,
-        n_seq_id=None,
-        seq_id=None,
-        logits=logits_buf,
+    built = build_decode_batch(
+        token_ids,
+        logits_mask=logits_mask,
+        seq_ids=[0] * len(token_ids),
+        pos_ids=[int(i) for i in range(len(token_ids))],
+        layout=KvCacheLayout(TEST_KV_LAYOUT),
+        block_size=TEST_KV_BLOCK_SIZE,
     )
-    status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+    status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
     assert status == 0
 
 
@@ -160,17 +157,15 @@ def test_default_logits_behavior_returns_last_row_only():
         assert int(LIB_LLAISYS.llaisysModelNOutputs(model)) == 0
 
         # Null logits mask means "return last token row".
-        token_buf = (c_int64 * 3)(1, 3, 5)
-        batch = LlaisysBatch(
-            n_tokens=c_int32(3),
-            token=token_buf,
-            embd=None,
-            pos=None,
-            n_seq_id=None,
-            seq_id=None,
-            logits=None,
+        built = build_decode_batch(
+            [1, 3, 5],
+            logits_mask=None,
+            seq_ids=[0, 0, 0],
+            pos_ids=[0, 1, 2],
+            layout=KvCacheLayout(TEST_KV_LAYOUT),
+            block_size=TEST_KV_BLOCK_SIZE,
         )
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
         assert status == 0
 
         assert int(LIB_LLAISYS.llaisysModelNOutputs(model)) == 1

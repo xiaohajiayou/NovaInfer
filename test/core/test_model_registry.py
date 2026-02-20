@@ -1,11 +1,12 @@
-from ctypes import POINTER, byref, c_int, c_int8, c_int32, c_int64, c_void_p, cast
+from ctypes import POINTER, byref, c_int, c_int32, c_int64, c_void_p, cast
 
 import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+from test.utils.batch_builders import build_decode_batch
 
 TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
@@ -93,26 +94,13 @@ def _make_mock():
 
 
 def _decode_mock(model):
-    tokens = (c_int64 * 3)(10, 20, 30)
-    logits = (c_int8 * 3)(0, 1, 1)
-    n_seq = (c_int32 * 3)(1, 1, 1)
-    seq_buf_0 = (c_int64 * 1)(5)
-    seq_buf_1 = (c_int64 * 1)(6)
-    seq_buf_2 = (c_int64 * 1)(5)
-    seq_ptr = (POINTER(c_int64) * 3)()
-    seq_ptr[0] = cast(seq_buf_0, POINTER(c_int64))
-    seq_ptr[1] = cast(seq_buf_1, POINTER(c_int64))
-    seq_ptr[2] = cast(seq_buf_2, POINTER(c_int64))
-    batch = LlaisysBatch(
-        n_tokens=c_int32(3),
-        token=tokens,
-        embd=None,
-        pos=None,
-        n_seq_id=n_seq,
-        seq_id=seq_ptr,
-        logits=logits,
+    built = build_decode_batch(
+        [10, 20, 30],
+        logits_mask=[0, 1, 1],
+        seq_ids=[5, 6, 5],
+        layout=KvCacheLayout.SLOT,
     )
-    return int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+    return int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
 
 
 def test_model_registry_qwen2_and_mock():

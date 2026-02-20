@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from ctypes import POINTER, byref, c_int, c_int8, c_int32, c_int64, c_void_p, cast
+from ctypes import POINTER, byref, c_int, c_int32, c_int64, c_void_p, cast
 from dataclasses import dataclass
 
 import numpy as np
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysModelCreateParams, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysModelCreateParams, ModelType
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
+from test.utils.batch_builders import build_decode_batch
 
 TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
@@ -105,18 +106,14 @@ def create_tiny_qwen2_model(meta: TinyMeta = TinyMeta()):
     return model, meta
 
 
-def _make_batch(token_ids: list[int], logits_mask: list[int]) -> LlaisysBatch:
-    n = len(token_ids)
-    token_buf = (c_int64 * n)(*token_ids)
-    logits_buf = (c_int8 * n)(*logits_mask)
-    return LlaisysBatch(
-        n_tokens=c_int32(n),
-        token=token_buf,
-        embd=None,
-        pos=None,
-        n_seq_id=None,
-        seq_id=None,
-        logits=logits_buf,
+def _make_batch(token_ids: list[int], logits_mask: list[int]):
+    return build_decode_batch(
+        token_ids,
+        logits_mask=logits_mask,
+        seq_ids=[0] * len(token_ids),
+        pos_ids=[int(i) for i in range(len(token_ids))],
+        layout=KvCacheLayout(TEST_KV_LAYOUT),
+        block_size=TEST_KV_BLOCK_SIZE,
     )
 
 
@@ -125,8 +122,8 @@ def test_model_create_decode_logits_and_kv_api():
     try:
         assert int(LIB_LLAISYS.llaisysModelType(model)) == int(ModelType.QWEN2)
 
-        batch = _make_batch([1, 2, 3], [0, 0, 1])
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
+        built = _make_batch([1, 2, 3], [0, 0, 1])
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
         assert status == 0
 
         n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(model))
@@ -135,13 +132,44 @@ def test_model_create_decode_logits_and_kv_api():
         assert bool(LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(0)))
         assert not bool(LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(1)))
 
-        assert int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(0))) == 0
-        assert int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(1))) == 2
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == 2
+        keep0 = int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(0)))
+        keep1 = int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(1)))
+        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
+            assert keep0 == 5  # KvStatus::INTERNAL_ERROR (unsupported on paged KV path)
+            assert keep1 == 5
+        else:
+            assert keep0 == 0
+            assert keep1 == 2
+        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == -1
+        else:
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == 2
 
         rm_status = int(LIB_LLAISYS.llaisysModelKvSeqRm(model, c_int64(0), c_int64(2), c_int64(3)))
-        assert rm_status == 0
-        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == 1
+        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
+            assert rm_status == 5
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == -1
+            assert int(LIB_LLAISYS.llaisysModelKvResetPrefixCache(model)) == 0
+        else:
+            assert rm_status == 0
+            assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == 1
+
+        free_status = int(LIB_LLAISYS.llaisysModelRequestFree(model, c_int64(0)))
+        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
+            assert free_status == 2
+        else:
+            assert free_status == 0
+        assert int(LIB_LLAISYS.llaisysModelKvSeqPosMax(model, c_int64(0))) == -1
+
+        stats = llaisys.libllaisys.model.LlaisysKvStats()
+        stats_rc = int(LIB_LLAISYS.llaisysModelKvStats(model, byref(stats)))
+        assert stats_rc == 0
+        assert int(stats.capacity_tokens) == meta.maxseq
+        assert int(stats.used_tokens) == 0
+        assert int(stats.free_tokens) == meta.maxseq
+        assert int(stats.peak_used_tokens) >= 0
+
+        assert int(LIB_LLAISYS.llaisysModelKvResetPrefixCache(model)) == 0
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
 
@@ -150,9 +178,12 @@ def test_model_decode_reports_oom_when_exceeding_maxseq():
     model, meta = create_tiny_qwen2_model()
     try:
         token_ids = [1] * (meta.maxseq + 1)
-        batch = _make_batch(token_ids, [0] * meta.maxseq + [1])
-        status = int(LIB_LLAISYS.llaisysModelDecode(model, batch))
-        assert status == 1
+        built = _make_batch(token_ids, [0] * meta.maxseq + [1])
+        status = int(LIB_LLAISYS.llaisysModelDecode(model, built.batch))
+        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
+            assert status != 0
+        else:
+            assert status == 1
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
 

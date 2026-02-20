@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <vector>
 
 namespace llaisys::runtime::kv_cache {
@@ -109,15 +110,49 @@ public:
     virtual KvSlotInfoVec prepare(const std::vector<KvUBatch> &ubatches) = 0;
     virtual KvStatus apply_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) = 0;
     virtual void rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) = 0;
+    virtual KvStatus request_free(int64_t seq_id) {
+        (void) seq_id;
+        std::cerr << "[ERROR] KvCacheBase::request_free is not implemented for this KV layout." << std::endl;
+        return KvStatus::INTERNAL_ERROR;
+    }
+    virtual KvStatus reset_prefix_cache() {
+        return KvStatus::OK;
+    }
     virtual KvStatus seq_cp(int64_t dst_seq,
                             int64_t src_seq,
                             int64_t p0,
                             int64_t p1,
                             std::vector<int32_t> *src_slots,
-                            std::vector<int32_t> *dst_slots) = 0;
-    virtual KvStatus seq_rm(int64_t seq_id, int64_t p0, int64_t p1) = 0;
-    virtual KvStatus seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) = 0;
-    virtual KvStatus seq_keep(int64_t seq_id) = 0;
+                            std::vector<int32_t> *dst_slots) {
+        (void) dst_seq;
+        (void) src_seq;
+        (void) p0;
+        (void) p1;
+        (void) src_slots;
+        (void) dst_slots;
+        std::cerr << "[ERROR] KvCacheBase::seq_cp is not implemented for this KV layout." << std::endl;
+        return KvStatus::INTERNAL_ERROR;
+    }
+    virtual KvStatus seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
+        (void) seq_id;
+        (void) p0;
+        (void) p1;
+        std::cerr << "[ERROR] KvCacheBase::seq_rm is not implemented for this KV layout." << std::endl;
+        return KvStatus::INTERNAL_ERROR;
+    }
+    virtual KvStatus seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
+        (void) seq_id;
+        (void) p0;
+        (void) p1;
+        (void) delta;
+        std::cerr << "[ERROR] KvCacheBase::seq_add is not implemented for this KV layout." << std::endl;
+        return KvStatus::INTERNAL_ERROR;
+    }
+    virtual KvStatus seq_keep(int64_t seq_id) {
+        (void) seq_id;
+        std::cerr << "[ERROR] KvCacheBase::seq_keep is not implemented for this KV layout." << std::endl;
+        return KvStatus::INTERNAL_ERROR;
+    }
     virtual int64_t seq_pos_max(int64_t seq_id) const noexcept = 0;
     virtual void used_slots(std::vector<int32_t> *out) const = 0;
     virtual bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const = 0;

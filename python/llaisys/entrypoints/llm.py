@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from ..engine.engine_client import EngineClient
+from ..engine.config import EngineConfig
 from ..engine.llm_engine import LLMEngine
 from ..engine.model_registry import ModelRegistry
 from ..engine.types import SamplingParams
@@ -23,11 +24,15 @@ class LLM:
         kv_cache_block_size: int = 16,
         max_model_len: int | None = None,
         kv_cache_capacity_tokens: int | None = None,
+        max_num_seqs: int | None = None,
+        max_num_batched_tokens: int | None = None,
+        kv_cache_auto_capacity: bool = False,
+        kv_cache_memory_utilization: float = 0.9,
         model_registry: ModelRegistry | None = None,
     ):
         self._model_path = Path(model)
         self._tokenizer = None
-        engine = LLMEngine(
+        cfg = EngineConfig(
             model_type=model_type,
             model_path=model,
             device=device,
@@ -35,6 +40,13 @@ class LLM:
             kv_cache_block_size=kv_cache_block_size,
             max_model_len=max_model_len,
             kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+            max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
+            max_num_batched_tokens=max_num_batched_tokens,
+            kv_cache_auto_capacity=kv_cache_auto_capacity,
+            kv_cache_memory_utilization=kv_cache_memory_utilization,
+        ).normalized()
+        engine = LLMEngine(
+            config=cfg,
             model_registry=model_registry,
         )
         self._engine_client = EngineClient(engine)
@@ -99,6 +111,12 @@ class LLM:
         if callable(close_fn):
             close_fn()
 
+    def kv_cache_stats(self) -> dict:
+        fn = getattr(self._engine_client, "kv_cache_stats", None)
+        if callable(fn):
+            return fn()
+        return {}
+
     def generate(
         self,
         inputs,
@@ -113,21 +131,10 @@ class LLM:
     ):
         _ = use_tqdm
 
-        # Backward-compatible fast path: token ids in, token ids out.
-        if self._is_token_id_list(inputs):
-            params = self._build_sampling_params(
-                sampling_params=sampling_params if isinstance(sampling_params, SamplingParams) else None,
-                max_new_tokens=max_new_tokens,
-                top_k=top_k,
-                top_p=top_p,
-                temperature=temperature,
-                stop_token_ids=stop_token_ids,
-                stop=stop,
-            )
-            output = self._engine_client.generate(inputs=inputs, sampling_params=params)
-            return output.token_ids
-
+        # Normalize all accepted input forms into a uniform token-batch representation:
+        # str -> [token_ids], list[str] -> list[token_ids], list[list[int]] -> unchanged.
         batch_inputs, prompt_token_lens = self._normalize_batch_inputs(inputs)
+        # Build per-request sampling params (single config is broadcast to all requests).
         params_list = self._normalize_sampling_params_list(
             sampling_params=sampling_params,
             batch_size=len(batch_inputs),
@@ -139,11 +146,13 @@ class LLM:
             stop=stop,
         )
 
+        # Submit all requests first; actual decoding happens in step()/collect() loop below.
         request_ids = []
         for token_ids, params in zip(batch_inputs, params_list):
             req_id = self._engine_client.submit(inputs=token_ids, sampling_params=params)
             request_ids.append(req_id)
 
+        # Drive the engine until every request becomes collectable.
         pending = set(request_ids)
         outputs = {}
         while pending:
@@ -155,6 +164,8 @@ class LLM:
                 outputs[req_id] = out
                 pending.remove(req_id)
 
+        # Convert engine outputs to entrypoint payload shape.
+        # token_ids are completion-only (prompt prefix removed).
         packed = []
         for req_id, prompt_len in zip(request_ids, prompt_token_lens):
             out = outputs[req_id]
@@ -226,15 +237,18 @@ class LLM:
         raise TypeError("inputs must be str or Sequence[int]")
 
     def _normalize_batch_inputs(self, inputs) -> tuple[list[list[int]], list[int]]:
+        # Single prompt string -> single request batch.
         if isinstance(inputs, str):
             token_ids = self._encode_prompt(inputs)
             return [token_ids], [len(token_ids)]
 
+        # Multiple prompt strings -> N requests.
         if isinstance(inputs, Sequence) and inputs and isinstance(inputs[0], str):
             token_batches = [self._encode_prompt(str(p)) for p in inputs]
             lens = [len(x) for x in token_batches]
             return token_batches, lens
 
+        # Tokenized batch path (vLLM-style): list[list[int]].
         if isinstance(inputs, Sequence) and inputs and isinstance(inputs[0], Sequence):
             token_batches = []
             lens = []

@@ -84,6 +84,7 @@ public:
     KvSlotInfoVec prepare(const std::vector<KvUBatch> &ubatches) override;
     KvStatus apply_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
     void rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
+    KvStatus request_free(int64_t seq_id) override;
 
     KvStatus seq_cp(int64_t dst_seq,
                     int64_t src_seq,
