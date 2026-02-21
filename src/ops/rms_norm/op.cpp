@@ -1,5 +1,8 @@
 #include "op.hpp"
 #include "cpu/rms_norm_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "cuda/rms_norm_cuda.hpp"
+#endif
 
 namespace llaisys::ops {
 
@@ -23,6 +26,10 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
     switch (out->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::rms_norm(out, in, weight, eps);
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return cuda::rms_norm(out, in, weight, eps);
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
     }

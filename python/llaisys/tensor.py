@@ -95,3 +95,19 @@ class Tensor:
                 self._tensor, c_size_t(dim), c_size_t(start), c_size_t(end)
             )
         )
+
+    def contiguous(self):
+        return Tensor(tensor=LIB_LLAISYS.tensorContiguous(self._tensor))
+
+    def reshape(self, *shape: int):
+        _shape = (c_size_t * len(shape))(*shape)
+        return Tensor(
+            tensor=LIB_LLAISYS.tensorReshape(self._tensor, _shape, c_size_t(len(shape)))
+        )
+
+    def to(self, device: DeviceType, device_id: int = -1):
+        return Tensor(
+            tensor=LIB_LLAISYS.tensorTo(
+                self._tensor, llaisysDeviceType_t(device), c_int(device_id)
+            )
+        )

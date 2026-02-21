@@ -15,6 +15,13 @@ MULTI_PROMPTS = [
     "Give one short sentence about distributed inference.",
 ]
 
+def _has_nvidia_runtime() -> bool:
+    try:
+        api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
+        return api.get_device_count() > 0 and torch.cuda.is_available()
+    except Exception:
+        return False
+
 
 def load_hf_model(model_path: str, device_name="cpu"):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -99,7 +106,10 @@ def llaisys_offline_infer(
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-def test_offline_parity_single(require_model_path):
+@pytest.mark.parametrize("ll_device", ["cpu", "nvidia"])
+def test_offline_parity_single(require_model_path, ll_device):
+    if ll_device == "nvidia" and not _has_nvidia_runtime():
+        pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
     prompt = "Who are you?"
     top_p, top_k, temperature = 1.0, 1, 1.0
@@ -115,17 +125,20 @@ def test_offline_parity_single(require_model_path):
         temperature=temperature,
     )
 
-    llm = load_llaisys_llm(require_model_path, "cpu")
-    ll_tokens = llaisys_offline_infer(
-        prompt,
-        tokenizer,
-        llm,
-        max_new_tokens=max_steps,
-        top_p=top_p,
-        top_k=top_k,
-        temperature=temperature,
-    )
-    assert ll_tokens == hf_tokens
+    llm = load_llaisys_llm(require_model_path, ll_device)
+    try:
+        ll_tokens = llaisys_offline_infer(
+            prompt,
+            tokenizer,
+            llm,
+            max_new_tokens=max_steps,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+        )
+        assert ll_tokens == hf_tokens
+    finally:
+        llm.close()
 
     del model
     gc.collect()
@@ -134,7 +147,10 @@ def test_offline_parity_single(require_model_path):
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-def test_offline_parity_multi(require_model_path):
+@pytest.mark.parametrize("ll_device", ["cpu", "nvidia"])
+def test_offline_parity_multi(require_model_path, ll_device):
+    if ll_device == "nvidia" and not _has_nvidia_runtime():
+        pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
     top_p, top_k, temperature = 1.0, 1, 1.0
     max_steps = 10
@@ -152,16 +168,19 @@ def test_offline_parity_multi(require_model_path):
         )
         hf_expected_completion_tokens.append(completion)
 
-    llm = load_llaisys_llm(require_model_path, "cpu")
-    outputs = llm.generate(
-        MULTI_PROMPTS,
-        max_new_tokens=max_steps,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-    )
-    for i in range(len(MULTI_PROMPTS)):
-        assert outputs[i]["token_ids"] == hf_expected_completion_tokens[i]
+    llm = load_llaisys_llm(require_model_path, ll_device)
+    try:
+        outputs = llm.generate(
+            MULTI_PROMPTS,
+            max_new_tokens=max_steps,
+            top_k=top_k,
+            top_p=top_p,
+            temperature=temperature,
+        )
+        for i in range(len(MULTI_PROMPTS)):
+            assert outputs[i]["token_ids"] == hf_expected_completion_tokens[i]
+    finally:
+        llm.close()
 
     del model
     gc.collect()

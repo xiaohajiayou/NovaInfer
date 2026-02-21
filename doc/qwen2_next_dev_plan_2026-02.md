@@ -53,3 +53,103 @@
    - `python scripts/run_tests.py --suite stage1 --model-path /path/to/model --run-parity always`
    - `pytest -q test/online/test_online_real_model_multisession.py --model-path /path/to/model`
 3. 目录口径：测试文件已重构到 `test/core|engine|offline|online|parity|ops|utils`。
+
+## 6. CUDA 开发阶段计划（执行清单）
+
+### 阶段 1：CUDA 基础通路打通
+
+范围：
+1. `src/device`：CUDA 内存分配/释放/拷贝/同步。
+2. `tensor`：CUDA 下 `create/load/view/slice/isContiguous` 语义一致。
+
+交付：
+1. CUDA tensor 可创建、写入、读取、切片、视图。
+2. 无隐式回 CPU 路径。
+
+验收标准：
+1. CUDA tensor 基础单测通过。
+2. `device=nvidia` 的最小算子 smoke（伪数据）通过。
+
+### 阶段 2：Linear CUDA 主路径
+
+范围：
+1. `src/ops/linear/*` 增加 CUDA 实现。
+2. `src/ops/linear/op.cpp` 增加 `LLAISYS_DEVICE_NVIDIA` 分发。
+
+交付：
+1. `linear(out, in, weight, bias)` 支持 CUDA `fp16/bf16`。
+
+验收标准：
+1. 与 CPU 结果对齐（按 dtype 误差阈值）。
+2. Qwen2 单层权重抽样前向一致。
+3. 线性层执行不回退到 CPU。
+
+### 阶段 3：Paged Attention CUDA 主路径
+
+范围：
+1. `src/ops/self_attention/*` 实现 `self_attention_paged` CUDA 版本。
+2. 输入协议保持当前口径：`used_slots/row_ptr/col_idx`。
+
+交付：
+1. CUDA paged attention correctness 版本可用。
+
+验收标准：
+1. 与 CPU `self_attention_paged` 在固定 batch 上对齐（阈值内）。
+2. 支持可变 `nnz`、多 token 行场景。
+3. `decode_block_path_` 可稳定调用 CUDA attention 分支。
+
+### 阶段 4：Qwen2 端到端 CUDA decode 跑通
+
+范围：
+1. `qwen2_model.cpp` 去除 CPU-only 假设（如 host memcpy 路径）。
+2. 权重/workspace/KV cache 全链路 GPU 驻留。
+
+交付：
+1. `device=nvidia` 下完成 prefill+decode。
+
+验收标准：
+1. `core/engine/offline` 关键用例在 CUDA 跑通。
+2. online server 可启动并返回流式结果。
+3. 无跨设备 dtype/contiguous 断言错误。
+
+### 阶段 5：辅助算子 CUDA 化（去 fallback）
+
+范围：
+1. `rms_norm`、`rope`、`swiglu`、`add`（必要时 embedding/logits 路径）补 CUDA。
+2. 对应 `op.cpp` 完成 CUDA dispatch。
+
+交付：
+1. decode 热路径中 CPU fallback 显著减少。
+
+验收标准：
+1. `bench_kv_layout.py --device nvidia` 稳定跑通。
+2. profile 中主热路径为 CUDA kernel。
+
+### 阶段 6：性能收敛与基线固化
+
+范围：
+1. kernel 参数与访存优化、launch/拷贝开销清理。
+2. 固化 CUDA benchmark 配置与日志模板。
+
+交付：
+1. CUDA 基线表（tokens/s、TTFT、avg latency、显存占用）。
+2. slot vs block（CUDA）对比结论。
+
+验收标准：
+1. 同配置多轮波动可解释。
+2. BLOCK 相对 SLOT 收益可复现。
+3. 文档基线区持续更新。
+
+### 阶段 7：TP 预留与最小实现
+
+范围：
+1. `EngineConfig`/runtime 增加 TP 参数（`tensor_parallel_size/rank/world_size`）。
+2. attention/MLP 切分与必要通信接口骨架（先 correctness）。
+
+交付：
+1. TP=1/2 配置链路打通。
+
+验收标准：
+1. TP=2 最小端到端推理通过。
+2. TP=1/TP=2 输出一致性在阈值内。
+3. 文档补齐通信点与后续优化计划。

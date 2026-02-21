@@ -1,3 +1,5 @@
+#pragma once
+
 #include "llaisys.h"
 
 #include <iostream>

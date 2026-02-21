@@ -151,10 +151,24 @@ sequenceDiagram
 Linux/macOS (CPU):
 
 ```bash
-xmake f -m release
+xmake f -m release --nv-gpu=n
 xmake
 xmake install
 ```
+
+Linux (CUDA/NVIDIA):
+
+```bash
+xmake f -m release --nv-gpu=y
+xmake
+xmake install
+```
+
+Notes:
+
+- `--nv-gpu` is a configure option, so run it with `xmake f ...` first.
+- `xmake --nv-gpu ...` is not a valid replacement for `xmake f --nv-gpu=...`.
+- If you switch between CPU/CUDA modes, rerun `xmake f ...` to refresh config.
 
 The install step copies the shared library into `python/llaisys/libllaisys/`.
 If you run `xmake` only, the new `.so/.dylib` is generated under `build/...` and may not be the one Python loads.

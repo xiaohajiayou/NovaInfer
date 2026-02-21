@@ -13,6 +13,14 @@ from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 
 
+def _has_nvidia_runtime() -> bool:
+    try:
+        api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
+        return api.get_device_count() > 0 and torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def load_hf_model(model_path: str, device_name: str = "cpu"):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -157,16 +165,19 @@ def test_infer_parity(require_model_path):
         device=llaisys_device("cpu"),
         kv_cache_auto_capacity=True,
     )
-    mr_tokens = llaisys_model_runner_infer(
-        prompt,
-        tokenizer,
-        model_runner,
-        max_new_tokens=max_steps,
-        top_p=top_p,
-        top_k=top_k,
-        temperature=temperature,
-    )
-    assert mr_tokens == hf_tokens
+    try:
+        mr_tokens = llaisys_model_runner_infer(
+            prompt,
+            tokenizer,
+            model_runner,
+            max_new_tokens=max_steps,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+        )
+        assert mr_tokens == hf_tokens
+    finally:
+        model_runner.close()
 
 
 @pytest.mark.requires_model
@@ -182,13 +193,45 @@ def test_infer_smoke(require_model_path):
         device=llaisys_device("cpu"),
         kv_cache_auto_capacity=True,
     )
-    out_tokens = llaisys_model_runner_infer(
-        prompt,
-        tokenizer,
-        model_runner,
-        max_new_tokens=max_steps,
-        top_p=top_p,
-        top_k=top_k,
-        temperature=temperature,
+    try:
+        out_tokens = llaisys_model_runner_infer(
+            prompt,
+            tokenizer,
+            model_runner,
+            max_new_tokens=max_steps,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+        )
+        assert len(out_tokens) > 0
+    finally:
+        model_runner.close()
+
+
+@pytest.mark.requires_model
+@pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
+def test_infer_smoke_nvidia(require_model_path):
+    model_path = require_model_path
+    prompt = "hello"
+    max_steps = 2
+    top_p, top_k, temperature = 1.0, 1, 1.0
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    model_runner = llaisys.models.Qwen2(
+        model_path=model_path,
+        device=llaisys_device("nvidia"),
+        kv_cache_auto_capacity=True,
     )
-    assert len(out_tokens) > 0
+    try:
+        out_tokens = llaisys_model_runner_infer(
+            prompt,
+            tokenizer,
+            model_runner,
+            max_new_tokens=max_steps,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+        )
+        assert len(out_tokens) > 0
+    finally:
+        model_runner.close()

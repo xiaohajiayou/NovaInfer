@@ -1,6 +1,7 @@
 #include "qwen2_model.hpp"
 #include "../runtime/kv_cache/paged_kv.hpp"
 #include "../runtime/kv_cache/unified_kv.hpp"
+#include "../../core/llaisys_core.hpp"
 #include <unordered_set>
 
 namespace llaisys::models::qwen2 {
@@ -33,6 +34,27 @@ tensor_t kv_layer_v(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
     return impl->layer_v(layer);
 }
 
+llaisysMemcpyKind_t choose_memcpy_kind(llaisysDeviceType_t dst, llaisysDeviceType_t src) {
+    if (dst == LLAISYS_DEVICE_CPU && src == LLAISYS_DEVICE_CPU) {
+        return LLAISYS_MEMCPY_H2H;
+    }
+    if (dst != LLAISYS_DEVICE_CPU && src == LLAISYS_DEVICE_CPU) {
+        return LLAISYS_MEMCPY_H2D;
+    }
+    if (dst == LLAISYS_DEVICE_CPU && src != LLAISYS_DEVICE_CPU) {
+        return LLAISYS_MEMCPY_D2H;
+    }
+    return LLAISYS_MEMCPY_D2D;
+}
+
+void runtime_copy_bytes(llaisysDeviceType_t dst_dev, std::byte *dst, llaisysDeviceType_t src_dev, const std::byte *src, size_t nbytes) {
+    if (nbytes == 0) {
+        return;
+    }
+    const auto *api = core::context().runtime().api();
+    api->memcpy_sync(dst, src, nbytes, choose_memcpy_kind(dst_dev, src_dev));
+}
+
 } // namespace
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
@@ -47,7 +69,6 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
       kv_layout_(kv_layout),
       kv_block_size_(kv_block_size),
       kv_cache_capacity_tokens_(kv_cache_capacity_tokens) {
-    CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_CPU, "Qwen2: only CPU is supported in this stage");
 
     if (device_ids != nullptr && ndevice > 0) {
         device_id_ = device_ids[0];
@@ -244,13 +265,16 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
 void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values) {
     ASSERT(pos_ids->dtype() == LLAISYS_DTYPE_I64, "Qwen2: pos_ids dtype must be int64");
     ASSERT(pos_ids->shape()[0] == pos_values.size(), "Qwen2: pos_ids length mismatch");
-    int64_t *ptr = reinterpret_cast<int64_t *>(pos_ids->data());
-    std::memcpy(ptr, pos_values.data(), pos_values.size() * sizeof(int64_t));
+    const size_t nbytes = pos_values.size() * sizeof(int64_t);
+    runtime_copy_bytes(pos_ids->deviceType(),
+                       pos_ids->data(),
+                       LLAISYS_DEVICE_CPU,
+                       reinterpret_cast<const std::byte *>(pos_values.data()),
+                       nbytes);
 }
 
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
-    ASSERT(cache->deviceType() == LLAISYS_DEVICE_CPU, "Qwen2: cache must be on CPU");
-    ASSERT(src->deviceType() == LLAISYS_DEVICE_CPU, "Qwen2: src must be on CPU");
+    ASSERT(cache->deviceType() == src->deviceType(), "Qwen2: cache/src device mismatch");
     ASSERT(cache->dtype() == src->dtype(), "Qwen2: cache/src dtype mismatch");
     ASSERT(cache->shape()[1] == src->shape()[1] && cache->shape()[2] == src->shape()[2],
            "Qwen2: cache/src head shape mismatch");
@@ -262,7 +286,7 @@ void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const ten
 
     std::byte *dst = cache->data() + static_cast<ptrdiff_t>(slot) * static_cast<ptrdiff_t>(stride_bytes);
     const std::byte *src_ptr = src->data() + static_cast<ptrdiff_t>(token_idx) * static_cast<ptrdiff_t>(stride_bytes);
-    std::memcpy(dst, src_ptr, stride_bytes);
+    runtime_copy_bytes(cache->deviceType(), dst, src->deviceType(), src_ptr, stride_bytes);
 }
 
 tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer) {
@@ -439,7 +463,13 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         if (collect) {
             const size_t row_bytes = meta_.voc * utils::dsize(meta_.dtype);
             const std::byte *row = ws.logits->data() + i * row_bytes;
-            output_->append_row(row, meta_.dtype, static_cast<int32_t>(i));
+            if (device_type_ == LLAISYS_DEVICE_CPU) {
+                output_->append_row(row, meta_.dtype, static_cast<int32_t>(i));
+            } else {
+                std::vector<std::byte> host_row(row_bytes);
+                runtime_copy_bytes(LLAISYS_DEVICE_CPU, host_row.data(), device_type_, row, row_bytes);
+                output_->append_row(host_row.data(), meta_.dtype, static_cast<int32_t>(i));
+            }
         }
     }
 }
@@ -484,16 +514,18 @@ int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
 
     // Dense mask over global used slots; correctness-first fallback path.
     tensor_t attn_mask = Tensor::create({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
-    uint8_t *mask_ptr = reinterpret_cast<uint8_t *>(attn_mask->data());
+    // Build mask on host first; attn_mask may live on GPU in NVIDIA mode.
+    std::vector<uint8_t> host_mask(ntoken * kvlen, static_cast<uint8_t>(0));
     for (size_t i = 0; i < ntoken; ++i) {
         bool has_visible = false;
         for (size_t k = 0; k < kvlen; ++k) {
             const bool visible = kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
-            mask_ptr[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+            host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
             has_visible = has_visible || visible;
         }
         CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
     }
+    attn_mask->load(host_mask.data());
 
     run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, attn_mask, {}, {}, false);
     return 0;

@@ -1,5 +1,8 @@
 #include "op.hpp"
 #include "cpu/self_attention_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "cuda/self_attention_cuda.hpp"
+#endif
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
     CHECK_SAME_DEVICE(attn_val, q, k, v);
@@ -18,6 +21,10 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
     switch (attn_val->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::self_attention(attn_val, q, k, v, scale);
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return cuda::self_attention(attn_val, q, k, v, scale);
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
     }
@@ -120,6 +127,10 @@ void self_attention_paged(tensor_t attn_val,
     switch (attn_val->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::self_attention_paged(attn_val, q, k_cache, v_cache, used_slots, row_ptr, col_idx, scale);
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return cuda::self_attention_paged(attn_val, q, k_cache, v_cache, used_slots, row_ptr, col_idx, scale);
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
     }

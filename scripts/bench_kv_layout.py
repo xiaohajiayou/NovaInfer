@@ -154,17 +154,24 @@ def main() -> int:
 
     rng = random.Random(int(args.seed))
     n = max(1, int(args.num_prompts))
-    max_input_len = max(100, int(args.max_input_len))
-    max_output_len = max(100, int(args.max_output_len))
+    max_input_len = max(1, int(args.max_input_len))
+    max_output_len = max(1, int(args.max_output_len))
+    max_model_len = max(2, int(args.max_model_len))
+
+    # Respect CLI limits and keep prompt length within max_model_len budget.
+    prompt_hi = min(max_input_len, max_model_len - 1)
+    prompt_lo = min(prompt_hi, 1)
     prompts = [
-        [rng.randint(0, 10000) for _ in range(rng.randint(100, max_input_len))]
+        [rng.randint(0, 10000) for _ in range(rng.randint(prompt_lo, prompt_hi))]
         for _ in range(n)
     ]
-    max_model_len = max(1, int(args.max_model_len))
-    sampling_params = [
-        SamplingParams(max_new_tokens=rng.randint(100, max_output_len), top_k=1, top_p=1.0, temperature=1.0)
-        for _ in range(n)
-    ]
+
+    sampling_params = []
+    for p in prompts:
+        want = rng.randint(1, max_output_len)
+        remain = max(1, max_model_len - len(p))
+        actual = min(want, remain)
+        sampling_params.append(SamplingParams(max_new_tokens=actual, top_k=1, top_p=1.0, temperature=1.0))
     expected_total_tokens_per_round = sum(int(sp.max_new_tokens or 0) for sp in sampling_params)
     print(f"[bench] expected_total_tokens_per_round={expected_total_tokens_per_round}")
     device = _parse_device(args.device)
@@ -176,9 +183,14 @@ def main() -> int:
         else explicit_capacity_tokens
     )
 
+    run_layout = args.layout
+    if device == DeviceType.NVIDIA and args.layout == "both":
+        print("[bench] note device=nvidia does not support SLOT layout yet; fallback to layout=block")
+        run_layout = "block"
+
     slot = None
     block = None
-    if args.layout in ("both", "slot"):
+    if run_layout in ("both", "slot"):
         slot = _run_once(
             model_path=args.model_path,
             device=device,
@@ -197,7 +209,7 @@ def main() -> int:
         )
         print("=== SLOT ===")
         print(slot)
-    if args.layout in ("both", "block"):
+    if run_layout in ("both", "block"):
         block = _run_once(
             model_path=args.model_path,
             device=device,
@@ -224,6 +236,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
 

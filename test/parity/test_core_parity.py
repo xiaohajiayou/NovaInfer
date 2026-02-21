@@ -13,6 +13,14 @@ from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 
 
+def _has_nvidia_runtime() -> bool:
+    try:
+        api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
+        return api.get_device_count() > 0 and torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 def _torch_device(device_name: str):
     if device_name == "cpu":
         return torch.device("cpu")
@@ -176,13 +184,18 @@ def _build_prompt_to_token_ids(tokenizer, prompts):
 @pytest.mark.requires_hf
 @pytest.mark.parity
 @pytest.mark.parametrize(
-    "prompts",
+    "prompts, ll_device",
     [
-        ["Who are you?"],
-        ["Who are you?", "Explain KV cache in one sentence."],
+        (["Who are you?"], "cpu"),
+        (["Who are you?", "Explain KV cache in one sentence."], "cpu"),
+        (["Who are you?"], "nvidia"),
+        (["Who are you?", "Explain KV cache in one sentence."], "nvidia"),
     ],
 )
-def test_core_parity(require_model_path, prompts):
+def test_core_parity(require_model_path, prompts, ll_device):
+    if ll_device == "nvidia" and not _has_nvidia_runtime():
+        pytest.skip("NVIDIA runtime unavailable")
+
     tokenizer = AutoTokenizer.from_pretrained(require_model_path, trust_remote_code=True)
     tokenizer.padding_side = "left"
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -198,8 +211,11 @@ def test_core_parity(require_model_path, prompts):
 
     llaisys_model = llaisys.models.Qwen2(
         require_model_path,
-        llaisys.DeviceType.CPU,
+        llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
         kv_cache_auto_capacity=True,
     )
-    ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
-    assert ll_tokens == hf_tokens
+    try:
+        ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
+        assert ll_tokens == hf_tokens
+    finally:
+        llaisys_model.close()
