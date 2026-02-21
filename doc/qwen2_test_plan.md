@@ -217,3 +217,15 @@ PYTHONPATH=python python -m pytest -q
 5. 结果解释：
    - 端到端对比可接受算子不同（方案级对比）；
    - 需额外补“归因实验”（只换 KV 形态或只换算子）。
+
+### 9.1 NovaInfer vs vLLM 对比口径（新增）
+
+1. 统一脚本：`scripts/bench_compare_vllm.py`。
+2. 推荐模式：`--backend both`（脚本内部已改为子进程隔离执行 `novainfer/vllm`）。
+3. 统一参数：`seed/num_seqs/input-output length/max_model_len/max_num_seqs/max_num_batched_tokens` 必须一致。
+4. 计时口径：
+   - NovaInfer：输出 `init/warmup/run/total`，吞吐按 `run_seconds` 计算；
+   - vLLM：当前以端到端生成耗时统计。
+5. 注意事项：
+   - vLLM tokenized 输入需 `{"prompt_token_ids":[...]}`，不可直接传 `list[list[int]]`；
+   - 如需复现单后端结果，优先分别运行 `--backend novainfer` 与 `--backend vllm`。

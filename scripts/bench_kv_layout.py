@@ -4,12 +4,51 @@ import argparse
 import os
 import random
 import time
+import ctypes
 from pathlib import Path
 
 from llaisys.entrypoints.llm import LLM
 from llaisys.engine.types import SamplingParams
 from llaisys.libllaisys import DeviceType
 from llaisys.libllaisys.model import KvCacheLayout
+
+
+def _load_nvtx():
+    for name in ("libnvToolsExt.so.1", "libnvToolsExt.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            lib.nvtxRangePushA.argtypes = [ctypes.c_char_p]
+            lib.nvtxRangePushA.restype = ctypes.c_int
+            lib.nvtxRangePop.argtypes = []
+            lib.nvtxRangePop.restype = ctypes.c_int
+            return lib
+        except Exception:
+            continue
+    return None
+
+
+_NVTX = _load_nvtx()
+
+
+class _NvtxRange:
+    def __init__(self, name: str):
+        self._name = name
+
+    def __enter__(self):
+        if _NVTX is not None:
+            try:
+                _NVTX.nvtxRangePushA(self._name.encode("utf-8"))
+            except Exception:
+                pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if _NVTX is not None:
+            try:
+                _NVTX.nvtxRangePop()
+            except Exception:
+                pass
+        return False
 
 
 def _parse_device(name: str) -> DeviceType:
@@ -55,59 +94,82 @@ def _run_once(
 ) -> dict:
     layout_name = "block" if layout == KvCacheLayout.BLOCK else "slot"
     print(f"[bench] init layout={layout_name} block_size={block_size} model={model_path}")
-    llm = LLM(
-        model=model_path,
-        model_type="qwen2",
-        device=device,
-        kv_cache_layout=layout,
-        kv_cache_block_size=block_size,
-        max_num_seqs=max_num_seqs,
-        max_num_batched_tokens=max_num_batched_tokens,
-        max_model_len=max_model_len,
-        kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-        kv_cache_auto_capacity=kv_cache_auto_capacity,
-        kv_cache_memory_utilization=kv_cache_memory_utilization,
-    )
+    t_total0 = time.perf_counter()
+    t_init0 = t_total0
+    with _NvtxRange(f"{layout_name}.init"):
+        llm = LLM(
+            model=model_path,
+            model_type="qwen2",
+            device=device,
+            kv_cache_layout=layout,
+            kv_cache_block_size=block_size,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
+            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+            kv_cache_auto_capacity=kv_cache_auto_capacity,
+            kv_cache_memory_utilization=kv_cache_memory_utilization,
+        )
+    t_init1 = time.perf_counter()
     kv_stats_last: dict = {}
+    total_reqs = 0
+    t_warmup0 = t_init1
+    t_warmup1 = t_warmup0
+    run_dt_sum = 0.0
     try:
         # warmup
         print(f"[bench] warmup start layout={layout_name}")
-        _ = llm.generate([[1, 2, 3, 4]], sampling_params=SamplingParams(max_new_tokens=4, top_k=1, top_p=1.0, temperature=1.0))
+        with _NvtxRange(f"{layout_name}.warmup"):
+            _ = llm.generate(
+                [[1, 2, 3, 4]],
+                sampling_params=SamplingParams(max_new_tokens=4, top_k=1, top_p=1.0, temperature=1.0),
+            )
         kv_stats_last = llm.kv_cache_stats()
         if kv_stats_last:
             print(f"[bench] kv_stats_after_warmup layout={layout_name} stats={kv_stats_last}")
         print(f"[bench] warmup done layout={layout_name}")
+        t_warmup1 = time.perf_counter()
 
-        t0 = time.perf_counter()
-        total_reqs = 0
-        for i in range(rounds):
-            print(f"[bench] round {i + 1}/{rounds} start layout={layout_name}")
-            outs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
-            total_reqs += len(outs)
-            kv_stats_last = llm.kv_cache_stats()
-            print(
-                f"[bench] round {i + 1}/{rounds} done layout={layout_name} "
-                f"cum_reqs={total_reqs} kv_stats={kv_stats_last}"
-            )
-        t1 = time.perf_counter()
+        with _NvtxRange(f"{layout_name}.run"):
+            for i in range(rounds):
+                print(f"[bench] round {i + 1}/{rounds} start layout={layout_name}")
+                with _NvtxRange(f"{layout_name}.round_{i + 1}"):
+                    t_round0 = time.perf_counter()
+                    outs = llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+                    run_dt_sum += (time.perf_counter() - t_round0)
+                total_reqs += len(outs)
+                kv_stats_last = llm.kv_cache_stats()
+                print(
+                    f"[bench] round {i + 1}/{rounds} done layout={layout_name} "
+                    f"cum_reqs={total_reqs} kv_stats={kv_stats_last}"
+                )
     finally:
         print(f"[bench] close model layout={layout_name}")
         llm.close()
+    t_total1 = time.perf_counter()
 
-    dt = max(1e-9, t1 - t0)
+    init_dt = max(1e-9, t_init1 - t_init0)
+    warmup_dt = max(1e-9, t_warmup1 - t_warmup0)
+    run_dt = max(1e-9, run_dt_sum)
+    total_dt = max(1e-9, t_total1 - t_total0)
     total_completion = int(expected_total_tokens_per_round) * int(rounds)
     print(
         f"[bench] finish layout={layout_name} total_reqs={total_reqs} "
-        f"completion_tokens={total_completion} seconds={dt:.4f}"
+        f"completion_tokens={total_completion} "
+        f"init_seconds={init_dt:.4f} warmup_seconds={warmup_dt:.4f} "
+        f"run_seconds={run_dt:.4f} total_seconds={total_dt:.4f}"
     )
     return {
         "layout": layout_name,
         "rounds": rounds,
         "requests": total_reqs,
         "completion_tokens": total_completion,
-        "seconds": dt,
-        "tokens_per_sec": total_completion / dt,
-        "avg_req_latency_ms": (dt / max(1, total_reqs)) * 1000.0,
+        "init_seconds": init_dt,
+        "warmup_seconds": warmup_dt,
+        "run_seconds": run_dt,
+        "seconds": total_dt,
+        "tokens_per_sec": total_completion / run_dt,
+        "avg_req_latency_ms": (run_dt / max(1, total_reqs)) * 1000.0,
         "kv_cache_stats": kv_stats_last,
     }
 
@@ -236,4 +298,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

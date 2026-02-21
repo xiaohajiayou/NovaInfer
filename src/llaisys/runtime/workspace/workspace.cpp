@@ -77,7 +77,10 @@ Qwen2Workspace::Layout Qwen2Workspace::build_layout_(size_t ntoken) const {
     layout.v_ctx = off;
     off += maxseq_ * nkvh_ * dh_;
     layout.total_main = off;
-    layout.total_i64 = ntoken;
+    // i64 arena packs [input_ids, pos_ids].
+    layout.total_i64 = ntoken * 2;
+    // u8 arena is used by SLOT dense-mask materialization.
+    layout.total_u8 = ntoken * maxseq_;
     return layout;
 }
 
@@ -101,10 +104,20 @@ tensor_t Qwen2Workspace::slice_i64_(const Layout &layout,
     return t->view(shape);
 }
 
+tensor_t Qwen2Workspace::slice_u8_(const Layout &layout,
+                                   size_t start,
+                                   size_t n,
+                                   const std::vector<size_t> &shape) const {
+    ASSERT(u8_arena_ != nullptr, "workspace: u8 arena is null");
+    ASSERT(start + n <= layout.total_u8, "workspace: u8 slice out of range");
+    tensor_t t = u8_arena_->slice(0, start, start + n);
+    return t->view(shape);
+}
+
 void Qwen2Workspace::reserve(size_t ntoken) {
     CHECK_ARGUMENT(ntoken > 0, "workspace: ntoken must be > 0");
     // Grow-only: reuse current arenas when capacity already satisfies request.
-    if (token_cap_ >= ntoken && main_arena_ != nullptr && i64_arena_ != nullptr) {
+    if (token_cap_ >= ntoken && main_arena_ != nullptr && i64_arena_ != nullptr && u8_arena_ != nullptr) {
         return;
     }
 
@@ -113,6 +126,7 @@ void Qwen2Workspace::reserve(size_t ntoken) {
 
     main_arena_ = make_tensor({layout.total_main}, dtype_, device_type_, device_id_);
     i64_arena_ = make_tensor({layout.total_i64}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    u8_arena_ = make_tensor({layout.total_u8}, LLAISYS_DTYPE_U8, device_type_, device_id_);
 
     // Materialize all tensor views once after (re)allocation.
     view_.hidden = slice_main_(layout, layout.hidden, token_cap_ * hs_, {token_cap_, hs_});
@@ -132,7 +146,9 @@ void Qwen2Workspace::reserve(size_t ntoken) {
     view_.logits = slice_main_(layout, layout.logits, token_cap_ * voc_, {token_cap_, voc_});
     view_.k_ctx = slice_main_(layout, layout.k_ctx, maxseq_ * nkvh_ * dh_, {maxseq_, nkvh_, dh_});
     view_.v_ctx = slice_main_(layout, layout.v_ctx, maxseq_ * nkvh_ * dh_, {maxseq_, nkvh_, dh_});
-    view_.pos_ids = slice_i64_(layout, 0, token_cap_, {token_cap_});
+    view_.input_ids = slice_i64_(layout, 0, token_cap_, {token_cap_});
+    view_.pos_ids = slice_i64_(layout, token_cap_, token_cap_, {token_cap_});
+    view_.attn_mask_flat = slice_u8_(layout, 0, token_cap_ * maxseq_, {token_cap_ * maxseq_});
 }
 
 } // namespace llaisys::runtime::workspace

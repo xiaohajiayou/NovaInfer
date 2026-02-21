@@ -2,7 +2,6 @@
 #include "../runtime/kv_cache/paged_kv.hpp"
 #include "../runtime/kv_cache/unified_kv.hpp"
 #include "../../core/llaisys_core.hpp"
-#include <unordered_set>
 
 namespace llaisys::models::qwen2 {
 
@@ -377,8 +376,11 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
                                          const std::vector<int32_t> &slot_idxs,
                                          const std::vector<int32_t> &used_slots,
                                          tensor_t attn_mask,
-                                         const std::vector<int32_t> &attn_row_ptr,
-                                         const std::vector<int32_t> &attn_col_idx,
+                                         const std::vector<int32_t> &q_seq_rows,
+                                         const std::vector<int32_t> &q_pos,
+                                         const std::vector<int32_t> &block_tables,
+                                         const std::vector<int32_t> &seq_lens,
+                                         int32_t block_table_width,
                                          bool paged_attention) {
     ASSERT(workspace_ != nullptr, "Qwen2: workspace is null");
     const auto &ws = workspace_->view();
@@ -423,8 +425,33 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
 
         tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
         if (paged_attention) {
+#ifdef ENABLE_NVIDIA_API
+            if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+                ops::cuda::self_attention_paged_prepared(
+                    attn_out,
+                    rope_q,
+                    layer_k_cache,
+                    layer_v_cache,
+                    paged_attn_prepared_,
+                    block_table_width,
+                    static_cast<int32_t>(kv_block_size_),
+                    scale);
+            } else
+#endif
+            {
             ops::self_attention_paged(
-                attn_out, rope_q, layer_k_cache, layer_v_cache, used_slots, attn_row_ptr, attn_col_idx, scale);
+                attn_out,
+                rope_q,
+                layer_k_cache,
+                layer_v_cache,
+                q_seq_rows,
+                q_pos,
+                block_tables,
+                seq_lens,
+                block_table_width,
+                static_cast<int32_t>(kv_block_size_),
+                scale);
+            }
         } else {
             tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
             tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
@@ -458,18 +485,32 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
     tensor_t logits = slice_tokens_(ws.logits, ntoken);
     ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
 
+    std::vector<int32_t> collected_rows;
+    collected_rows.reserve(ntoken);
     for (size_t i = 0; i < ntoken; ++i) {
         const bool collect = (batch.logits == nullptr) ? (i + 1 == ntoken) : (batch.logits[i] != 0);
         if (collect) {
-            const size_t row_bytes = meta_.voc * utils::dsize(meta_.dtype);
-            const std::byte *row = ws.logits->data() + i * row_bytes;
-            if (device_type_ == LLAISYS_DEVICE_CPU) {
-                output_->append_row(row, meta_.dtype, static_cast<int32_t>(i));
-            } else {
-                std::vector<std::byte> host_row(row_bytes);
-                runtime_copy_bytes(LLAISYS_DEVICE_CPU, host_row.data(), device_type_, row, row_bytes);
-                output_->append_row(host_row.data(), meta_.dtype, static_cast<int32_t>(i));
-            }
+            collected_rows.push_back(static_cast<int32_t>(i));
+        }
+    }
+    if (collected_rows.empty()) {
+        return;
+    }
+
+    const size_t row_bytes = meta_.voc * utils::dsize(meta_.dtype);
+    if (device_type_ == LLAISYS_DEVICE_CPU) {
+        for (int32_t row_id : collected_rows) {
+            const std::byte *row = ws.logits->data() + static_cast<size_t>(row_id) * row_bytes;
+            output_->append_row(row, meta_.dtype, row_id);
+        }
+    } else {
+        // GPU path: collapse many tiny D2H row copies into one batched D2H copy.
+        const size_t all_rows_bytes = ntoken * row_bytes;
+        std::vector<std::byte> host_logits(all_rows_bytes);
+        runtime_copy_bytes(LLAISYS_DEVICE_CPU, host_logits.data(), device_type_, ws.logits->data(), all_rows_bytes);
+        for (int32_t row_id : collected_rows) {
+            const std::byte *row = host_logits.data() + static_cast<size_t>(row_id) * row_bytes;
+            output_->append_row(row, meta_.dtype, row_id);
         }
     }
 }
@@ -512,8 +553,8 @@ int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
     const size_t kvlen = used_slots.size();
     CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
 
-    // Dense mask over global used slots; correctness-first fallback path.
-    tensor_t attn_mask = Tensor::create({ntoken, kvlen}, LLAISYS_DTYPE_U8, device_type_, device_id_);
+    // Dense mask over global used slots; materialized from workspace scratch buffer.
+    const auto &ws = workspace_->view();
     // Build mask on host first; attn_mask may live on GPU in NVIDIA mode.
     std::vector<uint8_t> host_mask(ntoken * kvlen, static_cast<uint8_t>(0));
     for (size_t i = 0; i < ntoken; ++i) {
@@ -525,9 +566,11 @@ int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
         }
         CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
     }
-    attn_mask->load(host_mask.data());
+    tensor_t attn_mask_flat = ws.attn_mask_flat->slice(0, 0, ntoken * kvlen);
+    attn_mask_flat->load(host_mask.data());
+    tensor_t attn_mask = attn_mask_flat->view({ntoken, kvlen});
 
-    run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, attn_mask, {}, {}, false);
+    run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, attn_mask, {}, {}, {}, {}, 0, false);
     return 0;
     } catch (const std::invalid_argument &) {
         if (kv_applied) {
@@ -557,97 +600,43 @@ int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
         slot_idxs.push_back(batch.slot_mapping[i]);
     }
 
-    std::vector<int32_t> used_slots;
-    std::vector<int32_t> attn_row_ptr;
-    std::vector<int32_t> attn_col_idx;
     // Step 1) Build seq_id -> row index map for block_tables/context_lens lookup.
     const int32_t n_batch_seq = batch.n_batch_seq;
     const int32_t width = batch.block_table_width;
+    std::vector<int32_t> seq_lens(static_cast<size_t>(n_batch_seq), 0);
+    std::vector<int32_t> block_tables(static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width), -1);
     std::unordered_map<int64_t, int32_t> seq_row;
     seq_row.reserve(static_cast<size_t>(n_batch_seq) * 2);
     for (int32_t r = 0; r < n_batch_seq; ++r) {
         seq_row[batch.batch_seq_ids[r]] = r;
+        seq_lens[static_cast<size_t>(r)] = batch.context_lens[r];
+        for (int32_t c = 0; c < width; ++c) {
+            block_tables[static_cast<size_t>(r) * static_cast<size_t>(width) + static_cast<size_t>(c)] =
+                batch.block_tables[r * width + c];
+        }
     }
 
-    // Step 2) Enumerate visible physical slots for each token.
-    // token_slots[i]: raw visible slots of token i.
-    // global_slots: union of all token-visible slots, used as CSR column domain.
-    std::vector<std::unordered_set<int32_t>> token_slots(ntoken);
-    std::unordered_set<int32_t> global_slots;
-    const int64_t block_size = static_cast<int64_t>(kv_block_size_);
+    // Step 2) Build token-level row/position vectors for paged attention.
+    std::vector<int32_t> q_seq_rows(ntoken, -1);
+    std::vector<int32_t> q_pos(ntoken, -1);
     for (size_t i = 0; i < ntoken; ++i) {
-        auto &tok = token_slots[i];
         const int64_t sid = seq_ids_flat[i];
-        // Token belongs to one seq in BLOCK mainline; map it to row.
         auto it = seq_row.find(sid);
-        if (it == seq_row.end()) {
-            continue;
-        }
+        CHECK_ARGUMENT(it != seq_row.end(), "Qwen2: seq id missing in block metadata");
         const int32_t row = it->second;
-        // context_lens[row] caps the visible prefix length of this sequence.
-        const int64_t clen = batch.context_lens[row];
-        if (clen <= 0) {
-            continue;
-        }
-        // Visible positions are [0, min(qpos, clen-1)].
-        const int64_t vmax = std::min<int64_t>(pos_values[i], clen - 1);
-        if (vmax < 0) {
-            continue;
-        }
-        // Convert visible logical position range to block range [0, max_bidx].
-        const int64_t max_bidx = vmax / block_size;
-        for (int64_t bidx = 0; bidx <= max_bidx; ++bidx) {
-            if (bidx >= width) {
-                break;
-            }
-            // block_tables[row, bidx] gives physical block id; -1 means padding.
-            const int32_t bid = batch.block_tables[row * width + static_cast<int32_t>(bidx)];
-            if (bid < 0) {
-                continue;
-            }
-            // For last visible block, only include offsets up to vmax%block_size.
-            const int64_t off_max = (bidx == max_bidx) ? (vmax % block_size) : (block_size - 1);
-            for (int64_t off = 0; off <= off_max; ++off) {
-                const int32_t slot = static_cast<int32_t>(static_cast<int64_t>(bid) * block_size + off);
-                tok.insert(slot);
-                global_slots.insert(slot);
-            }
-        }
-        CHECK_ARGUMENT(!tok.empty(), "Qwen2: empty attention context for token");
-    }
-    // Step 3) Materialize global slot domain as sorted used_slots.
-    used_slots.assign(global_slots.begin(), global_slots.end());
-    std::sort(used_slots.begin(), used_slots.end());
-    CHECK_ARGUMENT(!used_slots.empty(), "Qwen2: empty used_slots for block attention");
-
-    // Step 4) Build slot->column mapping in CSR domain.
-    std::unordered_map<int32_t, int32_t> slot_to_col;
-    slot_to_col.reserve(used_slots.size() * 2);
-    for (size_t c = 0; c < used_slots.size(); ++c) {
-        slot_to_col[used_slots[c]] = static_cast<int32_t>(c);
+        q_seq_rows[i] = row;
+        q_pos[i] = static_cast<int32_t>(pos_values[i]);
     }
 
-    // Step 5) Build CSR row_ptr/col_idx:
-    // - one row per token
-    // - columns are indices into used_slots.
-    attn_row_ptr.assign(ntoken + 1, 0);
-    for (size_t i = 0; i < ntoken; ++i) {
-        std::vector<int32_t> cols;
-        cols.reserve(token_slots[i].size());
-        for (int32_t s : token_slots[i]) {
-            auto it = slot_to_col.find(s);
-            if (it != slot_to_col.end()) {
-                cols.push_back(it->second);
-            }
-        }
-        std::sort(cols.begin(), cols.end());
-        cols.erase(std::unique(cols.begin(), cols.end()), cols.end());
-        CHECK_ARGUMENT(!cols.empty(), "Qwen2: empty CSR row for token");
-        attn_col_idx.insert(attn_col_idx.end(), cols.begin(), cols.end());
-        attn_row_ptr[i + 1] = static_cast<int32_t>(attn_col_idx.size());
+#ifdef ENABLE_NVIDIA_API
+    if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+        // vLLM-style: prepare/upload attention metadata once per decode step.
+        ops::cuda::prepare_paged_attention(paged_attn_prepared_, q_seq_rows, q_pos, block_tables, seq_lens);
     }
+#endif
 
-    run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, {}, attn_row_ptr, attn_col_idx, true);
+    run_layers_and_collect_(
+        batch, ntoken, hidden, pos_ids, slot_idxs, {}, {}, q_seq_rows, q_pos, block_tables, seq_lens, width, true);
     return 0;
 }
 
@@ -740,8 +729,8 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
         }
     }
 
-    // Build input token tensor [ntoken] and load ids.
-    tensor_t input_ids = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    // Reuse workspace i64 buffer for input token ids [ntoken].
+    tensor_t input_ids = slice_tokens_(ws.input_ids, ntoken);
     input_ids->load(tokens.data());
 
     // Project token ids to hidden states with embedding table.

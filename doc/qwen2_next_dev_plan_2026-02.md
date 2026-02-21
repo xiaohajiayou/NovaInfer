@@ -35,8 +35,53 @@
 | 2026-02-19 | DeepSeek-R1-Distill-Qwen-1.5B | cpu | block | 8 | 3 | 256 | 256 | 2048 | 8192 | 8 | 4050 | 801.0294 | 5.0560 | 33376.23 | 16 | 9 | 2656 |
 | 2026-02-19 | DeepSeek-R1-Distill-Qwen-1.5B | cpu | slot | 8 | 3 | 256 | 256 | 2048 | 8192 | 8 | 4050 | 1708.4516 | 2.3706 | 71185.48 | 0 | 0 | 0 |
 | 2026-02-19 | DeepSeek-R1-Distill-Qwen-1.5B | cpu | block | 8 | 3 | 256 | 256 | 2048 | 8192 | 8 | 4050 | 895.6154 | 4.5220 | 37317.31 | 16 | 9 | 2656 |
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | block | 8 | 3 | 256 | 256 | 2048 | 16384 | 8 | 3453 | 35.7193 | 96.6704 | 1488.31 | 16 | 9 | 1696 |
 
-说明：同参数存在抖动，后续统一以多轮统计结论为准。
+说明：
+1. 同参数存在抖动，后续统一以多轮统计结论为准。
+2. 当前脚本口径中，表内 `seconds` 按 `run_seconds` 记录（不包含 init/warmup/close）。
+
+### 3.1 NovaInfer vs vLLM 对比基线（`scripts/bench_compare_vllm.py`）
+
+固定配置（本次）：
+1. `CUDA_VISIBLE_DEVICES=2`
+2. `num_seqs=256`
+3. `input_len=[100,1024]`
+4. `output_len=[100,1024]`
+5. `max_model_len=4096`
+6. `max_num_seqs=256`
+7. `max_num_batched_tokens=16384`
+8. `kv_cache_capacity_mode=auto`
+9. `seed=0`
+
+结果记录（持续追加）：
+
+| Date | Model | Device | Backend | num_seqs | max_model_len | expected_total_tokens | init_seconds | warmup_seconds | run_seconds | total_seconds | tokens_per_sec(run) | Status | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | novainfer | 256 | 4096 | 140084 | 6.6772 | 2.8732 | 664.8953 | 674.4868 | 210.6858 | PASS | `auto_max_num_seqs=256`，KV auto capacity 生效 |
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | vllm | 256 | 4096 | 140084 | N/A | N/A | N/A | N/A | N/A | FAIL | 首次失败：`AttributeError: 'list' object has no attribute 'get'`（vLLM 输入需 `{"prompt_token_ids":[...]}`） |
+
+修复与口径说明：
+1. `scripts/bench_compare_vllm.py` 已修复 vLLM tokenized prompt 输入格式（`prompt_token_ids`）。
+2. `--backend both` 已改为子进程隔离执行 `novainfer/vllm`，避免同进程 CUDA 初始化冲突。
+3. NovaInfer 吞吐按 `run_seconds` 统计，不包含 `init/warmup/close`。
+
+### 3.2 本轮实现与修复清单（2026-02-21）
+
+功能实现：
+1. `scripts/bench_compare_vllm.py` 新增 NovaInfer/vLLM 对比基准主脚本（nano-vllm 风格口径）。
+2. NovaInfer bench 输出已补齐 `init/warmup/run/finish` 分段计时与 KV 统计打印，便于在线排障。
+3. `backend=both` 支持串行子进程执行并汇总结果，避免多后端同进程 CUDA 状态污染。
+
+性能与稳定性优化：
+1. CUDA paged attention 元数据支持按 decode-step 复用，减少层内重复上传。
+2. CUDA benchmark 计时口径统一：吞吐按 `run_seconds`（纯推理阶段）计算。
+3. KV auto capacity 在 NVIDIA 下加入保守预算与日志字段，便于 OOM 与容量诊断。
+
+关键 bug 修复：
+1. 修复 NVIDIA auto capacity 估算未使用 `max_num_seqs` 的问题（已透传并参与估算）。
+2. 修复 vLLM 路径 tokenized 输入格式不兼容（`list[list[int]]` -> `prompt_token_ids`）。
+3. 修复 `linear_cuda` add-bias 大批量下 grid 配置越界问题（索引/网格改为 `size_t` 口径）。
 
 ## 4. 未完成清单（面向下一阶段）
 
@@ -153,3 +198,120 @@
 1. TP=2 最小端到端推理通过。
 2. TP=1/TP=2 输出一致性在阈值内。
 3. 文档补齐通信点与后续优化计划。
+
+## 7. CUDA 性能瓶颈分析与优化记录（2026-02-21）
+
+### 7.1 分析目标与背景
+
+1. 目标：解释“GPU 已跑通但吞吐偏低/波动大”的原因，给出可执行优化路径。
+2. 现象：
+   - 小 workload 下可见较高瞬时吞吐（如 >60 tok/s，极小样本可到 90 tok/s+）。
+   - 长 workload/混合场景下，端到端吞吐被 init/warmup 与 host-side 开销拉低。
+
+### 7.2 Profiling 方法（当前固定口径）
+
+1. 基准命令（短集，便于快速定位）：
+   - `python scripts/bench_kv_layout.py --device nvidia --layout block --num-prompts 2 --rounds 1 --max-input-len 64 --max-output-len 32 --max-model-len 1024 --max-num-seqs 4 --max-num-batched-tokens 512 ...`
+2. Nsight Systems（推荐）：
+   - `nsys profile --trace=cuda,nvtx,osrt --sample=none ...`
+   - `nsys stats --force-export=true --report cuda_api_gpu_sum,cuda_gpu_kern_sum,cuda_api_sum <rep>`
+3. NVTX 分段：
+   - `block.init`
+   - `block.warmup`
+   - `block.run`
+   - `block.round_1`
+
+### 7.3 关键证据（已记录）
+
+1. `nsys_after_stepmeta`（优化后、短集）：
+   - `cudaMemcpy` 约 `549.8 ms`（API）
+   - `H2D memcpy` 约 `350.2 ms`
+   - `cudaMalloc` 约 `157.0 ms`
+   - `cudaFree` 约 `19.8 ms`
+   - `paged_attention_warp_kernel` 约 `120.9 ms`
+2. `nsys_memcpy_fast_v2`（同口径复测）：
+   - `cudaMemcpy` 约 `474.5 ms`（仍是 API 第一大项）
+   - `cudaMalloc` 约 `169.1 ms`
+   - `cudaFree` 约 `135.4 ms`
+   - `paged_attention_warp_kernel` 约 `115.4 ms`
+3. NVTX 汇总（同批次）：
+   - `block.init` 约 `4.29 s`
+   - `block.warmup` 约 `2.08 s`
+   - `block.run` 约 `236 ms`
+4. 结论：
+   - 当前“慢”的主因不是单一 kernel 算力不足，而是大量 API/内存管理开销叠加（`cudaMemcpy/cudaMalloc/cudaFree`）。
+   - 端到端观察到的长耗时，常被 `init/warmup` 放大；纯 run 阶段明显更快。
+
+### 7.4 已完成优化（本轮）
+
+1. Paged attention 元数据由“层内重复上传”改为“decode-step 级准备/复用”。
+2. benchmark 计时口径收敛：
+   - 吞吐统一按 `run_seconds` 计算；
+   - `init/warmup/close` 独立统计，避免混入推理吞吐。
+3. `bench_compare_vllm.py`：
+   - `both` 改为子进程隔离，避免多后端同进程 CUDA 初始化问题。
+   - NovaInfer 增加 `init/warmup/run/finish + kv_stats` 打印，便于调试。
+
+### 7.5 主要瓶颈归因（当前判断）
+
+1. 高频 `cudaMemcpy`：
+   - token/position/logits 路径与注意力元数据路径存在频繁 H2D/D2H 传输。
+   - 小块、频繁调用导致 API 时间占比过高。
+2. 高频 `cudaMalloc/cudaFree`：
+   - decode 热路径仍有临时 buffer/tensor 分配释放。
+   - allocator 抖动直接拖慢短步前向。
+3. paged attention kernel 本身已是热点，但不是唯一主瓶颈：
+   - kernel 时间占比高于其他算子，但 API/内存管理总开销同样显著。
+
+### 7.6 优化策略与落地顺序（执行版）
+
+P0（优先级最高，先做）：
+1. 热路径去动态分配：
+   - 将 decode 中临时 tensor/metadata 全量搬入 workspace 复用。
+   - 目标：显著降低 `cudaMalloc/cudaFree` 次数。
+2. 降低小块 memcpy 次数：
+   - 按 step 打包上传 metadata，避免 layer 内重复上传。
+   - 输出/logits 路径改为按需回传，减少 D2H 细粒度拷贝。
+
+P1（完成 P0 后）：
+1. paged attention 内核继续对齐高性能实现（访存模式、并行映射、共享内存策略）。
+2. 进一步减少 launch 开销（融合轻量 kernel / 批量化调用）。
+
+P2（稳定后）：
+1. 固化 A/B 基准矩阵（同配置多轮，记录 median/p95）。
+2. 与 vLLM 做同口径端到端对比，分离 init/run 指标。
+
+### 7.7 验收指标（本阶段）
+
+1. `cudaMalloc + cudaFree` 总时间占比下降到可接受区间（相对当前显著下降）。
+2. `cudaMemcpy` API 占比明显下降，H2D 小包次数下降。
+3. `block.run` 吞吐稳定提升（同 seed/同 workload）。
+4. 文档与基线表持续追加：每次优化都必须补 profile 截图/统计摘要与结论。
+
+### 7.8 任务看板（已验证 / 待验证）
+
+已验证：
+1. 已定位并复现主瓶颈：`cudaMemcpy/cudaMalloc/cudaFree` 在短集 profile 中占比显著。
+2. 已确认 `run` 与 `init/warmup` 需分离统计，吞吐必须按 `run_seconds` 计算。
+3. 已完成 paged attention 元数据 step 级复用改造（减少层内重复上传）。
+4. 已完成 `bench_compare_vllm.py` 调试增强：
+   - NovaInfer 输出 `init/warmup/run/finish + kv_stats`；
+   - `backend=both` 子进程隔离，避免 CUDA 初始化冲突。
+5. 已修复 vLLM tokenized 输入格式（`prompt_token_ids`），可继续对比跑数。
+
+待验证（下一轮执行）：
+1. Workspace 全覆盖：
+   - decode 热路径临时 tensor/metadata 全量搬入 workspace 复用；
+   - 验证 `cudaMalloc/cudaFree` 次数与总时间下降。
+2. memcpy 收敛：
+   - 梳理 token/pos/logits/attention metadata 拷贝路径；
+   - 合并小包 H2D，减少细粒度 `cudaMemcpy` 调用。
+3. paged attention 内核收敛：
+   - 在当前 warp kernel 基础上继续访存/并行映射优化；
+   - 目标是提升 run 阶段 tokens/s，并压低 kernel 时间方差。
+4. 对比基准闭环：
+   - 跑通 NovaInfer/vLLM 同配置 full run；
+   - 产出同表对比（tokens/s、run_seconds、init/warmup）。
+5. 稳定性验证：
+   - 同配置至少 3 轮，记录 median/p95；
+   - 若波动超阈值，补充资源竞争与上下文污染排查结论。

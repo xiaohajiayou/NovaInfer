@@ -303,6 +303,7 @@ class Qwen2:
         kv_cache_capacity_tokens: Optional[int] = None,
         kv_cache_auto_capacity: bool = False,
         kv_cache_memory_utilization: float = 0.9,
+        max_num_seqs: Optional[int] = None,
     ):
         self._model_path = Path(model_path)
         self._device = device
@@ -336,7 +337,11 @@ class Qwen2:
             )
         elif kv_cache_auto_capacity:
             if device == DeviceType.NVIDIA:
-                auto_max_num_seqs = max(1, int(os.getenv("LLAISYS_KV_AUTO_MAX_SEQS", "8")))
+                auto_max_num_seqs = (
+                    max(1, int(max_num_seqs))
+                    if max_num_seqs is not None
+                    else max(1, int(os.getenv("LLAISYS_KV_AUTO_MAX_SEQS", "8")))
+                )
                 capacity_tokens, probe = _estimate_cuda_kv_capacity_tokens(
                     available_bytes=int(self._available_memory_bytes),
                     token_bytes=token_bytes,

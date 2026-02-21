@@ -6,6 +6,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cfloat>
 #include <cstdint>
 #include <vector>
 
@@ -20,49 +21,30 @@ namespace llaisys::ops::cuda {
 
 namespace {
 
-struct CachedDeviceI32Buffer {
-    int32_t *ptr{nullptr};
-    size_t cap{0};
-    CachedDeviceI32Buffer() = default;
-
-    ~CachedDeviceI32Buffer() {
-        if (ptr != nullptr) {
-            cudaFree(ptr);
-        }
+void release_device_i32(int32_t *&ptr) {
+    if (ptr != nullptr) {
+        LLAISYS_CUDA_CHECK(cudaFree(ptr));
+        ptr = nullptr;
     }
+}
 
-    void ensure_capacity(size_t n) {
-        if (n <= cap) {
-            return;
-        }
-        if (ptr != nullptr) {
-            LLAISYS_CUDA_CHECK(cudaFree(ptr));
-            ptr = nullptr;
-            cap = 0;
-        }
-        LLAISYS_CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(int32_t)));
-        cap = n;
+void ensure_device_i32_capacity(int32_t *&ptr, size_t &cap, size_t n) {
+    if (n <= cap) {
+        return;
     }
+    release_device_i32(ptr);
+    LLAISYS_CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(int32_t)));
+    cap = n;
+}
 
-    void upload(const std::vector<int32_t> &host) {
-        const size_t n = host.size();
-        if (n == 0) {
-            return;
-        }
-        ensure_capacity(n);
-        LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+void upload_device_i32(int32_t *&ptr, size_t &cap, const std::vector<int32_t> &host) {
+    const size_t n = host.size();
+    if (n == 0) {
+        return;
     }
-
-    CachedDeviceI32Buffer(const CachedDeviceI32Buffer &) = delete;
-    CachedDeviceI32Buffer &operator=(const CachedDeviceI32Buffer &) = delete;
-};
-
-struct PagedAttentionMetaCache {
-    CachedDeviceI32Buffer used_slots;
-    CachedDeviceI32Buffer row_ptr;
-    CachedDeviceI32Buffer col_idx;
-    PagedAttentionMetaCache() = default;
-};
+    ensure_device_i32_capacity(ptr, cap, n);
+    LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+}
 
 template <typename T>
 __global__ void self_attention_kernel(T *out,
@@ -179,21 +161,36 @@ void launch_self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename T>
-__global__ void paged_attention_kernel(T *out,
-                                       const T *q,
-                                       const T *k_cache,
-                                       const T *v_cache,
-                                       const int32_t *used_slots,
-                                       const int32_t *row_ptr,
-                                       const int32_t *col_idx,
-                                       std::int32_t seqlen,
-                                       std::int32_t nslot,
-                                       std::int32_t nhead,
-                                       std::int32_t nkvhead,
-                                       std::int32_t head_dim,
-                                       float scale) {
-    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+__device__ __forceinline__ float warp_sum(float x) {
+#pragma unroll
+    for (int mask = 16; mask >= 1; mask >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, mask);
+    }
+    return x;
+}
+
+template <typename T, int WARPS_PER_BLOCK>
+__global__ void paged_attention_warp_kernel(T *out,
+                                            const T *q,
+                                            const T *k_cache,
+                                            const T *v_cache,
+                                            const int32_t *q_seq_rows,
+                                            const int32_t *q_pos,
+                                            const int32_t *block_tables,
+                                            const int32_t *seq_lens,
+                                            std::int32_t seqlen,
+                                            std::int32_t nslot,
+                                            std::int32_t nseq,
+                                            std::int32_t block_table_width,
+                                            std::int32_t block_size,
+                                            std::int32_t nhead,
+                                            std::int32_t nkvhead,
+                                            std::int32_t head_dim,
+                                            float scale) {
+    constexpr int WARP = 32;
+    const int warp_id = static_cast<int>(threadIdx.x) / WARP;
+    const int lane = static_cast<int>(threadIdx.x) % WARP;
+    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * WARPS_PER_BLOCK + warp_id);
     const std::int32_t total = seqlen * nhead;
     if (idx >= total) {
         return;
@@ -207,70 +204,90 @@ __global__ void paged_attention_kernel(T *out,
                                * static_cast<std::size_t>(head_dim);
     const T *q_ptr = q + q_base;
 
-    const int32_t rb = row_ptr[t];
-    const int32_t re = row_ptr[t + 1];
-    if (rb >= re) {
+    const int32_t row = q_seq_rows[t];
+    if (row < 0 || row >= nseq) {
+        return;
+    }
+    const int32_t qpos = q_pos[t];
+    const int32_t seq_len = seq_lens[row];
+    const int32_t vmax = min(qpos, seq_len - 1);
+    if (vmax < 0) {
         return;
     }
 
-    float maxv = -1.0e30f;
-    for (int32_t p = rb; p < re; ++p) {
-        const int32_t col = col_idx[p];
-        if (col < 0) {
+    float maxv = -FLT_MAX;
+    for (int32_t p = 0; p <= vmax; ++p) {
+        const int32_t bidx = p / block_size;
+        const int32_t boff = p % block_size;
+        if (bidx < 0 || bidx >= block_table_width) {
             continue;
         }
-        const int32_t slot = used_slots[col];
+        const int32_t bid = block_tables[row * block_table_width + bidx];
+        if (bid < 0) {
+            continue;
+        }
+        const int32_t slot = bid * block_size + boff;
         if (slot < 0 || slot >= nslot) {
             continue;
         }
         const std::size_t k_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead) + static_cast<std::size_t>(kvh))
                                    * static_cast<std::size_t>(head_dim);
         const T *k_ptr = k_cache + k_base;
-        float dot = 0.0f;
-        for (std::int32_t j = 0; j < head_dim; ++j) {
-            dot += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
-                   llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+        float dot_local = 0.0f;
+        for (std::int32_t j = lane; j < head_dim; j += WARP) {
+            dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                         llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
         }
-        dot *= scale;
+        float dot = warp_sum(dot_local) * scale;
         if (dot > maxv) {
             maxv = dot;
         }
     }
 
     float sum = 0.0f;
-    for (int32_t p = rb; p < re; ++p) {
-        const int32_t col = col_idx[p];
-        if (col < 0) {
+    for (int32_t p = 0; p <= vmax; ++p) {
+        const int32_t bidx = p / block_size;
+        const int32_t boff = p % block_size;
+        if (bidx < 0 || bidx >= block_table_width) {
             continue;
         }
-        const int32_t slot = used_slots[col];
+        const int32_t bid = block_tables[row * block_table_width + bidx];
+        if (bid < 0) {
+            continue;
+        }
+        const int32_t slot = bid * block_size + boff;
         if (slot < 0 || slot >= nslot) {
             continue;
         }
         const std::size_t k_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead) + static_cast<std::size_t>(kvh))
                                    * static_cast<std::size_t>(head_dim);
         const T *k_ptr = k_cache + k_base;
-        float dot = 0.0f;
-        for (std::int32_t j = 0; j < head_dim; ++j) {
-            dot += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
-                   llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+        float dot_local = 0.0f;
+        for (std::int32_t j = lane; j < head_dim; j += WARP) {
+            dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                         llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
         }
-        dot *= scale;
+        const float dot = warp_sum(dot_local) * scale;
         sum += expf(dot - maxv);
-    }
-    if (sum <= 0.0f) {
-        sum = 1.0f;
     }
 
     T *out_ptr = out + q_base;
-    for (std::int32_t d = 0; d < head_dim; ++d) {
+    if (sum <= 0.0f) {
+        sum = 1.0f;
+    }
+    for (std::int32_t d = lane; d < head_dim; d += WARP) {
         float acc = 0.0f;
-        for (int32_t p = rb; p < re; ++p) {
-            const int32_t col = col_idx[p];
-            if (col < 0) {
+        for (int32_t p = 0; p <= vmax; ++p) {
+            const int32_t bidx = p / block_size;
+            const int32_t boff = p % block_size;
+            if (bidx < 0 || bidx >= block_table_width) {
                 continue;
             }
-            const int32_t slot = used_slots[col];
+            const int32_t bid = block_tables[row * block_table_width + bidx];
+            if (bid < 0) {
+                continue;
+            }
+            const int32_t slot = bid * block_size + boff;
             if (slot < 0 || slot >= nslot) {
                 continue;
             }
@@ -282,12 +299,12 @@ __global__ void paged_attention_kernel(T *out,
                                        * static_cast<std::size_t>(head_dim);
             const T *k_ptr = k_cache + k_base;
             const T *v_ptr = v_cache + v_base;
-            float dot = 0.0f;
-            for (std::int32_t j = 0; j < head_dim; ++j) {
-                dot += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
-                       llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+            float dot_local = 0.0f;
+            for (std::int32_t j = lane; j < head_dim; j += WARP) {
+                dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                             llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
             }
-            dot *= scale;
+            const float dot = warp_sum(dot_local) * scale;
             const float w = expf(dot - maxv) / sum;
             acc += w * llaisys::device::nvidia::dtype::to_float<T>(v_ptr[d]);
         }
@@ -296,39 +313,39 @@ __global__ void paged_attention_kernel(T *out,
 }
 
 template <typename T>
-void launch_paged_attention(tensor_t attn_val,
-                            tensor_t q,
-                            tensor_t k_cache,
-                            tensor_t v_cache,
-                            const std::vector<int32_t> &used_slots,
-                            const std::vector<int32_t> &row_ptr,
-                            const std::vector<int32_t> &col_idx,
-                            float scale,
-                            std::int32_t seqlen,
-                            std::int32_t nslot,
-                            std::int32_t nhead,
-                            std::int32_t nkvhead,
-                            std::int32_t head_dim) {
-    // Reuse device-side metadata buffers across decode steps to avoid
-    // repeated cudaMalloc/cudaFree in paged attention hot path.
-    static thread_local PagedAttentionMetaCache cache;
-    cache.used_slots.upload(used_slots);
-    cache.row_ptr.upload(row_ptr);
-    cache.col_idx.upload(col_idx);
-    constexpr int kBlock = 128;
+void launch_paged_attention_prepared(tensor_t attn_val,
+                                     tensor_t q,
+                                     tensor_t k_cache,
+                                     tensor_t v_cache,
+                                     const PagedAttentionPrepared &prepared,
+                                     std::int32_t block_table_width,
+                                     std::int32_t block_size,
+                                     float scale,
+                                     std::int32_t seqlen,
+                                     std::int32_t nslot,
+                                     std::int32_t nseq,
+                                     std::int32_t nhead,
+                                     std::int32_t nkvhead,
+                                     std::int32_t head_dim) {
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kBlock = kWarpsPerBlock * 32;
     const int total = seqlen * nhead;
-    const int grid = (total + kBlock - 1) / kBlock;
+    const int grid = (total + kWarpsPerBlock - 1) / kWarpsPerBlock;
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    paged_attention_kernel<T><<<grid, kBlock, 0, stream>>>(
+    paged_attention_warp_kernel<T, kWarpsPerBlock><<<grid, kBlock, 0, stream>>>(
         reinterpret_cast<T *>(attn_val->data()),
         reinterpret_cast<const T *>(q->data()),
         reinterpret_cast<const T *>(k_cache->data()),
         reinterpret_cast<const T *>(v_cache->data()),
-        cache.used_slots.ptr,
-        cache.row_ptr.ptr,
-        cache.col_idx.ptr,
+        prepared.q_seq_rows,
+        prepared.q_pos,
+        prepared.block_tables,
+        prepared.seq_lens,
         seqlen,
         nslot,
+        nseq,
+        block_table_width,
+        block_size,
         nhead,
         nkvhead,
         head_dim,
@@ -337,6 +354,30 @@ void launch_paged_attention(tensor_t attn_val,
 }
 
 } // namespace
+
+PagedAttentionPrepared::~PagedAttentionPrepared() {
+    release_device_i32(q_seq_rows);
+    release_device_i32(q_pos);
+    release_device_i32(block_tables);
+    release_device_i32(seq_lens);
+    q_seq_rows_cap = 0;
+    q_pos_cap = 0;
+    block_tables_cap = 0;
+    seq_lens_cap = 0;
+    nseq = 0;
+}
+
+void prepare_paged_attention(PagedAttentionPrepared &prepared,
+                             const std::vector<int32_t> &q_seq_rows,
+                             const std::vector<int32_t> &q_pos,
+                             const std::vector<int32_t> &block_tables,
+                             const std::vector<int32_t> &seq_lens) {
+    upload_device_i32(prepared.q_seq_rows, prepared.q_seq_rows_cap, q_seq_rows);
+    upload_device_i32(prepared.q_pos, prepared.q_pos_cap, q_pos);
+    upload_device_i32(prepared.block_tables, prepared.block_tables_cap, block_tables);
+    upload_device_i32(prepared.seq_lens, prepared.seq_lens_cap, seq_lens);
+    prepared.nseq = static_cast<int32_t>(seq_lens.size());
+}
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
@@ -363,13 +404,58 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
     }
 }
 
+void self_attention_paged_prepared(tensor_t attn_val,
+                                   tensor_t q,
+                                   tensor_t k_cache,
+                                   tensor_t v_cache,
+                                   const PagedAttentionPrepared &prepared,
+                                   int32_t block_table_width,
+                                   int32_t block_size,
+                                   float scale) {
+    const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
+    const std::int32_t nhead = static_cast<std::int32_t>(q->shape()[1]);
+    const std::int32_t head_dim = static_cast<std::int32_t>(q->shape()[2]);
+    const std::int32_t nslot = static_cast<std::int32_t>(k_cache->shape()[0]);
+    const std::int32_t nkvhead = static_cast<std::int32_t>(k_cache->shape()[1]);
+    if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0 || prepared.nseq <= 0) {
+        return;
+    }
+    if (prepared.q_seq_rows == nullptr || prepared.q_pos == nullptr || prepared.block_tables == nullptr ||
+        prepared.seq_lens == nullptr) {
+        return;
+    }
+
+    switch (q->dtype()) {
+    case LLAISYS_DTYPE_F32:
+        launch_paged_attention_prepared<float>(
+            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+            nhead, nkvhead, head_dim);
+        return;
+    case LLAISYS_DTYPE_F16:
+        launch_paged_attention_prepared<llaisys::fp16_t>(
+            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+            nhead, nkvhead, head_dim);
+        return;
+    case LLAISYS_DTYPE_BF16:
+        launch_paged_attention_prepared<llaisys::bf16_t>(
+            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+            nhead, nkvhead, head_dim);
+        return;
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(q->dtype());
+    }
+}
+
 void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
                           tensor_t v_cache,
-                          const std::vector<int32_t> &used_slots,
-                          const std::vector<int32_t> &row_ptr,
-                          const std::vector<int32_t> &col_idx,
+                          const std::vector<int32_t> &q_seq_rows,
+                          const std::vector<int32_t> &q_pos,
+                          const std::vector<int32_t> &block_tables,
+                          const std::vector<int32_t> &seq_lens,
+                          int32_t block_table_width,
+                          int32_t block_size,
                           float scale) {
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
     const std::int32_t nhead = static_cast<std::int32_t>(q->shape()[1]);
@@ -379,26 +465,14 @@ void self_attention_paged(tensor_t attn_val,
     if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
         return;
     }
-    if (used_slots.empty() || row_ptr.empty()) {
+    if (q_seq_rows.empty() || q_pos.empty() || block_tables.empty() || seq_lens.empty()) {
         return;
     }
 
-    switch (q->dtype()) {
-    case LLAISYS_DTYPE_F32:
-        launch_paged_attention<float>(
-            attn_val, q, k_cache, v_cache, used_slots, row_ptr, col_idx, scale, seqlen, nslot, nhead, nkvhead, head_dim);
-        return;
-    case LLAISYS_DTYPE_F16:
-        launch_paged_attention<llaisys::fp16_t>(
-            attn_val, q, k_cache, v_cache, used_slots, row_ptr, col_idx, scale, seqlen, nslot, nhead, nkvhead, head_dim);
-        return;
-    case LLAISYS_DTYPE_BF16:
-        launch_paged_attention<llaisys::bf16_t>(
-            attn_val, q, k_cache, v_cache, used_slots, row_ptr, col_idx, scale, seqlen, nslot, nhead, nkvhead, head_dim);
-        return;
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(q->dtype());
-    }
+    // Compatibility path: keep one-shot API by preparing metadata internally.
+    static thread_local PagedAttentionPrepared prepared{};
+    prepare_paged_attention(prepared, q_seq_rows, q_pos, block_tables, seq_lens);
+    self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
 }
 
 } // namespace llaisys::ops::cuda

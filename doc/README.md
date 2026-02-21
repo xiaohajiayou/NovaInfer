@@ -17,3 +17,4 @@
 
 1. 测试目录已重构：`test/core|engine|offline|online|parity|ops|utils`
 2. CI 与 `scripts/run_tests.py` 已同步到上述新路径。
+3. 对比基准脚本：`scripts/bench_compare_vllm.py`（NovaInfer/vLLM 同口径基准）。

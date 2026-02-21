@@ -1,6 +1,6 @@
 # Qwen2 概览（当前口径）
 
-## 1. 当前状态（2026-02-20）
+## 1. 当前状态（2026-02-21）
 
 1. 主线架构：`BLOCK(PagedKvImpl)` 为性能演进主线；`SLOT(UnifiedKvImpl)` 作为兼容与回归对照。
 2. 执行链路：Python `engine/scheduler/executor/worker` 负责调度，C++ `Qwen2Model` 负责 runner 执行。
@@ -8,6 +8,12 @@
 4. CPU 策略：CPU attention 路径冻结为“功能稳定 + 回归可用”，后续性能主线转向 CUDA。
 5. 测试组织：测试目录已重构为 `core/engine/offline/online/parity/ops/utils` 分层。
 6. CI 状态：GitHub Actions 已同步新测试路径，`push/pull_request` 自动运行。
+7. CUDA 现状：`BLOCK + NVIDIA` 主路径已可跑通离线推理与 benchmark；`SLOT + NVIDIA` 仍不支持。
+8. 基准对比：已新增 `scripts/bench_compare_vllm.py` 用于 NovaInfer/vLLM 同口径对比。
+9. 已修复关键问题：
+   - KV auto capacity 估算已接入 `max_num_seqs`（不再固定默认 `8`）。
+   - `bench_compare_vllm.py --backend both` 改为子进程隔离运行，避免同进程 CUDA 初始化冲突。
+   - vLLM tokenized 输入已改为 `prompt_token_ids` 结构，修复批量 token prompt 报错。
 
 ## 2. 代码主路径
 

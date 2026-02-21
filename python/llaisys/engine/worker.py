@@ -63,6 +63,7 @@ class Worker:
             kv_cache_layout=self._kv_cache_layout,
             kv_cache_block_size=self._kv_cache_block_size,
             max_model_len=self._max_model_len,
+            max_num_seqs=int(self._config.max_num_seqs),
             kv_cache_capacity_tokens=self._kv_cache_capacity_tokens,
             kv_cache_auto_capacity=self._kv_cache_auto_capacity,
             kv_cache_memory_utilization=self._kv_cache_memory_utilization,

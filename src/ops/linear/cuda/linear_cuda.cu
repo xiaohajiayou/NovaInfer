@@ -43,12 +43,13 @@ cublasHandle_t get_cublas_handle() {
 
 template <typename T>
 __global__ void add_bias_kernel(T *out, const T *bias, std::int32_t M, std::int32_t N) {
-    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-    const std::int32_t total = M * N;
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                            static_cast<std::size_t>(threadIdx.x);
+    const std::size_t total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
     if (idx >= total) {
         return;
     }
-    const std::int32_t n = idx % N;
+    const std::size_t n = idx % static_cast<std::size_t>(N);
     out[idx] += bias[n];
 }
 
@@ -57,12 +58,13 @@ __global__ void add_bias_kernel<llaisys::fp16_t>(llaisys::fp16_t *out,
                                                  const llaisys::fp16_t *bias,
                                                  std::int32_t M,
                                                  std::int32_t N) {
-    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-    const std::int32_t total = M * N;
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                            static_cast<std::size_t>(threadIdx.x);
+    const std::size_t total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
     if (idx >= total) {
         return;
     }
-    const std::int32_t n = idx % N;
+    const std::size_t n = idx % static_cast<std::size_t>(N);
     __half o = __ushort_as_half(out[idx]._v);
     __half b = __ushort_as_half(bias[n]._v);
     out[idx]._v = __half_as_ushort(__hadd(o, b));
@@ -73,12 +75,13 @@ __global__ void add_bias_kernel<llaisys::bf16_t>(llaisys::bf16_t *out,
                                                  const llaisys::bf16_t *bias,
                                                  std::int32_t M,
                                                  std::int32_t N) {
-    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-    const std::int32_t total = M * N;
+    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * static_cast<std::size_t>(blockDim.x) +
+                            static_cast<std::size_t>(threadIdx.x);
+    const std::size_t total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
     if (idx >= total) {
         return;
     }
-    const std::int32_t n = idx % N;
+    const std::size_t n = idx % static_cast<std::size_t>(N);
     __nv_bfloat16 o = __ushort_as_bfloat16(out[idx]._v);
     __nv_bfloat16 b = __ushort_as_bfloat16(bias[n]._v);
     out[idx]._v = __bfloat16_as_ushort(__hadd(o, b));
@@ -90,10 +93,10 @@ void launch_add_bias(tensor_t out, tensor_t bias, std::int32_t M, std::int32_t N
         return;
     }
     constexpr int kBlock = 256;
-    const int total = M * N;
-    const int grid = (total + kBlock - 1) / kBlock;
+    const std::size_t total = static_cast<std::size_t>(M) * static_cast<std::size_t>(N);
+    const std::size_t grid = (total + static_cast<std::size_t>(kBlock) - 1) / static_cast<std::size_t>(kBlock);
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    add_bias_kernel<T><<<grid, kBlock, 0, stream>>>(
+    add_bias_kernel<T><<<static_cast<unsigned int>(grid), kBlock, 0, stream>>>(
         reinterpret_cast<T *>(out->data()),
         reinterpret_cast<const T *>(bias->data()),
         M,

@@ -30,6 +30,10 @@
 4. `llaisysModelKvSeq*` 当前主要用于兼容与测试。BLOCK 下部分语义已与 SLOT 不同：
    - BLOCK 下 `llaisysModelKvSeq*` 统一按未实现处理（`INTERNAL_ERROR(5)`）。
 5. 当前推荐口径：BLOCK 作为性能主线，SLOT 作为兼容/回归模式。
+6. NVIDIA + auto capacity 口径（当前实现）：
+   - `max_num_seqs` 会从 EngineConfig 透传到 Qwen2 runner，
+   - 并参与 KV auto capacity 的 `logical_cap_tokens = max_model_len * max_num_seqs` 估算；
+   - 若未显式提供 `max_num_seqs`，才回落环境变量 `LLAISYS_KV_AUTO_MAX_SEQS`。
 
 历史状态快照（As-Built）：
 

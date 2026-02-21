@@ -40,8 +40,12 @@ struct Qwen2WorkspaceView {
     tensor_t down;
     // [ntoken, voc]
     tensor_t logits;
+    // [ntoken] i64 token ids for embedding input.
+    tensor_t input_ids;
     // [ntoken] i64 logical positions.
     tensor_t pos_ids;
+    // [token_cap * maxseq] u8 flat buffer used to materialize SLOT attention mask.
+    tensor_t attn_mask_flat;
     // [maxseq, nkvh, dh] transient key context gather buffer.
     tensor_t k_ctx;
     // [maxseq, nkvh, dh] transient value context gather buffer.
@@ -120,6 +124,8 @@ private:
         size_t total_main;
         // Total element count in i64 arena.
         size_t total_i64;
+        // Total element count in u8 arena.
+        size_t total_u8;
     };
 
     // Build linear layout for a given token count.
@@ -128,6 +134,8 @@ private:
     tensor_t slice_main_(const Layout &layout, size_t start, size_t n, const std::vector<size_t> &shape) const;
     // Slice typed view from i64 arena by [start, start+n) and reshape.
     tensor_t slice_i64_(const Layout &layout, size_t start, size_t n, const std::vector<size_t> &shape) const;
+    // Slice typed view from u8 arena by [start, start+n) and reshape.
+    tensor_t slice_u8_(const Layout &layout, size_t start, size_t n, const std::vector<size_t> &shape) const;
 
     // Model config: hidden size.
     size_t hs_;
@@ -156,6 +164,8 @@ private:
     tensor_t main_arena_;
     // Contiguous arena for i64 position buffers.
     tensor_t i64_arena_;
+    // Contiguous arena for u8 scratch buffers (e.g., SLOT attention mask).
+    tensor_t u8_arena_;
     // Materialized per-buffer views over arenas.
     Qwen2WorkspaceView view_{};
 };

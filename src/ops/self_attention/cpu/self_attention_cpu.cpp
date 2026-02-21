@@ -261,10 +261,13 @@ void self_attention_paged_(
     const T* q,   // [seqlen, nhead, head_dim]
     const T* k_cache, // [nslot, nkvhead, head_dim]
     const T* v_cache, // [nslot, nkvhead, head_dim]
-    const int32_t* used_slots, // [n_used]
-    size_t n_used,
-    const int32_t* row_ptr, // [seqlen + 1]
-    const int32_t* col_idx, // [nnz], each in [0, n_used)
+    const int32_t* q_seq_rows, // [seqlen], query token -> seq row
+    const int32_t* q_pos, // [seqlen], query position in sequence
+    const int32_t* block_tables, // [nseq, block_table_width]
+    const int32_t* seq_lens, // [nseq]
+    int32_t nseq,
+    int32_t block_table_width,
+    int32_t block_size,
     size_t seqlen,
     size_t nslot,
     size_t nhead,
@@ -274,10 +277,11 @@ void self_attention_paged_(
 {
     size_t group_size = nhead / nkvhead;
     for (size_t t = 0; t < seqlen; ++t) {
-        const int32_t rb = row_ptr[t];
-        const int32_t re = row_ptr[t + 1];
-        ASSERT(rb >= 0 && re >= rb, "self_attention_paged: invalid row range");
-        const size_t n_visible = static_cast<size_t>(re - rb);
+        const int32_t row = q_seq_rows[t];
+        ASSERT(row >= 0 && row < nseq, "self_attention_paged: q_seq_rows out of range");
+        const int32_t seq_len = seq_lens[row];
+        const int32_t vmax = std::min<int32_t>(q_pos[t], seq_len - 1);
+        const size_t n_visible = (vmax >= 0) ? (static_cast<size_t>(vmax) + 1) : 0;
 
         if (n_visible == 0) {
             for (size_t q_h_idx = 0; q_h_idx < nhead; ++q_h_idx) {
@@ -298,20 +302,23 @@ void self_attention_paged_(
             const T* q_ptr = q + (t * nhead + q_h_idx) * head_dim;
             T* out_ptr = out + (t * nhead + q_h_idx) * head_dim;
             std::vector<float> scores(n_visible);
+            std::vector<int32_t> visible_slots(n_visible, -1);
 
-            for (size_t vi = 0; vi < n_visible; ++vi) {
-                const int32_t col = col_idx[static_cast<size_t>(rb) + vi];
-                ASSERT(col >= 0 && static_cast<size_t>(col) < n_used,
-                       "self_attention_paged: column index out of range");
-                const int32_t slot = used_slots[static_cast<size_t>(col)];
-                ASSERT(slot >= 0 && static_cast<size_t>(slot) < nslot,
-                       "self_attention_paged: used slot out of range");
+            for (int32_t p = 0; p <= vmax; ++p) {
+                const int32_t bidx = p / block_size;
+                const int32_t boff = p % block_size;
+                ASSERT(bidx >= 0 && bidx < block_table_width, "self_attention_paged: block index out of range");
+                const int32_t bid = block_tables[row * block_table_width + bidx];
+                ASSERT(bid >= 0, "self_attention_paged: invalid block id");
+                const int32_t slot = bid * block_size + boff;
+                ASSERT(slot >= 0 && static_cast<size_t>(slot) < nslot, "self_attention_paged: slot out of range");
+                visible_slots[static_cast<size_t>(p)] = slot;
                 const T* k_ptr = k_cache + (static_cast<size_t>(slot) * nkvhead + kv_h_idx) * head_dim;
                 float dot = 0.f;
                 for (size_t j = 0; j < head_dim; ++j) {
                     dot += llaisys::utils::cast<float>(q_ptr[j]) * llaisys::utils::cast<float>(k_ptr[j]);
                 }
-                scores[vi] = dot * scale;
+                scores[static_cast<size_t>(p)] = dot * scale;
             }
 
             float maxv = -1e30f;
@@ -331,8 +338,7 @@ void self_attention_paged_(
             for (size_t i = 0; i < head_dim; ++i) {
                 float acc = 0.f;
                 for (size_t vi = 0; vi < n_visible; ++vi) {
-                    const int32_t col = col_idx[static_cast<size_t>(rb) + vi];
-                    const int32_t slot = used_slots[static_cast<size_t>(col)];
+                    const int32_t slot = visible_slots[vi];
                     const T* v_ptr = v_cache + (static_cast<size_t>(slot) * nkvhead + kv_h_idx) * head_dim;
                     acc += scores[vi] * llaisys::utils::cast<float>(v_ptr[i]);
                 }
@@ -527,9 +533,12 @@ void self_attention_paged(tensor_t attn_val,
         tensor_t q,
         tensor_t k_cache,
         tensor_t v_cache,
-        const std::vector<int32_t>& used_slots,
-        const std::vector<int32_t>& row_ptr,
-        const std::vector<int32_t>& col_idx,
+        const std::vector<int32_t>& q_seq_rows,
+        const std::vector<int32_t>& q_pos,
+        const std::vector<int32_t>& block_tables,
+        const std::vector<int32_t>& seq_lens,
+        int32_t block_table_width,
+        int32_t block_size,
         float scale) {
     CHECK_SAME_DEVICE(attn_val, q, k_cache, v_cache);
 
@@ -552,11 +561,13 @@ void self_attention_paged(tensor_t attn_val,
     ASSERT(attn_val->shape()[2] == head_dim, "self_attention_paged: attn_val head_dim mismatch");
     ASSERT(nhead % nkvhead == 0, "self_attention_paged: nhead must be divisible by nkvhead");
 
-    ASSERT(row_ptr.size() == seqlen + 1, "self_attention_paged: row_ptr size mismatch");
-    ASSERT(!row_ptr.empty(), "self_attention_paged: row_ptr must be non-empty");
-    ASSERT(row_ptr.front() == 0, "self_attention_paged: row_ptr must start at 0");
-    ASSERT(row_ptr.back() == static_cast<int32_t>(col_idx.size()),
-           "self_attention_paged: row_ptr end mismatch");
+    ASSERT(block_table_width > 0, "self_attention_paged: block_table_width must be > 0");
+    ASSERT(block_size > 0, "self_attention_paged: block_size must be > 0");
+    ASSERT(q_seq_rows.size() == seqlen, "self_attention_paged: q_seq_rows size mismatch");
+    ASSERT(q_pos.size() == seqlen, "self_attention_paged: q_pos size mismatch");
+    ASSERT(!seq_lens.empty(), "self_attention_paged: seq_lens must be non-empty");
+    ASSERT(block_tables.size() == seq_lens.size() * static_cast<size_t>(block_table_width),
+           "self_attention_paged: block_tables size mismatch");
 
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
@@ -565,10 +576,13 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const float*>(q->data()),
             reinterpret_cast<const float*>(k_cache->data()),
             reinterpret_cast<const float*>(v_cache->data()),
-            used_slots.data(),
-            used_slots.size(),
-            row_ptr.data(),
-            col_idx.data(),
+            q_seq_rows.data(),
+            q_pos.data(),
+            block_tables.data(),
+            seq_lens.data(),
+            static_cast<int32_t>(seq_lens.size()),
+            block_table_width,
+            block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);
     case LLAISYS_DTYPE_BF16:
         return self_attention_paged_(
@@ -576,10 +590,13 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::bf16_t*>(q->data()),
             reinterpret_cast<const llaisys::bf16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::bf16_t*>(v_cache->data()),
-            used_slots.data(),
-            used_slots.size(),
-            row_ptr.data(),
-            col_idx.data(),
+            q_seq_rows.data(),
+            q_pos.data(),
+            block_tables.data(),
+            seq_lens.data(),
+            static_cast<int32_t>(seq_lens.size()),
+            block_table_width,
+            block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);
     case LLAISYS_DTYPE_F16:
         return self_attention_paged_(
@@ -587,10 +604,13 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::fp16_t*>(q->data()),
             reinterpret_cast<const llaisys::fp16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::fp16_t*>(v_cache->data()),
-            used_slots.data(),
-            used_slots.size(),
-            row_ptr.data(),
-            col_idx.data(),
+            q_seq_rows.data(),
+            q_pos.data(),
+            block_tables.data(),
+            seq_lens.data(),
+            static_cast<int32_t>(seq_lens.size()),
+            block_table_width,
+            block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(q->dtype());

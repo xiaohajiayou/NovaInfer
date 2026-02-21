@@ -16,6 +16,9 @@
 #include "../../ops/rope/op.hpp"
 #include "../../ops/self_attention/op.hpp"
 #include "../../ops/swiglu/op.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "../../ops/self_attention/cuda/self_attention_cuda.hpp"
+#endif
 #include "../../tensor/tensor.hpp"
 #include "../../utils/check.hpp"
 
@@ -95,6 +98,10 @@ private:
     tensor_t zero_bias_mlp_up_{};
     tensor_t zero_bias_mlp_down_{};
     tensor_t zero_bias_logits_{};
+#ifdef ENABLE_NVIDIA_API
+    // Step-level paged-attention metadata uploaded once and reused by all layers.
+    ops::cuda::PagedAttentionPrepared paged_attn_prepared_{};
+#endif
 
     bool validate_decode_batch_(const LlaisysBatch &batch) const;
 
@@ -118,8 +125,11 @@ private:
                                  const std::vector<int32_t> &slot_idxs,
                                  const std::vector<int32_t> &used_slots,
                                  tensor_t attn_mask,
-                                 const std::vector<int32_t> &attn_row_ptr,
-                                 const std::vector<int32_t> &attn_col_idx,
+                                 const std::vector<int32_t> &q_seq_rows,
+                                 const std::vector<int32_t> &q_pos,
+                                 const std::vector<int32_t> &block_tables,
+                                 const std::vector<int32_t> &seq_lens,
+                                 int32_t block_table_width,
                                  bool paged_attention);
     int32_t decode_slot_path_(const LlaisysBatch &batch,
                               size_t ntoken,
