@@ -9,7 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from test.parity.backend_matrix import parity_device_backend_cases
+from test.parity.backend_matrix import parity_device_backend_layout_cases
 from llaisys.libllaisys import LIB_LLAISYS
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
@@ -204,21 +204,17 @@ def _build_prompt_to_token_ids(tokenizer, prompts):
 @pytest.mark.requires_hf
 @pytest.mark.parity
 @pytest.mark.parametrize(
-    "prompts, ll_device, backend",
+    "prompts, ll_device, backend, kv_layout",
     [
-        (["Who are you?"],) + parity_device_backend_cases()[0],
-        (["Who are you?", "Explain KV cache in one sentence."],) + parity_device_backend_cases()[0],
-        *[
-            (p, d, b)
-            for p in (
-                ["Who are you?"],
-                ["Who are you?", "Explain KV cache in one sentence."],
-            )
-            for d, b in parity_device_backend_cases()[1:]
-        ],
+        (prompts, d, b, layout)
+        for prompts in (
+            ["Who are you?"],
+            ["Who are you?", "Explain KV cache in one sentence."],
+        )
+        for d, b, layout in parity_device_backend_layout_cases()
     ],
 )
-def test_core_parity(require_model_path, prompts, ll_device, backend):
+def test_core_parity(require_model_path, prompts, ll_device, backend, kv_layout):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
 
@@ -242,6 +238,9 @@ def test_core_parity(require_model_path, prompts, ll_device, backend):
             llaisys_model = llaisys.models.Qwen2(
                 require_model_path,
                 llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
+                kv_cache_layout=(
+                    KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT
+                ),
                 kv_cache_auto_capacity=True,
             )
         except Exception as exc:

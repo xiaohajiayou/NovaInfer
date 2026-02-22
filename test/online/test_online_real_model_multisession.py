@@ -98,6 +98,9 @@ def _hf_completion_tokens(model_path: str, prompt: str, max_new_tokens: int) -> 
 
 @pytest.mark.requires_model
 @pytest.mark.online
+@pytest.mark.test_device("cpu")
+@pytest.mark.test_layout("block")
+@pytest.mark.test_backend("native")
 def test_online_real_model_multisession_stream_isolation(require_model_path: str):
     engine = LLMEngine(
         model_type="qwen2",
@@ -130,6 +133,8 @@ def test_online_real_model_multisession_stream_isolation(require_model_path: str
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.online
+@pytest.mark.test_device("nvidia")
+@pytest.mark.test_layout("block")
 @pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
 @pytest.mark.parametrize("backend", ["native", "cudnn"])
 def test_online_real_model_hf_parity_nvidia_backend(require_model_path: str, backend: str):

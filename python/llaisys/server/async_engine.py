@@ -191,6 +191,9 @@ class AsyncLLMEngine:
             if outputs:
                 for out in outputs:
                     req_id = out.request_id
+                    # Ensure all newly generated tokens are emitted before
+                    # sending terminal chunk for this request.
+                    self._emit_pending_chunks_for_request(req_id)
                     self._final_outputs[req_id] = out
                     self._emit_chunk(req_id, token_id=None, text_delta=None, status=out.status, is_finished=True, finish_reason=out.finish_reason)
                     self._close_stream(req_id)
@@ -225,6 +228,10 @@ class AsyncLLMEngine:
             elif op == "watch_stream":
                 _, req_id, stream_q = cmd
                 self._stream_queues.setdefault(req_id, []).append(stream_q)
+                # Stream consumer may subscribe after some tokens are already
+                # produced by the loop. Replay current completion tokens once
+                # to avoid losing prefix chunks due to subscribe race.
+                self._replay_generated_tokens(req_id, stream_q)
                 if req_id in self._final_outputs:
                     out = self._final_outputs[req_id]
                     stream_q.put(
@@ -241,34 +248,64 @@ class AsyncLLMEngine:
             else:
                 pass
 
-    def _emit_inflight_chunks(self):
-        for req_id, state in list(self._stream_states.items()):
-            if state.finished:
-                continue
-            completion_tokens = self._engine.get_completion_tokens(req_id)
-            status = self._engine.get_request_status(req_id)
-            if completion_tokens is None or status is None:
-                continue
-            if len(completion_tokens) <= state.emitted:
-                continue
+    def _replay_generated_tokens(self, req_id: str, stream_q: Queue) -> None:
+        completion_tokens = self._engine.get_completion_tokens(req_id)
+        status = self._engine.get_request_status(req_id)
+        if completion_tokens is None or status is None or not completion_tokens:
+            return
 
-            new_tokens = completion_tokens[state.emitted :]
-            full_text = self._engine.decode_tokens(completion_tokens)
+        tokens = [int(t) for t in completion_tokens]
+        full_text = self._engine.decode_tokens(tokens)
+        for idx, token_id in enumerate(tokens):
             text_delta = None
-            if full_text is not None:
-                text_delta = full_text[len(state.prev_text) :] if full_text.startswith(state.prev_text) else full_text
-                state.prev_text = full_text
-
-            for idx, token_id in enumerate(new_tokens):
-                self._emit_chunk(
-                    req_id=req_id,
-                    token_id=int(token_id),
-                    text_delta=text_delta if idx == len(new_tokens) - 1 else None,
+            if full_text is not None and idx == len(tokens) - 1:
+                # Emit full decoded text once for parser state alignment.
+                text_delta = full_text
+            stream_q.put(
+                StreamChunk(
+                    request_id=req_id,
+                    token_id=token_id,
+                    text_delta=text_delta,
                     status=status,
                     is_finished=False,
                     finish_reason=None,
                 )
-            state.emitted = len(completion_tokens)
+            )
+
+    def _emit_inflight_chunks(self):
+        for req_id, state in list(self._stream_states.items()):
+            if state.finished:
+                continue
+            self._emit_pending_chunks_for_request(req_id)
+
+    def _emit_pending_chunks_for_request(self, req_id: str) -> None:
+        state = self._stream_states.get(req_id)
+        if state is None or state.finished:
+            return
+        completion_tokens = self._engine.get_completion_tokens(req_id)
+        status = self._engine.get_request_status(req_id)
+        if completion_tokens is None or status is None:
+            return
+        if len(completion_tokens) <= state.emitted:
+            return
+
+        new_tokens = completion_tokens[state.emitted :]
+        full_text = self._engine.decode_tokens(completion_tokens)
+        text_delta = None
+        if full_text is not None:
+            text_delta = full_text[len(state.prev_text) :] if full_text.startswith(state.prev_text) else full_text
+            state.prev_text = full_text
+
+        for idx, token_id in enumerate(new_tokens):
+            self._emit_chunk(
+                req_id=req_id,
+                token_id=int(token_id),
+                text_delta=text_delta if idx == len(new_tokens) - 1 else None,
+                status=status,
+                is_finished=False,
+                finish_reason=None,
+            )
+        state.emitted = len(completion_tokens)
 
     def _emit_chunk(
         self,

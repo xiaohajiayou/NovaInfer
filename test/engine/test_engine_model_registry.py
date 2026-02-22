@@ -42,7 +42,10 @@ def test_engine_uses_model_registry_for_worker_creation():
         model_path="/tmp/unused",
         model_registry=registry,
     )
-    out = engine.generate(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=3))
+    out = engine.generate(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=3, top_k=1, top_p=1.0, temperature=1.0),
+    )
 
     assert out.token_ids == [1, 2, 3, 4, 5]
     assert out.finish_reason == "eos_token"

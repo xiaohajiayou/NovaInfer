@@ -44,10 +44,18 @@ def _run(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
-def _run_pytest(files: list[str], env: dict[str, str], model_path: str | None = None) -> None:
+def _run_pytest(
+    files: list[str],
+    env: dict[str, str],
+    model_path: str | None = None,
+    device: str = "all",
+    layout: str = "all",
+    backend: str = "all",
+) -> None:
     cmd = [PYTHON, "-m", "pytest", "-q", *files]
     if model_path:
         cmd.extend(["--model-path", model_path])
+    cmd.extend(["--device", device, "--layout", layout, "--backend", backend])
     _run(cmd, env)
 
 
@@ -56,6 +64,10 @@ def _run_stage0(
     model_path: str | None,
     run_parity: str,
     run_hf: str,
+    *,
+    device: str,
+    layout: str,
+    backend: str,
 ) -> None:
     files = list(STAGE0_PYTEST_FILES)
     should_run_hf = (run_hf == "always") or (run_hf == "auto" and bool(model_path))
@@ -66,21 +78,50 @@ def _run_stage0(
     if not should_run_parity:
         files.remove("test/parity/test_core_parity.py")
         print("[skip] stage0 parity")
-    _run_pytest(files, env, model_path=model_path)
+    _run_pytest(
+        files,
+        env,
+        model_path=model_path,
+        device=device,
+        layout=layout,
+        backend=backend,
+    )
 
 
-def _run_stage1(env: dict[str, str], model_path: str | None, run_parity: str) -> None:
+def _run_stage1(
+    env: dict[str, str],
+    model_path: str | None,
+    run_parity: str,
+    *,
+    device: str,
+    layout: str,
+    backend: str,
+) -> None:
     files = list(STAGE1_PYTEST_FILES)
     should_run_parity = (run_parity == "always") or (run_parity == "auto" and bool(model_path))
     if not should_run_parity:
         files.remove("test/parity/test_offline_parity.py")
         print("[skip] stage1 parity")
-    _run_pytest(files, env, model_path=model_path)
+    _run_pytest(
+        files,
+        env,
+        model_path=model_path,
+        device=device,
+        layout=layout,
+        backend=backend,
+    )
 
 
-def _run_stage2(env: dict[str, str], model_path: str | None) -> None:
+def _run_stage2(
+    env: dict[str, str],
+    model_path: str | None,
+    *,
+    device: str,
+    layout: str,
+    backend: str,
+) -> None:
     _ = model_path
-    _run_pytest(STAGE2_PYTEST_FILES, env)
+    _run_pytest(STAGE2_PYTEST_FILES, env, device=device, layout=layout, backend=backend)
 
 
 def main() -> int:
@@ -108,6 +149,24 @@ def main() -> int:
         default=os.environ.get("RUN_HF", "auto"),
         help="HF-dependent policy for stage0 infer parity-like test",
     )
+    parser.add_argument(
+        "--device",
+        choices=["all", "cpu", "nvidia"],
+        default=os.environ.get("TEST_DEVICE", "all"),
+        help="Filter tests by device axis",
+    )
+    parser.add_argument(
+        "--layout",
+        choices=["all", "slot", "block"],
+        default=os.environ.get("TEST_LAYOUT", "all"),
+        help="Filter tests by layout axis",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["all", "native", "cudnn"],
+        default=os.environ.get("TEST_BACKEND", "all"),
+        help="Filter tests by backend axis",
+    )
     args = parser.parse_args()
 
     model_path = args.model_path.strip() or None
@@ -119,6 +178,9 @@ def main() -> int:
     print(f"[config] model_path={model_path or '<none>'}")
     print(f"[config] run_parity={args.run_parity}")
     print(f"[config] run_hf={args.run_hf}")
+    print(f"[config] device={args.device}")
+    print(f"[config] layout={args.layout}")
+    print(f"[config] backend={args.backend}")
 
     if args.suite in ("stage0", "all"):
         _run_stage0(
@@ -126,11 +188,27 @@ def main() -> int:
             model_path=model_path,
             run_parity=args.run_parity,
             run_hf=args.run_hf,
+            device=args.device,
+            layout=args.layout,
+            backend=args.backend,
         )
     if args.suite in ("stage1", "all"):
-        _run_stage1(env=env, model_path=model_path, run_parity=args.run_parity)
+        _run_stage1(
+            env=env,
+            model_path=model_path,
+            run_parity=args.run_parity,
+            device=args.device,
+            layout=args.layout,
+            backend=args.backend,
+        )
     if args.suite in ("stage2", "all"):
-        _run_stage2(env=env, model_path=model_path)
+        _run_stage2(
+            env=env,
+            model_path=model_path,
+            device=args.device,
+            layout=args.layout,
+            backend=args.backend,
+        )
 
     print("[ok] all selected test suites passed")
     return 0

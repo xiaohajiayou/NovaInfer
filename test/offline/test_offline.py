@@ -34,7 +34,10 @@ class DummyRunner:
 
 def test_offline_engine_argmax_loop():
     engine = LLMEngine(model_runner=DummyRunner())
-    out = engine.generate(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=8))
+    out = engine.generate(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out.token_ids == [1, 2, 3, 4]
     assert out.finish_reason == "eos_token"
     assert out.text == "de"
@@ -43,7 +46,12 @@ def test_offline_engine_argmax_loop():
 
 def test_offline_engine_stream_loop():
     engine = LLMEngine(model_runner=DummyRunner())
-    chunks = list(engine.stream(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=8)))
+    chunks = list(
+        engine.stream(
+            inputs=[1, 2],
+            sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+        )
+    )
     token_chunks = [c for c in chunks if not c.is_finished]
     assert [int(c.token_id) for c in token_chunks] == [3, 4]
     assert "".join((c.text_delta or "") for c in token_chunks) == "de"

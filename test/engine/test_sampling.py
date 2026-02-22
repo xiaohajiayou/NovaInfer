@@ -6,6 +6,13 @@ from llaisys.engine.sampling import Sampler
 from llaisys.engine.types import SamplingParams
 
 
+def test_sampling_defaults_align_vllm_style():
+    params = SamplingParams()
+    assert params.top_k == 0
+    assert params.top_p == 1.0
+    assert params.temperature == 1.0
+
+
 def test_sampling_argmax_when_temperature_zero():
     sampler = Sampler(seed=0)
     logits = [np.array([0.1, 0.2, 0.9, 0.4], dtype=np.float32)]

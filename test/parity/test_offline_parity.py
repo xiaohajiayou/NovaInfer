@@ -8,8 +8,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from test.parity.backend_matrix import parity_device_backend_cases
+from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
+from llaisys.libllaisys.model import KvCacheLayout
 
 
 MULTI_PROMPTS = [
@@ -77,11 +78,12 @@ def hf_completion_tokens(
     return full_tokens[len(prompt_tokens) :]
 
 
-def load_llaisys_llm(model_path, device_name):
+def load_llaisys_llm(model_path, device_name, kv_layout: str = "block"):
     return llaisys.LLM(
         model=model_path,
         model_type="qwen2",
         device=llaisys_device(device_name),
+        kv_cache_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
         kv_cache_auto_capacity=True,
     )
 
@@ -125,8 +127,8 @@ def llaisys_offline_infer(
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
-def test_offline_parity_single(require_model_path, ll_device, backend):
+@pytest.mark.parametrize(("ll_device", "backend", "kv_layout"), parity_device_backend_layout_cases())
+def test_offline_parity_single(require_model_path, ll_device, backend, kv_layout):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
@@ -148,7 +150,7 @@ def test_offline_parity_single(require_model_path, ll_device, backend):
     llm = None
     try:
         try:
-            llm = load_llaisys_llm(require_model_path, ll_device)
+            llm = load_llaisys_llm(require_model_path, ll_device, kv_layout=kv_layout)
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
@@ -175,8 +177,8 @@ def test_offline_parity_single(require_model_path, ll_device, backend):
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
-def test_offline_parity_multi(require_model_path, ll_device, backend):
+@pytest.mark.parametrize(("ll_device", "backend", "kv_layout"), parity_device_backend_layout_cases())
+def test_offline_parity_multi(require_model_path, ll_device, backend, kv_layout):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
@@ -200,7 +202,7 @@ def test_offline_parity_multi(require_model_path, ll_device, backend):
     llm = None
     try:
         try:
-            llm = load_llaisys_llm(require_model_path, ll_device)
+            llm = load_llaisys_llm(require_model_path, ll_device, kv_layout=kv_layout)
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")

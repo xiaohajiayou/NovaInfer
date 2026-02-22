@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import queue
+import time
+
 import numpy as np
 
 from llaisys.engine.llm_engine import LLMEngine
@@ -78,6 +81,77 @@ def test_online_chat_completion_stream():
     assert len(chunks) > 0
     assert chunks[-1]["is_finished"] is True
     assert chunks[-1]["choices"][0]["finish_reason"] is not None
+
+
+def test_online_chat_completion_stream_token_ids_match_non_stream():
+    server = _make_server()
+    req = ChatCompletionRequest(
+        model="qwen2",
+        messages=[ChatMessage(role="user", content="hello")],
+        stream=False,
+        max_tokens=8,
+        top_k=1,
+        top_p=1.0,
+        temperature=1.0,
+    )
+    non_stream = server.handle_chat(req)
+    expected = [int(t) for t in non_stream["token_ids"]]
+
+    stream_req = ChatCompletionRequest(
+        model="qwen2",
+        messages=[ChatMessage(role="user", content="hello")],
+        stream=True,
+        max_tokens=8,
+        top_k=1,
+        top_p=1.0,
+        temperature=1.0,
+    )
+    chunks = list(server.handle_chat_stream(stream_req))
+    stream_ids = [
+        int(c["token_id"])
+        for c in chunks
+        if not c.get("is_finished") and c.get("token_id") is not None
+    ]
+    assert stream_ids == expected
+
+
+def test_async_stream_late_subscribe_replays_prefix_and_tail():
+    server = _make_server()
+    params = SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0)
+    prompt = [1, 2]
+    req_id = server._async_engine.submit(inputs=prompt, sampling_params=params)
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        current = server._async_engine.inner_engine.get_completion_tokens(req_id) or []
+        if len(current) >= 2:
+            break
+        time.sleep(0.005)
+
+    stream_q: queue.Queue = queue.Queue()
+    server._async_engine._cmd_q.put(("watch_stream", req_id, stream_q))
+
+    seen_ids: list[int] = []
+    finished = False
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            item = stream_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if item is None:
+            break
+        if item.token_id is not None:
+            seen_ids.append(int(item.token_id))
+        if item.is_finished:
+            finished = True
+            break
+
+    assert finished, "stream should emit terminal chunk after late subscribe"
+    out = server._async_engine.collect(req_id)
+    assert out is not None
+    expected = [int(t) for t in out.token_ids[len(prompt) :]]
+    assert seen_ids == expected
 
 
 def test_online_cancel_request():

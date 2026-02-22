@@ -143,7 +143,10 @@ class KvStatsProbeRunner(DummyRunner):
 
 def test_state_machine_stopped_path():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4))
-    out = engine.generate(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=8))
+    out = engine.generate(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
 
     assert out.status == RequestStatus.FINISHED_STOPPED
     assert out.finish_reason == "eos_token"
@@ -159,7 +162,10 @@ def test_state_machine_stopped_path():
 
 def test_state_machine_length_capped_path():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
-    out = engine.generate(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=2))
+    out = engine.generate(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
+    )
 
     assert out.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert out.finish_reason == "length"
@@ -175,7 +181,10 @@ def test_state_machine_length_capped_path():
 
 def test_state_machine_aborted_on_invalid_prompt():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=1, end_token_id=4))
-    out = engine.generate(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=2))
+    out = engine.generate(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out.status == RequestStatus.FINISHED_ABORTED
     assert out.finish_reason == "aborted"
 
@@ -191,7 +200,10 @@ def test_state_machine_aborted_on_invalid_prompt():
 
 def test_submit_step_collect_contract():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4))
-    req_id = engine.submit(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=8))
+    req_id = engine.submit(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
 
     # drive engine loop explicitly
     for _ in range(16):
@@ -215,7 +227,10 @@ def test_submit_step_collect_contract():
 
 def test_cancel_contract():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
-    req_id = engine.submit(inputs=[1, 2], sampling_params=SamplingParams(max_new_tokens=8))
+    req_id = engine.submit(
+        inputs=[1, 2],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert engine.cancel(req_id) is True
 
     out = engine.collect(req_id)
@@ -228,7 +243,9 @@ def test_stop_string_contract():
     engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
     out = engine.generate(
         inputs=[1, 2],
-        sampling_params=SamplingParams(max_new_tokens=8, stop=("de",)),
+        sampling_params=SamplingParams(
+            max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0, stop=("de",)
+        ),
     )
     assert out.status == RequestStatus.FINISHED_STOPPED
     assert out.finish_reason == "stop_string"
@@ -241,7 +258,10 @@ def test_aborted_when_prompt_exceeds_scheduler_budget():
         model_runner=DummyRunner(max_seq_len=64, end_token_id=99),
         kv_cache_capacity_tokens=4,
     )
-    out = engine.generate(inputs=[1, 2, 3, 4, 5], sampling_params=SamplingParams(max_new_tokens=2))
+    out = engine.generate(
+        inputs=[1, 2, 3, 4, 5],
+        sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out.status == RequestStatus.FINISHED_ABORTED
     assert out.finish_reason == "aborted"
 
@@ -279,11 +299,17 @@ def test_prefix_attach_and_uncached_prefill_suffix():
         max_batch_size=1,
     )
 
-    req1 = engine.submit(inputs=[10, 11, 12, 13], sampling_params=SamplingParams(max_new_tokens=8))
+    req1 = engine.submit(
+        inputs=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert req1
     _ = engine.step()  # prefill req1
 
-    req2 = engine.submit(inputs=[10, 11, 12, 13, 14], sampling_params=SamplingParams(max_new_tokens=8))
+    req2 = engine.submit(
+        inputs=[10, 11, 12, 13, 14],
+        sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert req2
     _ = engine.step()  # prefill req2 (should feed uncached suffix with explicit block metadata)
 
@@ -305,12 +331,18 @@ def test_prefix_reuses_after_finished_request_freed():
         max_batch_size=1,
     )
 
-    out1 = engine.generate(inputs=[20, 21, 22, 23], sampling_params=SamplingParams(max_new_tokens=1))
+    out1 = engine.generate(
+        inputs=[20, 21, 22, 23],
+        sampling_params=SamplingParams(max_new_tokens=1, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out1.status == RequestStatus.FINISHED_LENGTH_CAPPED
     # nano-vllm style: finished request can be freed and still leave hash index reusable.
     assert 1 in runner.request_free_calls
 
-    req2 = engine.submit(inputs=[20, 21, 22, 23, 24], sampling_params=SamplingParams(max_new_tokens=1))
+    req2 = engine.submit(
+        inputs=[20, 21, 22, 23, 24],
+        sampling_params=SamplingParams(max_new_tokens=1, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert req2
     _ = engine.step()  # prefill req2
     last = runner.decode_calls[-1]
@@ -326,7 +358,10 @@ def test_finished_request_releases_blocks_in_block_mode():
         kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
     )
-    out = engine.generate(inputs=[30, 31, 32, 33], sampling_params=SamplingParams(max_new_tokens=1))
+    out = engine.generate(
+        inputs=[30, 31, 32, 33],
+        sampling_params=SamplingParams(max_new_tokens=1, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out.status == RequestStatus.FINISHED_LENGTH_CAPPED
     assert 1 in runner.request_free_calls
 
@@ -340,7 +375,10 @@ def test_engine_runtime_peak_watermark_is_observed_in_block_mode():
         kv_cache_capacity_tokens=64,
         max_batch_size=1,
     )
-    out = engine.generate(inputs=[40, 41, 42, 43], sampling_params=SamplingParams(max_new_tokens=2))
+    out = engine.generate(
+        inputs=[40, 41, 42, 43],
+        sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
+    )
     assert out.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
     stats = engine.kv_cache_stats()

@@ -9,7 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from test.parity.backend_matrix import parity_device_backend_cases
+from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
@@ -160,8 +160,8 @@ def llaisys_model_runner_infer(
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
-def test_infer_parity(require_model_path, ll_device, backend):
+@pytest.mark.parametrize(("ll_device", "backend", "kv_layout"), parity_device_backend_layout_cases())
+def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
     model_path = require_model_path
@@ -190,6 +190,7 @@ def test_infer_parity(require_model_path, ll_device, backend):
             model_runner = llaisys.models.Qwen2(
                 model_path=model_path,
                 device=llaisys_device(ll_device),
+                kv_cache_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
                 kv_cache_auto_capacity=True,
             )
         except Exception as exc:
@@ -213,6 +214,9 @@ def test_infer_parity(require_model_path, ll_device, backend):
 
 
 @pytest.mark.requires_model
+@pytest.mark.test_device("cpu")
+@pytest.mark.test_layout("block")
+@pytest.mark.test_backend("native")
 def test_infer_smoke(require_model_path):
     model_path = require_model_path
     prompt = "hello"
@@ -241,6 +245,8 @@ def test_infer_smoke(require_model_path):
 
 
 @pytest.mark.requires_model
+@pytest.mark.test_device("nvidia")
+@pytest.mark.test_layout("block")
 @pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
 @pytest.mark.parametrize("backend", ["native", "cudnn"])
 def test_infer_smoke_nvidia(require_model_path, backend):
