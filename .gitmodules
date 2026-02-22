@@ -1,0 +1,3 @@
+[submodule "third_party/cudnn_frontend"]
+	path = third_party/cudnn_frontend
+	url = https://github.com/NVIDIA/cudnn-frontend.git

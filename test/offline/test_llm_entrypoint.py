@@ -48,7 +48,7 @@ def _build_llm() -> LLM:
 
 def test_llm_generate_token_batch_output_shape():
     llm = _build_llm()
-    out = llm.generate([[1, 2]], sampling_params=SamplingParams(max_new_tokens=8))
+    out = llm.generate([[1, 2]], sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0))
     assert isinstance(out, list)
     assert len(out) == 1
     row = out[0]
@@ -60,12 +60,12 @@ def test_llm_generate_token_batch_output_shape():
 def test_llm_generate_rejects_legacy_token_list_input():
     llm = _build_llm()
     with pytest.raises(TypeError, match="inputs must be str, list\\[str\\], or list\\[list\\[int\\]\\] for batch mode"):
-        _ = llm.generate([1, 2], sampling_params=SamplingParams(max_new_tokens=8))
+        _ = llm.generate([1, 2], sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0))
 
 
 def test_llm_generate_single_prompt_output_shape():
     llm = _build_llm()
-    out = llm.generate("p0", sampling_params=SamplingParams(max_new_tokens=8))
+    out = llm.generate("p0", sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0))
     assert isinstance(out, list)
     assert len(out) == 1
     row = out[0]
@@ -79,8 +79,8 @@ def test_llm_generate_single_prompt_output_shape():
 def test_llm_generate_prompt_batch_and_params_list():
     llm = _build_llm()
     params = [
-        SamplingParams(max_new_tokens=2),
-        SamplingParams(max_new_tokens=8),
+        SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
+        SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
     ]
     out = llm.generate(["p0", "p1"], sampling_params=params)
     assert len(out) == 2
@@ -92,7 +92,7 @@ def test_llm_generate_prompt_batch_and_params_list():
 
 def test_llm_stream_single_prompt():
     llm = _build_llm()
-    chunks = list(llm.stream("p0", sampling_params=SamplingParams(max_new_tokens=8)))
+    chunks = list(llm.stream("p0", sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0)))
     token_chunks = [c for c in chunks if not c.is_finished]
     assert [int(c.token_id) for c in token_chunks] == [3, 4, 5]
     assert chunks[-1].is_finished is True

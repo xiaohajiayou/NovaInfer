@@ -16,9 +16,10 @@ class ChatCompletionRequest:
     messages: Sequence[ChatMessage]
     stream: bool = False
     max_tokens: int | None = None
-    top_k: int = 1
-    top_p: float = 1.0
-    temperature: float = 1.0
+    top_k: int | None = None
+    top_p: float | None = None
+    temperature: float | None = None
+    include_reasoning: bool = True
     stop: Sequence[str] = field(default_factory=tuple)
     stop_token_ids: Sequence[int] = field(default_factory=tuple)
     extra: dict[str, Any] = field(default_factory=dict)

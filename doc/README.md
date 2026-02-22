@@ -7,6 +7,7 @@
 3. `doc/qwen2_interface.md`：C/Python 接口口径
 4. `doc/qwen2_test_plan.md`：测试策略与回归规则
 5. `doc/qwen2_next_dev_plan_2026-02.md`：执行计划与未完成清单
+6. `doc/qwen2_cuda_perf_tracking_2026-02-21.md`：本轮 CUDA/cudnn 性能数据、适配现状与问题复盘
 
 ## 2. 归档文档
 

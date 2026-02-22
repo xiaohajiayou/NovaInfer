@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import gc
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
+from test.parity.backend_matrix import parity_device_backend_cases
 from test.test_utils import llaisys_device, torch_device
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
@@ -19,6 +21,24 @@ def _has_nvidia_runtime() -> bool:
         return api.get_device_count() > 0 and torch.cuda.is_available()
     except Exception:
         return False
+
+
+def _set_attn_backend(backend: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    old = os.environ.get(key)
+    if backend is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = backend
+    return old
+
+
+def _restore_attn_backend(old: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    if old is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = old
 
 
 def load_hf_model(model_path: str, device_name: str = "cpu"):
@@ -140,7 +160,10 @@ def llaisys_model_runner_infer(
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-def test_infer_parity(require_model_path):
+@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
+def test_infer_parity(require_model_path, ll_device, backend):
+    if ll_device == "nvidia" and not _has_nvidia_runtime():
+        pytest.skip("NVIDIA runtime unavailable")
     model_path = require_model_path
     prompt = "Who are you?"
     max_steps = 10
@@ -160,12 +183,19 @@ def test_infer_parity(require_model_path):
     del hf_model
     gc.collect()
 
-    model_runner = llaisys.models.Qwen2(
-        model_path=model_path,
-        device=llaisys_device("cpu"),
-        kv_cache_auto_capacity=True,
-    )
+    old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
+    model_runner = None
     try:
+        try:
+            model_runner = llaisys.models.Qwen2(
+                model_path=model_path,
+                device=llaisys_device(ll_device),
+                kv_cache_auto_capacity=True,
+            )
+        except Exception as exc:
+            if ll_device == "nvidia" and backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
         mr_tokens = llaisys_model_runner_infer(
             prompt,
             tokenizer,
@@ -177,7 +207,9 @@ def test_infer_parity(require_model_path):
         )
         assert mr_tokens == hf_tokens
     finally:
-        model_runner.close()
+        if model_runner is not None:
+            model_runner.close()
+        _restore_attn_backend(old_backend)
 
 
 @pytest.mark.requires_model
@@ -210,19 +242,27 @@ def test_infer_smoke(require_model_path):
 
 @pytest.mark.requires_model
 @pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
-def test_infer_smoke_nvidia(require_model_path):
+@pytest.mark.parametrize("backend", ["native", "cudnn"])
+def test_infer_smoke_nvidia(require_model_path, backend):
     model_path = require_model_path
     prompt = "hello"
     max_steps = 2
     top_p, top_k, temperature = 1.0, 1, 1.0
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model_runner = llaisys.models.Qwen2(
-        model_path=model_path,
-        device=llaisys_device("nvidia"),
-        kv_cache_auto_capacity=True,
-    )
+    old_backend = _set_attn_backend(backend)
+    model_runner = None
     try:
+        try:
+            model_runner = llaisys.models.Qwen2(
+                model_path=model_path,
+                device=llaisys_device("nvidia"),
+                kv_cache_auto_capacity=True,
+            )
+        except Exception as exc:
+            if backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
         out_tokens = llaisys_model_runner_infer(
             prompt,
             tokenizer,
@@ -234,4 +274,6 @@ def test_infer_smoke_nvidia(require_model_path):
         )
         assert len(out_tokens) > 0
     finally:
-        model_runner.close()
+        if model_runner is not None:
+            model_runner.close()
+        _restore_attn_backend(old_backend)

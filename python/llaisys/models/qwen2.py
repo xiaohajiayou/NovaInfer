@@ -538,7 +538,11 @@ class Qwen2:
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str:
         tokenizer = self._get_tokenizer()
-        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
 
     def encode_chat_messages(self, messages: Sequence[dict]) -> list[int]:
         tokenizer = self._get_tokenizer()
@@ -547,7 +551,9 @@ class Qwen2:
             add_generation_prompt=True,
             tokenize=False,
         )
-        return [int(t) for t in tokenizer.encode(text)]
+        # apply_chat_template() already materializes model-specific control tokens
+        # into text form; avoid duplicating BOS/EOS by re-adding special tokens.
+        return [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
 
     def decode_batch(
         self,

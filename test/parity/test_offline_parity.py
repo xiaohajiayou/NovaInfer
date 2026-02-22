@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import gc
 
 import pytest
@@ -7,6 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
+from test.parity.backend_matrix import parity_device_backend_cases
 from test.test_utils import llaisys_device, torch_device
 
 
@@ -83,6 +85,23 @@ def load_llaisys_llm(model_path, device_name):
         kv_cache_auto_capacity=True,
     )
 
+def _set_attn_backend(backend: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    old = os.environ.get(key)
+    if backend is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = backend
+    return old
+
+
+def _restore_attn_backend(old: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    if old is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = old
+
 
 def llaisys_offline_infer(
     prompt, tokenizer, llm, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
@@ -106,8 +125,8 @@ def llaisys_offline_infer(
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-@pytest.mark.parametrize("ll_device", ["cpu", "nvidia"])
-def test_offline_parity_single(require_model_path, ll_device):
+@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
+def test_offline_parity_single(require_model_path, ll_device, backend):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
@@ -125,8 +144,15 @@ def test_offline_parity_single(require_model_path, ll_device):
         temperature=temperature,
     )
 
-    llm = load_llaisys_llm(require_model_path, ll_device)
+    old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
+    llm = None
     try:
+        try:
+            llm = load_llaisys_llm(require_model_path, ll_device)
+        except Exception as exc:
+            if ll_device == "nvidia" and backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
         ll_tokens = llaisys_offline_infer(
             prompt,
             tokenizer,
@@ -138,7 +164,9 @@ def test_offline_parity_single(require_model_path, ll_device):
         )
         assert ll_tokens == hf_tokens
     finally:
-        llm.close()
+        if llm is not None:
+            llm.close()
+        _restore_attn_backend(old_backend)
 
     del model
     gc.collect()
@@ -147,8 +175,8 @@ def test_offline_parity_single(require_model_path, ll_device):
 @pytest.mark.requires_model
 @pytest.mark.requires_hf
 @pytest.mark.parity
-@pytest.mark.parametrize("ll_device", ["cpu", "nvidia"])
-def test_offline_parity_multi(require_model_path, ll_device):
+@pytest.mark.parametrize(("ll_device", "backend"), parity_device_backend_cases())
+def test_offline_parity_multi(require_model_path, ll_device, backend):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
     tokenizer, model = load_hf_model(require_model_path, "cpu")
@@ -168,8 +196,15 @@ def test_offline_parity_multi(require_model_path, ll_device):
         )
         hf_expected_completion_tokens.append(completion)
 
-    llm = load_llaisys_llm(require_model_path, ll_device)
+    old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
+    llm = None
     try:
+        try:
+            llm = load_llaisys_llm(require_model_path, ll_device)
+        except Exception as exc:
+            if ll_device == "nvidia" and backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
         outputs = llm.generate(
             MULTI_PROMPTS,
             max_new_tokens=max_steps,
@@ -180,7 +215,9 @@ def test_offline_parity_multi(require_model_path, ll_device):
         for i in range(len(MULTI_PROMPTS)):
             assert outputs[i]["token_ids"] == hf_expected_completion_tokens[i]
     finally:
-        llm.close()
+        if llm is not None:
+            llm.close()
+        _restore_attn_backend(old_backend)
 
     del model
     gc.collect()

@@ -5,7 +5,11 @@ import numpy as np
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import SamplingParams
 from llaisys.server.async_engine import AsyncLLMEngine
-from llaisys.server.openai_server import OpenAIServer
+from llaisys.server.openai_server import (
+    OpenAIServer,
+    _StreamingReasoningState,
+    _ThinkingReasoningParser,
+)
 from llaisys.server.schemas import ChatCompletionRequest, ChatMessage
 
 
@@ -103,3 +107,69 @@ def test_online_concurrent_requests():
     assert out_a.request_id != out_b.request_id
     assert out_a.status.value.startswith("finished_")
     assert out_b.status.value.startswith("finished_")
+
+
+def test_reasoning_parser_non_stream_split():
+    parser = _ThinkingReasoningParser()
+    reasoning, content = parser.extract_reasoning(
+        "<think>internal</think>answer",
+        include_reasoning=False,
+    )
+    assert reasoning is None
+    assert content == "answer"
+
+
+def test_reasoning_parser_non_stream_implicit_prefix_reasoning():
+    parser = _ThinkingReasoningParser()
+    reasoning, content = parser.extract_reasoning(
+        "hidden chain</think>final answer",
+        include_reasoning=False,
+    )
+    assert reasoning is None
+    assert content == "final answer"
+
+
+def test_reasoning_parser_streaming_split():
+    parser = _ThinkingReasoningParser()
+    state = _StreamingReasoningState()
+
+    r1, c1 = parser.extract_reasoning_streaming(
+        state,
+        "<thi",
+        include_reasoning=True,
+        finalize=False,
+    )
+    assert r1 == "<thi"
+    assert c1 is None
+
+    r2, c2 = parser.extract_reasoning_streaming(
+        state,
+        "nk>abc</think>ok",
+        include_reasoning=True,
+        finalize=True,
+    )
+    assert r2 == "nk>abc"
+    assert c2 == "ok"
+
+
+def test_reasoning_parser_streaming_implicit_prefix_reasoning():
+    parser = _ThinkingReasoningParser()
+    state = _StreamingReasoningState()
+
+    r1, c1 = parser.extract_reasoning_streaming(
+        state,
+        "hidden chain",
+        include_reasoning=False,
+        finalize=False,
+    )
+    assert r1 is None
+    assert c1 is None
+
+    r2, c2 = parser.extract_reasoning_streaming(
+        state,
+        "</think>final answer",
+        include_reasoning=False,
+        finalize=True,
+    )
+    assert r2 is None
+    assert c2 == "final answer"

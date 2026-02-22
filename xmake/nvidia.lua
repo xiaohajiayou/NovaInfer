@@ -28,6 +28,17 @@ target("llaisys-ops-cuda")
         add_cuflags("-Xcompiler=-fPIC")
     end
     add_links("cublas")
+    if has_config("nv-cudnn") then
+        add_defines("ENABLE_CUDNN_API")
+        add_links("cudnn")
+        if os.isdir("../third_party/cudnn_frontend/include") then
+            add_defines("ENABLE_CUDNN_FRONTEND")
+            add_sysincludedirs("../third_party/cudnn_frontend/include")
+            if not is_plat("windows") then
+                add_cuflags("-Xcompiler=-Wno-unused-function")
+            end
+        end
+    end
     add_files("../src/ops/*/cuda/*.cu")
 
     on_install(function (target) end)

@@ -101,6 +101,10 @@ private:
 #ifdef ENABLE_NVIDIA_API
     // Step-level paged-attention metadata uploaded once and reused by all layers.
     ops::cuda::PagedAttentionPrepared paged_attn_prepared_{};
+    // Switch point for staged FlashInfer migration (NATIVE by default).
+    ops::cuda::PagedAttentionBackend paged_attn_backend_{ops::cuda::PagedAttentionBackend::NATIVE};
+    // Reused CUDA buffer for slot mapping of current decode step.
+    tensor_t slot_idxs_i32_{};
 #endif
 
     bool validate_decode_batch_(const LlaisysBatch &batch) const;
@@ -114,6 +118,7 @@ private:
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
     void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
+    tensor_t upload_slot_indices_(const std::vector<int32_t> &slot_idxs);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
 

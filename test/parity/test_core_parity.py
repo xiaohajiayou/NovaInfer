@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from ctypes import c_int32
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
+from test.parity.backend_matrix import parity_device_backend_cases
 from llaisys.libllaisys import LIB_LLAISYS
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
@@ -19,6 +21,24 @@ def _has_nvidia_runtime() -> bool:
         return api.get_device_count() > 0 and torch.cuda.is_available()
     except Exception:
         return False
+
+
+def _set_attn_backend(backend: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    old = os.environ.get(key)
+    if backend is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = backend
+    return old
+
+
+def _restore_attn_backend(old: str | None):
+    key = "LLAISYS_CUDA_PAGED_ATTN_BACKEND"
+    if old is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = old
 
 
 def _torch_device(device_name: str):
@@ -184,15 +204,21 @@ def _build_prompt_to_token_ids(tokenizer, prompts):
 @pytest.mark.requires_hf
 @pytest.mark.parity
 @pytest.mark.parametrize(
-    "prompts, ll_device",
+    "prompts, ll_device, backend",
     [
-        (["Who are you?"], "cpu"),
-        (["Who are you?", "Explain KV cache in one sentence."], "cpu"),
-        (["Who are you?"], "nvidia"),
-        (["Who are you?", "Explain KV cache in one sentence."], "nvidia"),
+        (["Who are you?"],) + parity_device_backend_cases()[0],
+        (["Who are you?", "Explain KV cache in one sentence."],) + parity_device_backend_cases()[0],
+        *[
+            (p, d, b)
+            for p in (
+                ["Who are you?"],
+                ["Who are you?", "Explain KV cache in one sentence."],
+            )
+            for d, b in parity_device_backend_cases()[1:]
+        ],
     ],
 )
-def test_core_parity(require_model_path, prompts, ll_device):
+def test_core_parity(require_model_path, prompts, ll_device, backend):
     if ll_device == "nvidia" and not _has_nvidia_runtime():
         pytest.skip("NVIDIA runtime unavailable")
 
@@ -209,13 +235,22 @@ def test_core_parity(require_model_path, prompts, ll_device):
     prompt_ids = _build_prompt_to_token_ids(tokenizer, prompts)
     hf_tokens = _hf_generate_batch(hf_model, prompt_ids, max_new_tokens=5)
 
-    llaisys_model = llaisys.models.Qwen2(
-        require_model_path,
-        llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
-        kv_cache_auto_capacity=True,
-    )
+    old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
+    llaisys_model = None
     try:
+        try:
+            llaisys_model = llaisys.models.Qwen2(
+                require_model_path,
+                llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
+                kv_cache_auto_capacity=True,
+            )
+        except Exception as exc:
+            if ll_device == "nvidia" and backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
         ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
         assert ll_tokens == hf_tokens
     finally:
-        llaisys_model.close()
+        if llaisys_model is not None:
+            llaisys_model.close()
+        _restore_attn_backend(old_backend)

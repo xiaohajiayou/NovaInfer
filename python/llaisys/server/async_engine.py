@@ -77,7 +77,7 @@ class AsyncLLMEngine:
     def close(self):
         if not self._stop_event.is_set():
             self._stop_event.set()
-            self._loop_thread.join()
+            self._loop_thread.join(timeout=2.0)
 
         if not self._engine_closed:
             close_fn = getattr(self._engine, "close", None)
@@ -160,6 +160,25 @@ class AsyncLLMEngine:
     def encode_chat_messages(self, messages: list[dict]) -> list[int]:
         worker = self._engine._worker  # noqa: SLF001
         return worker.encode_chat_messages(messages)
+
+    def get_default_sampling_params(self) -> dict:
+        worker = self._engine._worker  # noqa: SLF001
+        fn = getattr(worker, "get_default_sampling_params", None)
+        if callable(fn):
+            try:
+                out = fn()
+                if isinstance(out, dict):
+                    return out
+            except Exception:
+                pass
+        return {"temperature": 1.0, "top_p": 1.0, "top_k": 0}
+
+    def get_max_model_len(self) -> int:
+        worker = self._engine._worker  # noqa: SLF001
+        try:
+            return int(worker.max_seq_len)
+        except Exception:
+            return 4096
 
     @property
     def inner_engine(self) -> LLMEngine:

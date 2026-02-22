@@ -8,6 +8,12 @@ const debugLog = document.getElementById("debugLog");
 const sessionList = document.getElementById("sessionList");
 const newSessionBtn = document.getElementById("newSessionBtn");
 const sessionTitle = document.getElementById("sessionTitle");
+const useServerDefaults = document.getElementById("useServerDefaults");
+const maxTokensInput = document.getElementById("maxTokensInput");
+const topKInput = document.getElementById("topKInput");
+const topPInput = document.getElementById("topPInput");
+const temperatureInput = document.getElementById("temperatureInput");
+const PROMPT_MAX_HEIGHT_PX = 140;
 
 let sessions = [];
 let currentSessionId = null;
@@ -15,6 +21,36 @@ let sessionSeq = 0;
 
 function nowMs() {
   return Date.now();
+}
+
+function resizePromptInput() {
+  promptInput.style.height = "auto";
+  const next = Math.min(promptInput.scrollHeight, PROMPT_MAX_HEIGHT_PX);
+  promptInput.style.height = `${next}px`;
+}
+
+function bindExclusivePanels() {
+  const panels = Array.from(document.querySelectorAll(".panel-toggle"));
+  for (const panel of panels) {
+    panel.addEventListener("toggle", () => {
+      if (!panel.open) return;
+      for (const other of panels) {
+        if (other !== panel) {
+          other.open = false;
+        }
+      }
+    });
+  }
+
+  document.addEventListener("mousedown", (e) => {
+    const target = e.target;
+    if (!(target instanceof Node)) return;
+    for (const panel of panels) {
+      if (!panel.contains(target)) {
+        panel.open = false;
+      }
+    }
+  });
 }
 
 function createSession() {
@@ -73,14 +109,46 @@ function renderSessions() {
 function renderChat() {
   const s = currentSession();
   if (!s) return;
+  const prevTop = chatLog.scrollTop;
+  const stickToBottom =
+    chatLog.scrollHeight - chatLog.clientHeight - chatLog.scrollTop < 24;
   chatLog.innerHTML = "";
   for (const m of s.messages) {
     const el = document.createElement("div");
     el.className = `msg ${m.role}`;
-    el.textContent = m.text;
+    if (m.role === "assistant") {
+      const details = document.createElement("details");
+      details.className = "assistant-reasoning";
+      details.open = m.reasoningOpen !== false;
+      const summary = document.createElement("summary");
+      summary.textContent = m.reasoningRunning ? "思考中..." : "思考过程";
+      const body = document.createElement("pre");
+      body.className = "assistant-reasoning-body";
+      body.textContent =
+        typeof m.reasoning === "string" && m.reasoning.length > 0
+          ? m.reasoning
+          : (m.reasoningRunning ? "思考中..." : "（无思考内容）");
+      details.addEventListener("toggle", () => {
+        m.reasoningOpen = details.open;
+      });
+      details.appendChild(summary);
+      details.appendChild(body);
+      el.appendChild(details);
+
+      const answer = document.createElement("div");
+      answer.className = "assistant-answer";
+      answer.textContent = m.text || "";
+      el.appendChild(answer);
+    } else {
+      el.textContent = m.text;
+    }
     chatLog.appendChild(el);
   }
-  chatLog.scrollTop = chatLog.scrollHeight;
+  if (stickToBottom) {
+    chatLog.scrollTop = chatLog.scrollHeight;
+  } else {
+    chatLog.scrollTop = prevTop;
+  }
 }
 
 function renderDebugStats() {
@@ -103,7 +171,10 @@ function renderControls() {
   const s = currentSession();
   if (!s) return;
   const running = Boolean(s.activeRequestId);
-  sendBtn.disabled = running;
+  sendBtn.disabled = false;
+  sendBtn.classList.toggle("is-running", running);
+  sendBtn.setAttribute("aria-label", running ? "Cancel" : "Send");
+  sendBtn.title = running ? "Cancel running request" : "Send";
   cancelBtn.disabled = !running;
 }
 
@@ -132,8 +203,12 @@ async function sendPrompt() {
   if (!prompt) return;
 
   promptInput.value = "";
+  resizePromptInput();
   appendMessage(s, "user", prompt);
   const assistantIndex = appendMessage(s, "assistant", "");
+  s.messages[assistantIndex].reasoning = "";
+  s.messages[assistantIndex].reasoningOpen = true;
+  s.messages[assistantIndex].reasoningRunning = true;
   s.reqStartedAtMs = nowMs();
   s.firstChunkAtMs = 0;
   s.chunkCount = 0;
@@ -145,12 +220,19 @@ async function sendPrompt() {
   const payload = {
     model: "qwen2",
     stream: true,
-    max_tokens: 32,
-    top_k: 1,
-    top_p: 1.0,
-    temperature: 1.0,
+    include_reasoning: true,
     messages: [{ role: "user", content: prompt }],
   };
+  if (!useServerDefaults.checked) {
+    const maxTokens = Number.parseInt(maxTokensInput.value, 10);
+    const topK = Number.parseInt(topKInput.value, 10);
+    const topP = Number.parseFloat(topPInput.value);
+    const temperature = Number.parseFloat(temperatureInput.value);
+    if (Number.isFinite(maxTokens) && maxTokens > 0) payload.max_tokens = maxTokens;
+    if (Number.isFinite(topK) && topK >= 0) payload.top_k = topK;
+    if (Number.isFinite(topP) && topP >= 0) payload.top_p = topP;
+    if (Number.isFinite(temperature) && temperature >= 0) payload.temperature = temperature;
+  }
 
   const url = `${serverBase.value.replace(/\/$/, "")}/v1/chat/completions`;
   const resp = await fetch(url, {
@@ -186,9 +268,13 @@ async function sendPrompt() {
       const payloadText = frame.slice(5).trim();
       if (payloadText === "[DONE]") {
         logDebug(s, "stream done");
+        s.messages[assistantIndex].reasoningRunning = false;
         s.activeRequestId = null;
         setSessionStatus(s, "done");
         renderSessions();
+        if (s.id === currentSessionId) {
+          renderChat();
+        }
         continue;
       }
       try {
@@ -200,24 +286,28 @@ async function sendPrompt() {
         }
         s.chunkCount += 1;
         const delta = obj?.choices?.[0]?.delta?.content || "";
+        const reasoningDelta = obj?.choices?.[0]?.delta?.reasoning || "";
         const doneFlag = Boolean(obj?.is_finished);
         const tokenId = obj?.token_id;
         logDebug(
           s,
-          `chunk#${s.chunkCount} req=${s.activeRequestId} token_id=${tokenId} done=${doneFlag} delta_len=${delta.length} delta=${JSON.stringify(delta)}`
+          `chunk#${s.chunkCount} req=${s.activeRequestId} token_id=${tokenId} done=${doneFlag} delta_len=${delta.length} reasoning_len=${reasoningDelta.length} delta=${JSON.stringify(delta)}`
         );
         setSessionStatus(s, doneFlag ? "finishing" : "streaming");
-        const renderDelta =
-          delta.length > 0
-            ? delta
-            : tokenId !== null && tokenId !== undefined
-              ? `<${tokenId}>`
-              : "";
+        const renderDelta = delta.length > 0 ? delta : "";
         s.messages[assistantIndex].text += renderDelta;
+        if (reasoningDelta.length > 0) {
+          if (typeof s.messages[assistantIndex].reasoning !== "string") {
+            s.messages[assistantIndex].reasoning = "";
+          }
+          s.messages[assistantIndex].reasoning += reasoningDelta;
+        }
         if (s.id === currentSessionId) {
           renderChat();
         }
-        renderSessions();
+        if (doneFlag) {
+          s.messages[assistantIndex].reasoningRunning = false;
+        }
       } catch (err) {
         appendMessage(s, "meta", `parse error: ${String(err)}`);
         logDebug(s, `parse error: ${String(err)}`);
@@ -262,8 +352,8 @@ newSessionBtn.addEventListener("click", () => {
   renderAll();
 });
 
-sendBtn.addEventListener("click", () => {
-  sendPrompt().catch((err) => {
+function sendWithErrorHandling() {
+  return sendPrompt().catch((err) => {
     const s = currentSession();
     if (!s) return;
     appendMessage(s, "meta", `request error: ${String(err)}`);
@@ -273,19 +363,49 @@ sendBtn.addEventListener("click", () => {
     renderSessions();
     renderControls();
   });
-});
+}
 
-cancelBtn.addEventListener("click", () => {
-  cancelRequest().catch((err) => {
+function cancelWithErrorHandling() {
+  return cancelRequest().catch((err) => {
     const s = currentSession();
     if (!s) return;
     logDebug(s, `cancel error: ${String(err)}`);
     setSessionStatus(s, "cancel_error");
   });
+}
+
+sendBtn.addEventListener("click", () => {
+  const s = currentSession();
+  if (!s) return;
+  if (s.activeRequestId) {
+    cancelWithErrorHandling();
+    return;
+  }
+  sendWithErrorHandling();
+});
+
+cancelBtn.addEventListener("click", () => {
+  cancelWithErrorHandling();
+});
+
+promptInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.shiftKey || e.isComposing) {
+    return;
+  }
+  e.preventDefault();
+  const s = currentSession();
+  if (!s || s.activeRequestId) return;
+  sendWithErrorHandling();
+});
+
+promptInput.addEventListener("input", () => {
+  resizePromptInput();
 });
 
 // Init with one session.
 const initial = createSession();
 sessions.push(initial);
 currentSessionId = initial.id;
+bindExclusivePanels();
+resizePromptInput();
 renderAll();

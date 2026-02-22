@@ -37,8 +37,8 @@ class RequestState:
 
 @dataclass(frozen=True)
 class SamplingParams:
-    max_new_tokens: Optional[int] = None
-    top_k: int = 1
+    max_new_tokens: Optional[int] = 16
+    top_k: int = 0
     top_p: float = 1.0
     temperature: float = 1.0
     seed: Optional[int] = None

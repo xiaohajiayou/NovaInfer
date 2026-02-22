@@ -2,6 +2,8 @@
 #include "../runtime/kv_cache/paged_kv.hpp"
 #include "../runtime/kv_cache/unified_kv.hpp"
 #include "../../core/llaisys_core.hpp"
+#include <cctype>
+#include <cstdlib>
 
 namespace llaisys::models::qwen2 {
 
@@ -54,6 +56,24 @@ void runtime_copy_bytes(llaisysDeviceType_t dst_dev, std::byte *dst, llaisysDevi
     api->memcpy_sync(dst, src, nbytes, choose_memcpy_kind(dst_dev, src_dev));
 }
 
+#ifdef ENABLE_NVIDIA_API
+ops::cuda::PagedAttentionBackend parse_paged_attn_backend_env() {
+    const char *raw = std::getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND");
+    if (raw == nullptr) {
+        return ops::cuda::PagedAttentionBackend::NATIVE;
+    }
+    std::string v(raw);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (v == "flashinfer") {
+        return ops::cuda::PagedAttentionBackend::FLASHINFER;
+    }
+    if (v == "cudnn") {
+        return ops::cuda::PagedAttentionBackend::CUDNN;
+    }
+    return ops::cuda::PagedAttentionBackend::NATIVE;
+}
+#endif
+
 } // namespace
 
 Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
@@ -72,6 +92,12 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
     if (device_ids != nullptr && ndevice > 0) {
         device_id_ = device_ids[0];
     }
+
+#ifdef ENABLE_NVIDIA_API
+    if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+        paged_attn_backend_ = parse_paged_attn_backend_env();
+    }
+#endif
 
     check_meta_invariants_();
     init_weight_slots_();
@@ -272,6 +298,25 @@ void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::v
                        nbytes);
 }
 
+tensor_t Qwen2Model::upload_slot_indices_(const std::vector<int32_t> &slot_idxs) {
+#ifdef ENABLE_NVIDIA_API
+    if (slot_idxs.empty()) {
+        return nullptr;
+    }
+    CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_NVIDIA, "Qwen2: slot index upload requires CUDA device");
+    if (slot_idxs_i32_ == nullptr || slot_idxs_i32_->shape().empty() || slot_idxs_i32_->shape()[0] < slot_idxs.size()) {
+        slot_idxs_i32_ = Tensor::create({slot_idxs.size()}, LLAISYS_DTYPE_I32, device_type_, device_id_);
+    }
+    tensor_t out = slot_idxs_i32_->slice(0, 0, slot_idxs.size());
+    const size_t nbytes = slot_idxs.size() * sizeof(int32_t);
+    runtime_copy_bytes(out->deviceType(), out->data(), LLAISYS_DEVICE_CPU, reinterpret_cast<const std::byte *>(slot_idxs.data()), nbytes);
+    return out;
+#else
+    (void)slot_idxs;
+    return nullptr;
+#endif
+}
+
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
     ASSERT(cache->deviceType() == src->deviceType(), "Qwen2: cache/src device mismatch");
     ASSERT(cache->dtype() == src->dtype(), "Qwen2: cache/src dtype mismatch");
@@ -389,6 +434,12 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
     const size_t dh = meta_.dh;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
     const size_t kvlen = used_slots.size();
+#ifdef ENABLE_NVIDIA_API
+    tensor_t slot_idxs_dev{};
+    if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+        slot_idxs_dev = upload_slot_indices_(slot_idxs);
+    }
+#endif
 
     // Shared transformer forward path. SLOT/BLOCK differ only in attention input form
     // (dense mask vs CSR paged plan), then merge into the same per-layer pipeline.
@@ -418,21 +469,30 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
 
         tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
         tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
-        for (size_t i = 0; i < ntoken; ++i) {
-            copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
-            copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
+#ifdef ENABLE_NVIDIA_API
+        if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+            ops::cuda::scatter_kv_cache_by_slots_device_indices(
+                layer_k_cache, layer_v_cache, rope_k, v_new_3d, slot_idxs_dev);
+        } else
+#endif
+        {
+            for (size_t i = 0; i < ntoken; ++i) {
+                copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
+                copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
+            }
         }
 
         tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
         if (paged_attention) {
 #ifdef ENABLE_NVIDIA_API
             if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
-                ops::cuda::self_attention_paged_prepared(
+                ops::cuda::self_attention_paged_prepared_with_backend(
                     attn_out,
                     rope_q,
                     layer_k_cache,
                     layer_v_cache,
                     paged_attn_prepared_,
+                    paged_attn_backend_,
                     block_table_width,
                     static_cast<int32_t>(kv_block_size_),
                     scale);
@@ -630,8 +690,17 @@ int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
 
 #ifdef ENABLE_NVIDIA_API
     if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
-        // vLLM-style: prepare/upload attention metadata once per decode step.
-        ops::cuda::prepare_paged_attention(paged_attn_prepared_, q_seq_rows, q_pos, block_tables, seq_lens);
+        // Always keep device metadata fresh. cuDNN path can fallback to native at
+        // runtime (build/exec failure), and native path requires device metadata.
+        const bool upload_device_metadata = true;
+        ops::cuda::prepare_paged_attention(
+            paged_attn_prepared_,
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            static_cast<int32_t>(kv_block_size_),
+            upload_device_metadata);
     }
 #endif
 

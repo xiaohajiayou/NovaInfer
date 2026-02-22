@@ -164,9 +164,21 @@ xmake
 xmake install
 ```
 
+Linux (CUDA/NVIDIA + cuDNN backend scaffolding):
+
+```bash
+xmake f -m release --nv-gpu=y --nv-cudnn=y
+xmake
+xmake install
+```
+
+If `third_party/cudnn_frontend/include` exists, build enables `ENABLE_CUDNN_FRONTEND` automatically.
+This is the expected path for implementing real cuDNN SDPA paged attention.
+
 Notes:
 
 - `--nv-gpu` is a configure option, so run it with `xmake f ...` first.
+- `--nv-cudnn` is optional and only meaningful together with `--nv-gpu=y`.
 - `xmake --nv-gpu ...` is not a valid replacement for `xmake f --nv-gpu=...`.
 - If you switch between CPU/CUDA modes, rerun `xmake f ...` to refresh config.
 
@@ -194,14 +206,14 @@ pytest
 Run parity tests with local model path:
 
 ```bash
-pytest -vv --model-path /home/hacode/NovaInfer/models/DeepSeek-R1-Distill-Qwen-1.5B -m parity
+pytest -vv --model-path models/DeepSeek-R1-Distill-Qwen-1.5B -m parity
 ```
 
 Run real-model multi-session stream regression (reproduces WebUI concurrent chat path):
 
 ```bash
 pytest -vv test/test_online_real_model_multisession.py \
-  --model-path /home/hacode/NovaInfer/models/DeepSeek-R1-Distill-Qwen-1.5B
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B
 ```
 
 Run stage suites:
@@ -232,11 +244,46 @@ PYTHONPATH=python python -c "import llaisys; print('ok')"
 
 ### 1. Start API server
 
+CPU:
+
 ```bash
 PYTHONPATH=python python -m llaisys.server \
-  --model-path /home/hacode/NovaInfer/models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
   --model-type qwen2 \
   --device cpu \
+  --kv-cache-capacity-mode auto \
+  --kv-cache-memory-utilization 0.9 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --verbose
+```
+
+NVIDIA (native paged attention):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=python python -m llaisys.server \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --model-type qwen2 \
+  --device nvidia \
+  --kv-cache-capacity-mode auto \
+  --kv-cache-memory-utilization 0.9 \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --verbose
+```
+
+NVIDIA (cuDNN paged attention backend):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+PYTHONPATH=python python -m llaisys.server \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --model-type qwen2 \
+  --device nvidia \
+  --kv-cache-capacity-mode auto \
+  --kv-cache-memory-utilization 0.9 \
   --host 127.0.0.1 \
   --port 8000 \
   --verbose

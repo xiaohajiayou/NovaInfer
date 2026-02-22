@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -32,6 +33,11 @@ class LLM:
     ):
         self._model_path = Path(model)
         self._tokenizer = None
+        self._configure_cudnn_prebuild_hint_(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            kv_cache_block_size=kv_cache_block_size,
+        )
         cfg = EngineConfig(
             model_type=model_type,
             model_path=model,
@@ -51,11 +57,38 @@ class LLM:
         )
         self._engine_client = EngineClient(engine)
 
+    def _configure_cudnn_prebuild_hint_(
+        self,
+        max_num_seqs: int | None,
+        max_model_len: int | None,
+        kv_cache_block_size: int,
+    ) -> None:
+        # Auto-derive cuDNN prebuild bucket from scheduler shape limits.
+        backend = os.environ.get("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "").strip().lower()
+        if backend != "cudnn":
+            return
+
+        # Respect explicit user override if already set.
+        if not os.environ.get("LLAISYS_CUDNN_PREBUILD_MAX_B"):
+            seq_cap = max(1, int(max_num_seqs)) if max_num_seqs is not None else 8
+            b_hint = 1
+            while b_hint < seq_cap:
+                b_hint <<= 1
+            b_hint = max(64, b_hint)
+            os.environ["LLAISYS_CUDNN_PREBUILD_MAX_B"] = str(b_hint)
+
+        # Stabilize page-table capacity across decode steps by using config upper
+        # bound, so cuDNN does not repeatedly rebuild plans on width growth.
+        if not os.environ.get("LLAISYS_CUDNN_BLOCK_TABLE_CAP"):
+            if max_model_len is not None and int(max_model_len) > 0 and int(kv_cache_block_size) > 0:
+                cap = max(1, int(max_model_len) // int(kv_cache_block_size))
+                os.environ["LLAISYS_CUDNN_BLOCK_TABLE_CAP"] = str(cap)
+
     def submit(
         self,
         inputs: Sequence[int] | str,
-        max_new_tokens: Optional[int] = None,
-        top_k: int = 1,
+        max_new_tokens: Optional[int] = 16,
+        top_k: int = 0,
         top_p: float = 1.0,
         temperature: float = 1.0,
         stop_token_ids: Optional[Sequence[int]] = None,
@@ -83,8 +116,8 @@ class LLM:
     def stream(
         self,
         inputs: Sequence[int] | str,
-        max_new_tokens: Optional[int] = None,
-        top_k: int = 1,
+        max_new_tokens: Optional[int] = 16,
+        top_k: int = 0,
         top_p: float = 1.0,
         temperature: float = 1.0,
         stop_token_ids: Optional[Sequence[int]] = None,
@@ -121,8 +154,8 @@ class LLM:
         self,
         inputs,
         sampling_params: SamplingParams | list[SamplingParams] | None = None,
-        max_new_tokens: Optional[int] = None,
-        top_k: int = 1,
+        max_new_tokens: Optional[int] = 16,
+        top_k: int = 0,
         top_p: float = 1.0,
         temperature: float = 1.0,
         stop_token_ids: Optional[Sequence[int]] = None,

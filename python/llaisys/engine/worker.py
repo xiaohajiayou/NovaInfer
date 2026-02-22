@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ..libllaisys import DeviceType
@@ -152,3 +153,34 @@ class Worker:
         # Fallback for dummy runners in tests.
         text = "\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
         return [int(b) for b in text.encode("utf-8")]
+
+    def get_default_sampling_params(self) -> dict:
+        # vLLM-like neutral defaults. Note: for OpenAI chat, max_tokens default
+        # is derived from context window (not a fixed 16).
+        out: dict[str, int | float] = {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": 0,
+        }
+
+        if self._model_path is None:
+            return out
+        gen_cfg_path = self._model_path / "generation_config.json"
+        if not gen_cfg_path.exists():
+            return out
+        try:
+            with gen_cfg_path.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception:
+            return out
+
+        if cfg.get("temperature") is not None:
+            out["temperature"] = float(cfg["temperature"])
+        if cfg.get("top_p") is not None:
+            out["top_p"] = float(cfg["top_p"])
+        if cfg.get("top_k") is not None:
+            out["top_k"] = int(cfg["top_k"])
+        # HF max_new_tokens corresponds to vLLM/NovaInfer max_tokens.
+        if cfg.get("max_new_tokens") is not None:
+            out["max_tokens"] = int(cfg["max_new_tokens"])
+        return out

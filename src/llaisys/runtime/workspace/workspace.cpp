@@ -116,12 +116,16 @@ tensor_t Qwen2Workspace::slice_u8_(const Layout &layout,
 
 void Qwen2Workspace::reserve(size_t ntoken) {
     CHECK_ARGUMENT(ntoken > 0, "workspace: ntoken must be > 0");
+    size_t target_cap = 1;
+    while (target_cap < ntoken) {
+        target_cap <<= 1;
+    }
     // Grow-only: reuse current arenas when capacity already satisfies request.
-    if (token_cap_ >= ntoken && main_arena_ != nullptr && i64_arena_ != nullptr && u8_arena_ != nullptr) {
+    if (token_cap_ >= target_cap && main_arena_ != nullptr && i64_arena_ != nullptr && u8_arena_ != nullptr) {
         return;
     }
 
-    token_cap_ = ntoken;
+    token_cap_ = target_cap;
     const Layout layout = build_layout_(token_cap_);
 
     main_arena_ = make_tensor({layout.total_main}, dtype_, device_type_, device_id_);
