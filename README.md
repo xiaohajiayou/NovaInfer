@@ -1,21 +1,32 @@
 # NovaInfer
 
-## Current Status (As-Built, 2026-02-11)
+## Current Status
 
-Core (C++) current state:
+Core/runtime:
 
-- `llaisysModelDecode` now executes one real batch step (no per-token `infer(..., 1)` loop).
-- KV cache is unified cell-first metadata:
-  - one slot can be attached to multiple `seq_id` (shared prefix semantics);
-  - decode path supports `n_seq_id > 1` per token.
-- attention isolation for mixed sequences is mask-based in one forward pass:
-  - visibility rule = `intersect(query_seq_ids, slot_seq_ids) && slot_pos <= query_pos`.
-- C API surface is unchanged (`llaisysModel*`), so Python/Engine call sites remain compatible.
+- `llaisysModelDecode` runs true batched decode (no per-token `infer(..., 1)` loop).
+- KV cache supports both `block` and `slot` layouts.
+- Prefix-sharing semantics are enabled in block layout via shared slot metadata.
+- NVIDIA paged attention backend is selectable via environment:
+  - `LLAISYS_CUDA_PAGED_ATTN_BACKEND=native`
+  - `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
 
-Known limits (still true):
+Server/streaming:
 
-- Sliding-window KV policy is not implemented.
-- current masked attention path is correctness-first; performance optimization is stage-3 scope.
+- OpenAI-compatible chat API supports non-stream and SSE stream.
+- Reasoning/content are parsed into separate fields (`reasoning`, `content`) in OpenAI responses.
+- Async stream race issues (late subscribe losing prefix tokens / terminal chunk before last token) have been fixed.
+
+Testing/CI:
+
+- Pytest supports axis filtering: `--device`, `--layout`, `--backend`.
+- Real-model parity covers CPU and NVIDIA paths; NVIDIA includes `native` and `cudnn`.
+- CI model is aligned to `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`.
+
+Known limits:
+
+- Sliding-window KV policy is not implemented yet.
+- Attention kernel path is functional-first; `cudnn` backend is still being optimized vs `native`/vLLM-class kernels.
 
 ## System Architecture & Sequence
 
@@ -144,47 +155,40 @@ sequenceDiagram
   end
 ```
 
-## Quick Start
+## Build
 
 ### 1. Build native library
 
-Linux/macOS (CPU):
+CPU (Linux):
 
 ```bash
-xmake f -m release --nv-gpu=n
-xmake
+xmake f --mode=release --nv-gpu=n
+xmake -j
 xmake install
 ```
 
-Linux (CUDA/NVIDIA):
+NVIDIA CUDA:
 
 ```bash
-xmake f -m release --nv-gpu=y
-xmake
+xmake f --mode=release --nv-gpu=y
+xmake -j
 xmake install
 ```
 
-Linux (CUDA/NVIDIA + cuDNN backend scaffolding):
+NVIDIA CUDA + cuDNN frontend (for `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`):
 
 ```bash
-xmake f -m release --nv-gpu=y --nv-cudnn=y
-xmake
+git submodule update --init --recursive
+xmake f --mode=release --nv-gpu=y --nv-cudnn=y
+xmake -j
 xmake install
 ```
-
-If `third_party/cudnn_frontend/include` exists, build enables `ENABLE_CUDNN_FRONTEND` automatically.
-This is the expected path for implementing real cuDNN SDPA paged attention.
 
 Notes:
 
-- `--nv-gpu` is a configure option, so run it with `xmake f ...` first.
-- `--nv-cudnn` is optional and only meaningful together with `--nv-gpu=y`.
-- `xmake --nv-gpu ...` is not a valid replacement for `xmake f --nv-gpu=...`.
-- If you switch between CPU/CUDA modes, rerun `xmake f ...` to refresh config.
-
-The install step copies the shared library into `python/llaisys/libllaisys/`.
-If you run `xmake` only, the new `.so/.dylib` is generated under `build/...` and may not be the one Python loads.
-In that case, run `xmake install` (recommended) or copy the built library to `python/llaisys/libllaisys/` manually.
+- `xmake f ...` configures build mode/options; rerun it when switching CPU/GPU/cudnn.
+- `xmake install` is required so Python loads the latest library from `python/llaisys/libllaisys/`.
+- If `third_party/cudnn_frontend` submodule is missing, cuDNN frontend build path will not be available.
 
 ### 2. Install Python package
 
@@ -192,59 +196,13 @@ In that case, run `xmake install` (recommended) or copy the built library to `py
 pip install -e ./python[test]
 ```
 
-`pytest` is configured as a test extra (not a base dependency).
-If you run only `pip install -e ./python`, test dependencies such as `pytest` will not be installed.
-
-### 3. Run tests (pytest)
-
-Run all default tests:
-
-```bash
-pytest
-```
-
-Run parity tests with local model path:
-
-```bash
-pytest -vv --model-path models/DeepSeek-R1-Distill-Qwen-1.5B -m parity
-```
-
-Run real-model multi-session stream regression (reproduces WebUI concurrent chat path):
-
-```bash
-pytest -vv test/test_online_real_model_multisession.py \
-  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B
-```
-
-Run stage suites:
-
-```bash
-python scripts/run_tests.py --suite stage0 --run-parity never --run-hf never
-python scripts/run_tests.py --suite stage1 --run-parity never
-python scripts/run_tests.py --suite stage2
-```
-
-## macOS Notes
-
-- Current macOS support is CPU-only (`--device cpu`).
-- NVIDIA/CUDA path is not available on macOS.
-- After `xmake install`, verify native library is present:
-
-```bash
-ls python/llaisys/libllaisys/libllaisys.dylib
-```
-
-- Quick sanity check:
-
-```bash
-PYTHONPATH=python python -c "import llaisys; print('ok')"
-```
+`[test]` extra installs pytest and related deps.
 
 ## Run Inference Services
 
 ### 1. Start API server
 
-CPU:
+CPU backend:
 
 ```bash
 PYTHONPATH=python python -m llaisys.server \
@@ -258,7 +216,7 @@ PYTHONPATH=python python -m llaisys.server \
   --verbose
 ```
 
-NVIDIA (native paged attention):
+NVIDIA backend (native paged attention):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -273,7 +231,7 @@ PYTHONPATH=python python -m llaisys.server \
   --verbose
 ```
 
-NVIDIA (cuDNN paged attention backend):
+NVIDIA backend (cuDNN paged attention):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -303,6 +261,12 @@ python -m http.server 8081 -d webui
 
 Open `http://127.0.0.1:8081` and set server URL to `http://127.0.0.1:8000`.
 
+Backend selection summary:
+
+- `--device cpu`: CPU runner (no CUDA backend switch).
+- `--device nvidia` + no env `LLAISYS_CUDA_PAGED_ATTN_BACKEND`: default native paged attention backend.
+- `--device nvidia` + `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`: cuDNN paged attention backend.
+
 ## Manual API Debug
 
 Non-stream:
@@ -325,6 +289,75 @@ Cancel request:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/v1/requests/<request_id>/cancel
+```
+
+## Run Tests
+
+### 1. Test axis filters
+
+`pytest` supports these global filters:
+
+- `--device {all,cpu,nvidia}`
+- `--layout {all,slot,block}`
+- `--backend {all,native,cudnn}`
+- `--model-path <local_model_dir>` for tests marked `requires_model`
+
+Examples:
+
+Run all CPU + native + block tests:
+
+```bash
+PYTHONPATH=python python -m pytest -q --device cpu --layout block --backend native
+```
+
+Run only NVIDIA + cuDNN tests:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --device nvidia --layout block --backend cudnn
+```
+
+### 2. Recommended smoke commands
+
+Core/offline/online (no real model):
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/core \
+  test/engine \
+  test/offline \
+  test/online/test_online.py \
+  test/online/test_online_http.py \
+  test/online/test_online_stream_isolation.py \
+  --device cpu --layout block --backend native
+```
+
+Parity (real model):
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/parity/test_core_parity.py \
+  test/parity/test_offline_parity.py \
+  test/parity/test_infer.py \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --device all --layout all --backend all
+```
+
+Online real-model regression:
+
+```bash
+PYTHONPATH=python python -m pytest -q \
+  test/online/test_online_real_model_multisession.py \
+  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --device nvidia --layout block --backend all
+```
+
+### 3. CI helper script (optional)
+
+```bash
+python scripts/run_tests.py --suite all --run-parity never --run-hf never
+python scripts/run_tests.py --suite stage2 --model-path models/DeepSeek-R1-Distill-Qwen-1.5B
 ```
 
 ## Notes

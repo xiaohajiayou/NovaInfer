@@ -198,9 +198,37 @@ def _available_memory_bytes(device: DeviceType) -> int:
                     elif line.startswith("MemTotal:"):
                         mem_total_kb = int(line.split()[1])
         except Exception:
-            return 0
+            pass
         kb = mem_avail_kb if mem_avail_kb > 0 else mem_total_kb
-        return int(kb) * 1024
+        if kb > 0:
+            return int(kb) * 1024
+
+        # Windows fallback: GlobalMemoryStatusEx.
+        try:
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
+            if int(ok) != 0:
+                avail = int(stat.ullAvailPhys)
+                total = int(stat.ullTotalPhys)
+                return avail if avail > 0 else total
+        except Exception:
+            pass
+
+        return 0
 
     if device == DeviceType.NVIDIA:
         cudart = None
