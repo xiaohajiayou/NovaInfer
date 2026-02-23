@@ -1,5 +1,8 @@
 #include "op.hpp"
 #include "cpu/linear_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "cuda/linear_cuda.hpp"
+#endif
 
 namespace llaisys::ops {
 void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
@@ -14,6 +17,10 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     switch (out->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::linear(out, in, weight, bias);
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return cuda::linear(out, in, weight, bias);
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
     }

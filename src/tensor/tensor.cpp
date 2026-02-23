@@ -6,6 +6,19 @@
 #include <numeric>
 #include <sstream>
 
+#ifdef ENABLE_NVIDIA_API
+namespace llaisys::device::nvidia {
+void contiguous_strided_copy(void *dst,
+                             const void *src,
+                             const size_t *shape,
+                             const ptrdiff_t *strides,
+                             size_t ndim,
+                             size_t numel,
+                             size_t elem_size,
+                             llaisysStream_t stream);
+} // namespace llaisys::device::nvidia
+#endif
+
 namespace llaisys {
 
 Tensor::Tensor(TensorMeta meta, core::storage_t storage, size_t offset)
@@ -232,18 +245,130 @@ void Tensor::load(const void *src_) {
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (this->isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto out = create(this->shape(), this->dtype(), this->deviceType(), this->deviceId());
+    const size_t elem_size = this->elementSize();
+    const size_t ndim_ = this->ndim();
+    const auto &shape_ = this->shape();
+    const auto &strides_ = this->strides();
+    const size_t total = this->numel();
+    std::vector<size_t> idx(ndim_, 0);
+    std::vector<std::byte> host_out(total * elem_size);
+
+    if (this->deviceType() == LLAISYS_DEVICE_CPU) {
+        const std::byte *src = this->data();
+        for (size_t linear = 0; linear < total; ++linear) {
+            ptrdiff_t src_elem_offset = 0;
+            for (size_t d = 0; d < ndim_; ++d) {
+                src_elem_offset += static_cast<ptrdiff_t>(idx[d]) * strides_[d];
+            }
+            std::memcpy(host_out.data() + linear * elem_size, src + static_cast<size_t>(src_elem_offset) * elem_size, elem_size);
+
+            for (size_t r = ndim_; r > 0; --r) {
+                const size_t d = r - 1;
+                idx[d] += 1;
+                if (idx[d] < shape_[d]) {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
+        std::memcpy(out->data(), host_out.data(), host_out.size());
+        return out;
+    }
+
+    // Fast path for NVIDIA device tensors: do strided gather directly on device.
+#ifdef ENABLE_NVIDIA_API
+    if (this->deviceType() == LLAISYS_DEVICE_NVIDIA) {
+        core::context().setDevice(this->deviceType(), this->deviceId());
+        device::nvidia::contiguous_strided_copy(out->data(),
+                                                this->data(),
+                                                shape_.data(),
+                                                strides_.data(),
+                                                ndim_,
+                                                total,
+                                                elem_size,
+                                                core::context().runtime().stream());
+        core::context().runtime().synchronize();
+        return out;
+    }
+#endif
+
+    // Conservative device fallback: stage visible storage tail to host, gather on host, copy back.
+    const size_t staged_bytes = _storage->size() - _offset;
+    std::vector<std::byte> host_stage(staged_bytes);
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    core::context().runtime().api()->memcpy_sync(host_stage.data(), this->data(), staged_bytes, LLAISYS_MEMCPY_D2H);
+    const std::byte *src_stage = host_stage.data();
+
+    for (size_t linear = 0; linear < total; ++linear) {
+        ptrdiff_t src_elem_offset = 0;
+        for (size_t d = 0; d < ndim_; ++d) {
+            src_elem_offset += static_cast<ptrdiff_t>(idx[d]) * strides_[d];
+        }
+        std::memcpy(host_out.data() + linear * elem_size, src_stage + static_cast<size_t>(src_elem_offset) * elem_size, elem_size);
+
+        for (size_t r = ndim_; r > 0; --r) {
+            const size_t d = r - 1;
+            idx[d] += 1;
+            if (idx[d] < shape_[d]) {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+
+    core::context().setDevice(out->deviceType(), out->deviceId());
+    core::context().runtime().api()->memcpy_sync(out->data(), host_out.data(), host_out.size(), LLAISYS_MEMCPY_H2D);
+    return out;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t n_e = 1;
+    for (size_t d : shape) {
+        n_e *= d;
+    }
+    CHECK_ARGUMENT(n_e == this->numel(), "reshape: shape size mismatch");
+    if (this->isContiguous()) {
+        return this->view(shape);
+    }
+    return this->contiguous()->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    const int dst_device = (device >= 0) ? device : ((device_type == this->deviceType()) ? this->deviceId() : 0);
+    if (device_type == this->deviceType() && dst_device == this->deviceId()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+
+    auto src_ctg = this->isContiguous() ? std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset)) : this->contiguous();
+    auto dst = create(src_ctg->shape(), src_ctg->dtype(), device_type, dst_device);
+    const size_t bytes = src_ctg->numel() * src_ctg->elementSize();
+    if (bytes == 0) {
+        return dst;
+    }
+
+    llaisysMemcpyKind_t kind = LLAISYS_MEMCPY_H2H;
+    if (src_ctg->deviceType() == LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2H;
+        core::context().setDevice(LLAISYS_DEVICE_CPU, 0);
+    } else if (src_ctg->deviceType() == LLAISYS_DEVICE_CPU && device_type != LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_H2D;
+        core::context().setDevice(device_type, dst_device);
+    } else if (src_ctg->deviceType() != LLAISYS_DEVICE_CPU && device_type == LLAISYS_DEVICE_CPU) {
+        kind = LLAISYS_MEMCPY_D2H;
+        core::context().setDevice(src_ctg->deviceType(), src_ctg->deviceId());
+    } else {
+        CHECK_ARGUMENT(src_ctg->deviceType() == device_type, "to: cross-backend device copy is not supported");
+        kind = LLAISYS_MEMCPY_D2D;
+        core::context().setDevice(src_ctg->deviceType(), src_ctg->deviceId());
+    }
+
+    core::context().runtime().api()->memcpy_sync(dst->data(), src_ctg->data(), bytes, kind);
+    return dst;
 }
 
 } // namespace llaisys

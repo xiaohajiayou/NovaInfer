@@ -22,6 +22,10 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
+class KvCacheLayout(IntEnum):
+    SLOT = 0
+    BLOCK = 1
+
 
 class LlaisysBatch(Structure):
     _fields_ = [
@@ -32,6 +36,12 @@ class LlaisysBatch(Structure):
         ("n_seq_id", POINTER(c_int32)),
         ("seq_id", POINTER(POINTER(c_int64))),
         ("logits", POINTER(c_int8)),
+        ("slot_mapping", POINTER(c_int32)),
+        ("context_lens", POINTER(c_int32)),
+        ("batch_seq_ids", POINTER(c_int64)),
+        ("block_tables", POINTER(c_int32)),
+        ("n_batch_seq", c_int32),
+        ("block_table_width", c_int32),
     ]
 
 
@@ -42,6 +52,18 @@ class LlaisysModelCreateParams(Structure):
         ("device", llaisysDeviceType_t),
         ("device_ids", POINTER(c_int)),
         ("ndevice", c_int),
+        ("kv_cache_layout", c_int32),
+        ("kv_cache_block_size", c_int32),
+        ("max_model_len", c_int32),
+        ("kv_cache_capacity_tokens", c_int32),
+    ]
+
+class LlaisysKvStats(Structure):
+    _fields_ = [
+        ("capacity_tokens", c_int64),
+        ("used_tokens", c_int64),
+        ("free_tokens", c_int64),
+        ("peak_used_tokens", c_int64),
     ]
 
 
@@ -91,6 +113,15 @@ def load_model(lib):
     lib.llaisysModelKvSeqPosMax.argtypes = [llaisysModel_t, c_int64]
     lib.llaisysModelKvSeqPosMax.restype = c_int64
 
+    lib.llaisysModelRequestFree.argtypes = [llaisysModel_t, c_int64]
+    lib.llaisysModelRequestFree.restype = c_int
+
+    lib.llaisysModelKvStats.argtypes = [llaisysModel_t, POINTER(LlaisysKvStats)]
+    lib.llaisysModelKvStats.restype = c_int
+
+    lib.llaisysModelKvResetPrefixCache.argtypes = [llaisysModel_t]
+    lib.llaisysModelKvResetPrefixCache.restype = c_int
+
     lib.llaisysBatchInit.argtypes = [c_int32, c_int32, c_int32]
     lib.llaisysBatchInit.restype = LlaisysBatch
 
@@ -104,7 +135,9 @@ def load_model(lib):
 __all__ = [
     "llaisysModel_t",
     "ModelType",
+    "KvCacheLayout",
     "LlaisysBatch",
     "LlaisysModelCreateParams",
+    "LlaisysKvStats",
     "load_model",
 ]

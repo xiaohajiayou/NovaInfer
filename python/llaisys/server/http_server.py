@@ -195,10 +195,31 @@ def _parse_chat_request(payload: dict) -> ChatCompletionRequest:
         messages=messages,
         stream=bool(payload.get("stream", False)),
         max_tokens=payload.get("max_tokens"),
-        top_k=int(payload.get("top_k", 1)),
-        top_p=float(payload.get("top_p", 1.0)),
-        temperature=float(payload.get("temperature", 1.0)),
+        top_k=(int(payload["top_k"]) if "top_k" in payload and payload.get("top_k") is not None else None),
+        top_p=(float(payload["top_p"]) if "top_p" in payload and payload.get("top_p") is not None else None),
+        temperature=(
+            float(payload["temperature"])
+            if "temperature" in payload and payload.get("temperature") is not None
+            else None
+        ),
+        include_reasoning=bool(payload.get("include_reasoning", True)),
         stop=tuple(payload.get("stop", []) or []),
         stop_token_ids=tuple(payload.get("stop_token_ids", []) or []),
-        extra={k: v for k, v in payload.items() if k not in {"model", "messages", "stream", "max_tokens", "top_k", "top_p", "temperature", "stop", "stop_token_ids"}},
+        extra={
+            k: v
+            for k, v in payload.items()
+            if k
+            not in {
+                "model",
+                "messages",
+                "stream",
+                "max_tokens",
+                "top_k",
+                "top_p",
+                "temperature",
+                "include_reasoning",
+                "stop",
+                "stop_token_ids",
+            }
+        },
     )

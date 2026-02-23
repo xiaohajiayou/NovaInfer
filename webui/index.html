@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>NovaInfer Chat</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=20260222m" />
   </head>
   <body>
     <main class="app layout">
@@ -23,24 +23,63 @@
           </div>
         </header>
 
-        <section id="chatLog" class="chat-log"></section>
+      <section id="chatLog" class="chat-log"></section>
 
-        <section class="controls">
-          <textarea id="promptInput" placeholder="Type your message..."></textarea>
-          <div class="buttons">
-            <button id="sendBtn">Send</button>
-            <button id="cancelBtn" class="ghost" disabled>Cancel</button>
+      <section class="controls">
+          <div class="controls-row">
+            <div class="composer">
+              <textarea id="promptInput" rows="1" placeholder="Type your message..."></textarea>
+              <div class="buttons">
+                <button id="sendBtn" class="icon-btn" aria-label="Send">
+                  <span class="icon-send" aria-hidden="true"></span>
+                  <span class="icon-run" aria-hidden="true"></span>
+                </button>
+                <button id="cancelBtn" class="ghost hidden" disabled>Cancel</button>
+              </div>
+            </div>
+            <div class="control-toggles">
+              <details class="panel-toggle sampling-panel">
+                <summary>Sampling</summary>
+                <div class="panel-body">
+                  <div class="sampling-grid">
+                    <label class="full-row">
+                      <input id="useServerDefaults" type="checkbox" checked />
+                      Use server defaults (vLLM-like)
+                    </label>
+                    <label>
+                      max_tokens
+                      <input id="maxTokensInput" type="number" min="1" step="1" value="256" />
+                    </label>
+                    <label>
+                      top_k
+                      <input id="topKInput" type="number" min="0" step="1" value="0" />
+                    </label>
+                    <label>
+                      top_p
+                      <input id="topPInput" type="number" min="0" max="1" step="0.01" value="1.0" />
+                    </label>
+                    <label>
+                      temperature
+                      <input id="temperatureInput" type="number" min="0" step="0.1" value="1.0" />
+                    </label>
+                  </div>
+                </div>
+              </details>
+              <details class="panel-toggle debug-panel">
+                <summary>Debug</summary>
+                <div class="panel-body">
+                  <div class="debug-inner">
+                    <div id="debugStats" class="debug-stats">idle</div>
+                    <pre id="debugLog" class="debug-log"></pre>
+                  </div>
+                </div>
+              </details>
+            </div>
           </div>
-        </section>
-
-        <section class="debug-panel">
-          <h2>Debug</h2>
-          <div id="debugStats" class="debug-stats">idle</div>
-          <pre id="debugLog" class="debug-log"></pre>
-        </section>
+      </section>
       </section>
     </main>
 
-    <script src="./app.js"></script>
+    <script src="./app.js?v=20260222m"></script>
   </body>
 </html>

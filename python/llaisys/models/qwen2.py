@@ -8,6 +8,8 @@ import json
 import os
 import re
 import threading
+import ctypes
+from ctypes.util import find_library
 
 import numpy as np
 import safetensors
@@ -16,7 +18,7 @@ import torch
 from ctypes import POINTER, byref, cast, c_int, c_int8, c_int32, c_int64, c_void_p
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
-from ..libllaisys.model import LlaisysBatch, LlaisysModelCreateParams, ModelType
+from ..libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysKvStats, LlaisysModelCreateParams, ModelType
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from ..tensor import Tensor
 
@@ -126,7 +128,7 @@ def _read_config(model_path: Path) -> dict:
         return json.load(f)
 
 
-def _parse_meta(model_path: Path) -> _MetaInfo:
+def _parse_meta(model_path: Path, max_model_len: Optional[int] = None) -> _MetaInfo:
     cfg = _read_config(model_path)
 
     dtype = _torch_dtype_to_datatype(cfg.get("torch_dtype"))
@@ -148,7 +150,7 @@ def _parse_meta(model_path: Path) -> _MetaInfo:
     cfg_maxseq = int(cfg["max_position_embeddings"])
     # KV-cache memory grows linearly with maxseq and can easily reach multiple GB.
     # Cap it by default to keep the stage-1 implementation stable on typical machines.
-    cap_maxseq = int(os.getenv("LLAISYS_MAXSEQ", "4096"))
+    cap_maxseq = int(max_model_len) if max_model_len is not None else int(os.getenv("LLAISYS_MAXSEQ", "4096"))
     maxseq = min(cfg_maxseq, cap_maxseq)
 
     return _MetaInfo(
@@ -184,6 +186,133 @@ def _build_meta_struct(meta: _MetaInfo) -> LlaisysQwen2Meta:
     )
 
 
+def _available_memory_bytes(device: DeviceType) -> int:
+    if device == DeviceType.CPU:
+        mem_avail_kb = 0
+        mem_total_kb = 0
+        try:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        mem_avail_kb = int(line.split()[1])
+                    elif line.startswith("MemTotal:"):
+                        mem_total_kb = int(line.split()[1])
+        except Exception:
+            pass
+        kb = mem_avail_kb if mem_avail_kb > 0 else mem_total_kb
+        if kb > 0:
+            return int(kb) * 1024
+
+        # Windows fallback: GlobalMemoryStatusEx.
+        try:
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))  # type: ignore[attr-defined]
+            if int(ok) != 0:
+                avail = int(stat.ullAvailPhys)
+                total = int(stat.ullTotalPhys)
+                return avail if avail > 0 else total
+        except Exception:
+            pass
+
+        return 0
+
+    if device == DeviceType.NVIDIA:
+        cudart = None
+        candidates = [
+            find_library("cudart"),
+            "libcudart.so",
+            "libcudart.so.12",
+            "libcudart.so.11.0",
+        ]
+        for name in candidates:
+            if not name:
+                continue
+            try:
+                cudart = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if cudart is None:
+            print("[error] qwen2: failed to load CUDA runtime (libcudart)")
+            return 0
+
+        cuda_set_device = cudart.cudaSetDevice
+        cuda_set_device.argtypes = [ctypes.c_int]
+        cuda_set_device.restype = ctypes.c_int
+
+        cuda_mem_get_info = cudart.cudaMemGetInfo
+        cuda_mem_get_info.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        cuda_mem_get_info.restype = ctypes.c_int
+
+        rc = int(cuda_set_device(0))
+        if rc != 0:
+            print(f"[error] qwen2: cudaSetDevice(0) failed, rc={rc}")
+            return 0
+
+        free_b = ctypes.c_size_t(0)
+        total_b = ctypes.c_size_t(0)
+        rc = int(cuda_mem_get_info(ctypes.byref(free_b), ctypes.byref(total_b)))
+        if rc != 0:
+            print(f"[error] qwen2: cudaMemGetInfo failed, rc={rc}")
+            return 0
+        return int(free_b.value)
+    return 0
+
+
+def _kv_token_bytes(meta: _MetaInfo) -> int:
+    dtype = _datatype_to_numpy_dtype(meta.dtype)
+    dtype_bytes = int(dtype.itemsize)
+    # bytes per token over all layers for K and V
+    return int(meta.nlayer) * int(meta.nkvh) * int(meta.dh) * 2 * dtype_bytes
+
+
+def _estimate_cuda_kv_capacity_tokens(
+    *,
+    available_bytes: int,
+    token_bytes: int,
+    block_size: int,
+    memory_utilization: float,
+    max_model_len: int,
+    max_num_seqs: int,
+) -> tuple[int, dict]:
+    util = min(0.98, max(0.01, float(memory_utilization)))
+    bs = max(1, int(block_size))
+    block_bytes = max(1, int(token_bytes) * bs)
+    # Conservative reserve to avoid runtime OOM from non-KV allocations.
+    reserve_bytes = max(2 * 1024**3, int(int(available_bytes) * 0.2))
+    budget_bytes = int(int(available_bytes) * util) - reserve_bytes
+    num_blocks = int(budget_bytes // block_bytes) if budget_bytes > 0 else 0
+    capacity_tokens_est = int(num_blocks * bs) if num_blocks > 0 else 0
+    logical_cap_tokens = max(1, int(max_model_len) * max(1, int(max_num_seqs)))
+    capacity_tokens = min(capacity_tokens_est, logical_cap_tokens)
+    probe = {
+        "free_bytes": int(available_bytes),
+        "budget_bytes": int(budget_bytes),
+        "reserve_bytes": int(reserve_bytes),
+        "block_bytes": int(block_bytes),
+        "num_blocks": int(num_blocks),
+        "capacity_tokens_est": int(capacity_tokens_est),
+        "capacity_tokens": int(capacity_tokens),
+        "logical_cap_tokens": int(logical_cap_tokens),
+        "util": float(util),
+    }
+    return capacity_tokens, probe
+
+
 def _device_ids(device_id: int = 0):
     arr = (c_int * 1)(device_id)
     return arr, 1
@@ -192,13 +321,102 @@ def _device_ids(device_id: int = 0):
 class Qwen2:
     """Qwen2 model wrapper backed by the LLAISYS C++ runtime."""
 
-    def __init__(self, model_path: Path | str, device: DeviceType = DeviceType.CPU):
+    def __init__(
+        self,
+        model_path: Path | str,
+        device: DeviceType = DeviceType.CPU,
+        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+        kv_cache_block_size: int = 16,
+        max_model_len: Optional[int] = None,
+        kv_cache_capacity_tokens: Optional[int] = None,
+        kv_cache_auto_capacity: bool = False,
+        kv_cache_memory_utilization: float = 0.9,
+        max_num_seqs: Optional[int] = None,
+    ):
         self._model_path = Path(model_path)
         self._device = device
+        self._kv_cache_layout = kv_cache_layout
+        if self._device == DeviceType.NVIDIA and self._kv_cache_layout == KvCacheLayout.SLOT:
+            raise ValueError("SLOT layout is not supported on NVIDIA yet; use KvCacheLayout.BLOCK")
+        self._available_memory_bytes = int(_available_memory_bytes(device))
+        if self._available_memory_bytes <= 0:
+            raise RuntimeError(
+                "invalid available memory bytes (<= 0): "
+                "cannot initialize model with current device memory probe"
+            )
 
-        meta = _parse_meta(self._model_path)
+        meta = _parse_meta(self._model_path, max_model_len=max_model_len)
         self._meta_info = meta
         self._meta_struct = _build_meta_struct(meta)
+        self._max_model_len = int(meta.maxseq)
+        token_bytes = _kv_token_bytes(meta)
+        util = min(0.98, max(0.01, float(kv_cache_memory_utilization)))
+        if kv_cache_capacity_tokens is not None:
+            self._kv_cache_capacity_tokens = max(1, int(kv_cache_capacity_tokens))
+            explicit_blocks = (self._kv_cache_capacity_tokens + int(kv_cache_block_size) - 1) // int(kv_cache_block_size)
+            print(
+                "[kv] probe "
+                f"device={int(device)} available_bytes={self._available_memory_bytes} "
+                f"token_bytes={token_bytes} block_size={int(kv_cache_block_size)} util={util:.2f}"
+            )
+            print(
+                "[kv] capacity explicit "
+                f"capacity_tokens={self._kv_cache_capacity_tokens} num_blocks={explicit_blocks}"
+            )
+        elif kv_cache_auto_capacity:
+            if device == DeviceType.NVIDIA:
+                auto_max_num_seqs = (
+                    max(1, int(max_num_seqs))
+                    if max_num_seqs is not None
+                    else max(1, int(os.getenv("LLAISYS_KV_AUTO_MAX_SEQS", "8")))
+                )
+                capacity_tokens, probe = _estimate_cuda_kv_capacity_tokens(
+                    available_bytes=int(self._available_memory_bytes),
+                    token_bytes=token_bytes,
+                    block_size=int(kv_cache_block_size),
+                    memory_utilization=util,
+                    max_model_len=int(self._max_model_len),
+                    max_num_seqs=auto_max_num_seqs,
+                )
+                print(
+                    "[kv] probe "
+                    f"device={int(device)} free_bytes={probe['free_bytes']} budget_bytes={probe['budget_bytes']} "
+                    f"reserve_bytes={probe['reserve_bytes']} token_bytes={token_bytes} block_size={int(kv_cache_block_size)} "
+                    f"util={probe['util']:.2f} max_model_len={self._max_model_len} auto_max_num_seqs={auto_max_num_seqs}"
+                )
+                if capacity_tokens <= 0:
+                    raise RuntimeError("estimated num_kvcache_blocks <= 0")
+                self._kv_cache_capacity_tokens = int(capacity_tokens)
+                print(
+                    "[kv] capacity auto "
+                    f"block_bytes={probe['block_bytes']} blocks={probe['num_blocks']} "
+                    f"capacity_tokens_est={probe['capacity_tokens_est']} "
+                    f"logical_cap_tokens={probe['logical_cap_tokens']} "
+                    f"capacity_tokens={self._kv_cache_capacity_tokens}"
+                )
+            else:
+                bs = max(1, int(kv_cache_block_size))
+                block_bytes = max(1, int(token_bytes) * bs)
+                num_blocks = int((int(self._available_memory_bytes) * util) // block_bytes)
+                capacity_tokens = max(1, int(num_blocks) * bs)
+                print(
+                    "[kv] probe "
+                    f"device={int(device)} available_bytes={self._available_memory_bytes} "
+                    f"token_bytes={token_bytes} block_size={int(kv_cache_block_size)} util={util:.2f}"
+                )
+                if num_blocks <= 0:
+                    raise RuntimeError("estimated num_kvcache_blocks <= 0")
+                self._kv_cache_capacity_tokens = int(capacity_tokens)
+                print(
+                    "[kv] capacity auto "
+                    f"block_bytes={block_bytes} blocks={num_blocks} "
+                    f"capacity_tokens={self._kv_cache_capacity_tokens}"
+                )
+        else:
+            raise RuntimeError(
+                "kv cache capacity is unspecified: set kv_cache_capacity_tokens "
+                "or enable kv_cache_auto_capacity"
+            )
 
         dev_ids, ndev = _device_ids(0)
         create_params = LlaisysModelCreateParams(
@@ -207,6 +425,10 @@ class Qwen2:
             device,
             dev_ids,
             ndev,
+            int(kv_cache_layout),
+            int(kv_cache_block_size),
+            int(self._max_model_len),
+            int(self._kv_cache_capacity_tokens),
         )
         self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params))
         if not self._model:
@@ -317,7 +539,11 @@ class Qwen2:
 
     @property
     def max_seq_len(self) -> int:
-        return int(self._meta_info.maxseq)
+        return int(self._max_model_len)
+
+    @property
+    def kv_cache_capacity_tokens(self) -> int:
+        return int(self._kv_cache_capacity_tokens)
 
     @property
     def end_token_id(self) -> int:
@@ -340,7 +566,11 @@ class Qwen2:
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str:
         tokenizer = self._get_tokenizer()
-        return tokenizer.decode(list(token_ids), skip_special_tokens=False)
+        return tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
 
     def encode_chat_messages(self, messages: Sequence[dict]) -> list[int]:
         tokenizer = self._get_tokenizer()
@@ -349,7 +579,9 @@ class Qwen2:
             add_generation_prompt=True,
             tokenize=False,
         )
-        return [int(t) for t in tokenizer.encode(text)]
+        # apply_chat_template() already materializes model-specific control tokens
+        # into text form; avoid duplicating BOS/EOS by re-adding special tokens.
+        return [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
 
     def decode_batch(
         self,
@@ -357,10 +589,16 @@ class Qwen2:
         pos_ids: Optional[Sequence[int]] = None,
         seq_ids: Optional[Sequence[int]] = None,
         logits_mask: Optional[Sequence[int]] = None,
+        slot_mapping: Optional[Sequence[int]] = None,
+        context_lens: Optional[Sequence[int]] = None,
+        batch_seq_ids: Optional[Sequence[int]] = None,
+        block_tables: Optional[Sequence[int]] = None,
+        block_table_width: int = 0,
     ):
         if not token_ids:
             raise ValueError("token_ids must be non-empty")
         n_tokens = len(token_ids)
+        is_block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
 
         token_buf = (c_int64 * n_tokens)(*[int(t) for t in token_ids])
         pos_buf = None
@@ -382,6 +620,10 @@ class Qwen2:
         if seq_ids is not None:
             if len(seq_ids) != n_tokens:
                 raise ValueError("seq_ids length mismatch")
+            if is_block_layout:
+                for sid in seq_ids:
+                    if isinstance(sid, (list, tuple)):
+                        raise ValueError("BLOCK layout requires one seq_id per token")
             n_seq_buf = (c_int32 * n_tokens)()
             seq_ptr_buf = (POINTER(c_int64) * n_tokens)()
             seq_rows = []
@@ -391,6 +633,41 @@ class Qwen2:
                 n_seq_buf[i] = 1
                 seq_ptr_buf[i] = row
 
+        slot_mapping_buf = None
+        if slot_mapping is not None:
+            if len(slot_mapping) != n_tokens:
+                raise ValueError("slot_mapping length mismatch")
+            slot_mapping_buf = (c_int32 * n_tokens)(*[int(x) for x in slot_mapping])
+
+        context_lens_buf = None
+        batch_seq_ids_buf = None
+        block_tables_buf = None
+        n_batch_seq = 0
+        bt_width = int(block_table_width)
+        if context_lens is not None or batch_seq_ids is not None or block_tables is not None:
+            if context_lens is None or batch_seq_ids is None or block_tables is None:
+                raise ValueError("context_lens/batch_seq_ids/block_tables must be provided together")
+            n_batch_seq = len(batch_seq_ids)
+            if len(context_lens) != n_batch_seq:
+                raise ValueError("context_lens length mismatch")
+            if bt_width <= 0:
+                raise ValueError("block_table_width must be > 0 when block_tables is provided")
+            if len(block_tables) != n_batch_seq * bt_width:
+                raise ValueError("block_tables length mismatch")
+            context_lens_buf = (c_int32 * n_batch_seq)(*[int(x) for x in context_lens])
+            batch_seq_ids_buf = (c_int64 * n_batch_seq)(*[int(x) for x in batch_seq_ids])
+            block_tables_buf = (c_int32 * (n_batch_seq * bt_width))(*[int(x) for x in block_tables])
+
+        if is_block_layout:
+            if pos_buf is None:
+                raise ValueError("BLOCK layout requires pos_ids")
+            if seq_ptr_buf is None:
+                raise ValueError("BLOCK layout requires seq_ids")
+            if slot_mapping_buf is None:
+                raise ValueError("BLOCK layout requires slot_mapping")
+            if context_lens_buf is None or batch_seq_ids_buf is None or block_tables_buf is None or n_batch_seq <= 0:
+                raise ValueError("BLOCK layout requires context_lens/batch_seq_ids/block_tables")
+
         batch = LlaisysBatch()
         batch.n_tokens = c_int32(n_tokens)
         batch.token = token_buf
@@ -399,6 +676,12 @@ class Qwen2:
         batch.n_seq_id = n_seq_buf
         batch.seq_id = seq_ptr_buf
         batch.logits = logits_buf
+        batch.slot_mapping = slot_mapping_buf
+        batch.context_lens = context_lens_buf
+        batch.batch_seq_ids = batch_seq_ids_buf
+        batch.block_tables = block_tables_buf
+        batch.n_batch_seq = c_int32(n_batch_seq)
+        batch.block_table_width = c_int32(bt_width if n_batch_seq > 0 else 0)
 
         status = int(LIB_LLAISYS.llaisysModelDecode(self._model, batch))
         if status != 0:
@@ -424,6 +707,35 @@ class Qwen2:
             logits_rows.append(np.array(row, copy=True))
 
         return output_ids, logits_rows
+
+    def request_free(self, seq_id: int) -> int:
+        if not self._model:
+            return 5
+        return int(LIB_LLAISYS.llaisysModelRequestFree(self._model, c_int64(int(seq_id))))
+
+    def kv_stats(self) -> dict[str, int]:
+        if not self._model:
+            return {
+                "capacity_tokens": 0,
+                "used_tokens": 0,
+                "free_tokens": 0,
+                "peak_used_tokens": 0,
+            }
+        out = LlaisysKvStats()
+        rc = int(LIB_LLAISYS.llaisysModelKvStats(self._model, byref(out)))
+        if rc != 0:
+            raise RuntimeError(f"KvStats failed with status={rc}")
+        return {
+            "capacity_tokens": int(out.capacity_tokens),
+            "used_tokens": int(out.used_tokens),
+            "free_tokens": int(out.free_tokens),
+            "peak_used_tokens": int(out.peak_used_tokens),
+        }
+
+    def kv_reset_prefix_cache(self) -> int:
+        if not self._model:
+            return 5
+        return int(LIB_LLAISYS.llaisysModelKvResetPrefixCache(self._model))
 
     def generate(
         self,

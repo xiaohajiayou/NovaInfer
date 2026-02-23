@@ -11,12 +11,28 @@ __C {
         LLAISYS_MODEL_TYPE_MOCK = 2,
     } LlaisysModelType;
 
+    typedef enum LlaisysKvCacheLayout {
+        LLAISYS_KV_CACHE_LAYOUT_SLOT = 0,
+        LLAISYS_KV_CACHE_LAYOUT_BLOCK = 1,
+    } LlaisysKvCacheLayout;
+
     struct LlaisysModelCreateParams {
         LlaisysModelType model_type;
         const void *meta; // points to model-specific meta struct
         llaisysDeviceType_t device;
         int *device_ids;
         int ndevice;
+        int32_t kv_cache_layout;     // LlaisysKvCacheLayout, <0 means default(BLOCK)
+        int32_t kv_cache_block_size; // <=0 means default(16)
+        int32_t max_model_len;       // <=0 means use meta.maxseq
+        int32_t kv_cache_capacity_tokens; // <=0 means use max_model_len
+    };
+
+    struct LlaisysKvStats {
+        int64_t capacity_tokens;
+        int64_t used_tokens;
+        int64_t free_tokens;
+        int64_t peak_used_tokens;
     };
 
     struct LlaisysModel;
@@ -62,6 +78,14 @@ __C {
     __export int llaisysModelKvSeqAdd(struct LlaisysModel *model, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
     __export int llaisysModelKvSeqKeep(struct LlaisysModel *model, int64_t seq_id);
     __export int64_t llaisysModelKvSeqPosMax(struct LlaisysModel *model, int64_t seq_id);
+    // Free all KV entries that belong to one request/sequence id.
+    // Return code follows KV status mapping above.
+    __export int llaisysModelRequestFree(struct LlaisysModel *model, int64_t seq_id);
+    // 0 success, <0 invalid input/internal error.
+    __export int llaisysModelKvStats(struct LlaisysModel *model, struct LlaisysKvStats *out_stats);
+    // Reset prefix-cache related metadata (no-op when prefix cache disabled/not implemented).
+    // Return code follows KV status mapping above.
+    __export int llaisysModelKvResetPrefixCache(struct LlaisysModel *model);
 }
 
 #endif // LLAISYS_MODELS_MODEL_H

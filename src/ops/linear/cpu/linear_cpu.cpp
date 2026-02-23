@@ -3,6 +3,7 @@
 #include "../../../utils.hpp"
 
 #include <cstring>
+#include <cstdint>
 
 template <typename T>
 void linear_(T *out,
@@ -12,8 +13,13 @@ void linear_(T *out,
              size_t M,
              size_t K,
              size_t N) {
-    for (size_t m = 0; m < M; ++m) {
-        for (size_t n = 0; n < N; ++n) {
+    #if defined(_OPENMP)
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for (int64_t m_i = 0; m_i < static_cast<int64_t>(M); ++m_i) {
+        for (int64_t n_i = 0; n_i < static_cast<int64_t>(N); ++n_i) {
+            const size_t m = static_cast<size_t>(m_i);
+            const size_t n = static_cast<size_t>(n_i);
 
             float acc = 0.0f;   // ✅ 用 float 累加
 

@@ -3,15 +3,48 @@
 本文档定义阶段0需要落地的 Core 对外接口与结构体。  
 阶段0口径：对外只暴露通用多模型 API（工厂模式）；`qwen2` 仅作为一个 `model_type` 实现。
 
-当前状态说明（As-Built）：
+> 文档状态更新（2026-02-18）  
+> 本文历史描述默认把 `kv_seq_*` 作为主语义。当前实现已进入 `SLOT/BLOCK` 双布局阶段，且 BLOCK 为主线。  
+> 若冲突，以下述“0.1 当前接口口径（2026-02）”为准。详细计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
+> 目录口径补充（2026-02-20）：测试目录已重构到 `test/core|engine|offline|online|parity|ops|utils`。
+
+## 0.2 阅读优先级（当前 vs 历史）
+
+1. 当前执行口径优先：`doc/qwen2_next_dev_plan_2026-02.md`。
+2. 本文中的 `As-Built` 段为阶段快照，不等同于当前所有行为边界。
+3. 若本文历史段与“0.1 当前接口口径”冲突，以“0.1 当前接口口径”为准。
+
+## 0.1 当前接口口径（2026-02）
+
+1. `LlaisysModelCreateParams` 已包含：
+   - `kv_cache_layout`（`SLOT=0 / BLOCK=1`，`<0` 走默认 BLOCK）
+   - `kv_cache_block_size`（`<=0` 默认 `16`）
+2. `llaisysModelDecode` 仍是统一主入口；Python 正常推理路径不依赖 `llaisysModelKvSeq*`。
+3. BLOCK 主路径已切到显式 batch 元数据输入（对齐 nano-vllm runner 数据流）：
+   - `slot_mapping`
+   - `context_lens`
+   - `batch_seq_ids`
+   - `block_tables`
+   - `n_batch_seq`
+   - `block_table_width`
+4. `llaisysModelKvSeq*` 当前主要用于兼容与测试。BLOCK 下部分语义已与 SLOT 不同：
+   - BLOCK 下 `llaisysModelKvSeq*` 统一按未实现处理（`INTERNAL_ERROR(5)`）。
+5. 当前推荐口径：BLOCK 作为性能主线，SLOT 作为兼容/回归模式。
+6. NVIDIA + auto capacity 口径（当前实现）：
+   - `max_num_seqs` 会从 EngineConfig 透传到 Qwen2 runner，
+   - 并参与 KV auto capacity 的 `logical_cap_tokens = max_model_len * max_num_seqs` 估算；
+   - 若未显式提供 `max_num_seqs`，才回落环境变量 `LLAISYS_KV_AUTO_MAX_SEQS`。
+
+历史状态快照（As-Built）：
 
 1. 主线接口已切到通用 `llaisysModel*`。
 2. 为阶段0测试引入了 `LLAISYS_MODEL_TYPE_MOCK`（测试路由模型），不影响 `qwen2` 主线接口语义。
 3. `include/llaisys/runtime/kv_cache.h` 属于目标头文件，当前仓库尚未落地该文件；KV 状态码语义目前由 `model.h` 文档约定与实现保持一致。
 4. 已提供 `llaisysModelReplaceWeight`，用于安全替换权重槽位（同句柄 no-op，异句柄先释放旧权重）。
 5. `llaisysModelDecode` 已是“真 batch 执行”语义（单轮前向处理整批 token）。
-6. 已支持 `n_seq_id > 1` token（一个 token 绑定多个 `seq_id`）。
-7. KV 已是 unified slot 语义：一个 slot 可绑定多个 `seq_id`。
+6. `SLOT` 路径支持 `n_seq_id > 1` token（一个 token 绑定多个 `seq_id`）。
+7. `BLOCK` 主路径要求一 token 对应一个 `seq_id`，并由上层提供显式 block 元数据。
+8. KV 已是 unified slot 语义：一个 slot 可绑定多个 `seq_id`（SLOT 路径）。
 
 对齐范围说明：
 
@@ -43,6 +76,8 @@ typedef struct LlaisysModelCreateParams {
     llaisysDeviceType_t device;
     int *device_ids;
     int ndevice;
+    int32_t kv_cache_layout;        // LlaisysKvCacheLayout, <0 means default(BLOCK)
+    int32_t kv_cache_block_size;    // <=0 means default(16)
 } LlaisysModelCreateParams;
 
 struct LlaisysModel;
@@ -59,6 +94,12 @@ typedef struct LlaisysBatch {
     int32_t *n_seq_id;   // nullable: default 1 when NULL
     int64_t **seq_id;    // nullable: default seq_id=0 when NULL
     int8_t  *logits;     // non-zero => keep logits row
+    int32_t *slot_mapping;     // [n_tokens], BLOCK optional
+    int32_t *context_lens;     // [n_batch_seq], BLOCK optional
+    int64_t *batch_seq_ids;    // [n_batch_seq], BLOCK optional
+    int32_t *block_tables;     // [n_batch_seq * block_table_width], BLOCK optional
+    int32_t n_batch_seq;       // BLOCK optional
+    int32_t block_table_width; // BLOCK optional
 } LlaisysBatch;
 ```
 
@@ -150,11 +191,12 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
 3. 采样由上层 Engine/Executor 基于 `GetLogitsIth` 返回结果执行。
 4. 阶段0兼容期允许模型适配层临时使用离线路径 argmax（仅用于旧测试兼容），不改变 `decode` 主路径职责。
 
-`Decode` 输入约束（As-Built）：
+`Decode` 输入约束（当前口径）：
 
-1. `n_seq_id[i] >= 1`（不再限制必须为 1）。
-2. 对于一个 token 的 seq 集，若显式提供 `pos[i]`，必须与该 seq 集当前可推进位置一致。
-3. `batch.logits` 仍仅控制“是否返回该 token 的 logits 行”，不改变 KV 写入与前向执行。
+1. `SLOT`：`n_seq_id[i] >= 1`，支持一个 token 绑定多个 `seq_id`。
+2. `BLOCK`：主路径要求 `n_seq_id[i] == 1`，并要求显式 `slot_mapping/context_lens/batch_seq_ids/block_tables` 元数据。
+3. 对于显式提供 `pos[i]` 的输入，`pos` 必须与当前可推进位置一致。
+4. `batch.logits` 仅控制“是否返回该 token 的 logits 行”，不改变 KV 写入与前向执行。
 
 ### 3.2 通用 Batch 辅助接口
 
@@ -171,7 +213,7 @@ __export struct LlaisysBatch llaisysBatchGetOne(
 __export void llaisysBatchFree(struct LlaisysBatch batch);
 ```
 
-### 3.3 通用 KV 序列接口（`model.h`）
+### 3.3 通用 KV 序列接口（`model.h`，兼容态）
 
 ```c
 __export int llaisysModelKvSeqCp(
@@ -201,6 +243,24 @@ __export int llaisysModelKvSeqKeep(
 __export int64_t llaisysModelKvSeqPosMax(
     struct LlaisysModel *model,
     int64_t seq_id);
+
+__export int llaisysModelRequestFree(
+    struct LlaisysModel *model,
+    int64_t seq_id);
+
+typedef struct LlaisysKvStats {
+    int64_t capacity_tokens;
+    int64_t used_tokens;
+    int64_t free_tokens;
+    int64_t peak_used_tokens;
+} LlaisysKvStats;
+
+__export int llaisysModelKvStats(
+    struct LlaisysModel *model,
+    struct LlaisysKvStats *out_stats);
+
+__export int llaisysModelKvResetPrefixCache(
+    struct LlaisysModel *model);
 ```
 
 区间语义统一为半开区间 `[p0, p1)`。  
@@ -213,11 +273,15 @@ KV 返回码：
 5. `4`：EMPTY_RANGE
 6. `5`：INTERNAL_ERROR
 
-KV 语义补充（As-Built）：
+KV 语义补充（当前口径）：
 
-1. `llaisysModelKvSeqCp(dst, src, p0, p1)` 当前为“共享前缀关联”语义：dst 附加 src 命中的 slot 关联，不强制复制新 slot。
-2. `llaisysModelKvSeqRm` 会移除 seq 与 slot 关联；当 slot 无剩余 seq 关联时释放物理 slot。
-3. `llaisysModelKvSeqAdd` 已支持 `delta != 0` 的位置平移语义（按 `[p0, p1)` 对命中 cell 执行 `pos += delta`）。
+1. `llaisysModelKvSeq*` 在 SLOT 下保留 legacy 语义；BLOCK 下统一返回 `INTERNAL_ERROR(5)`。
+2. `llaisysModelRequestFree(seq_id)` 已落地：释放该请求绑定的全部 KV（BLOCK/SLOT 通用）。
+3. `llaisysModelKvStats` 已落地：返回 capacity/used/free/peak 四项 token 统计。
+4. `llaisysModelKvResetPrefixCache` 已落地：
+   - BLOCK 路径下，当仍有活跃 KV 占用时返回 `INTERNAL_ERROR(5)`；
+   - 当无活跃占用时返回 `OK(0)`，并清理 runtime 请求元数据（`req_to_blocks/seq_to_stream/block_tables`）；
+   - 当前 BLOCK 前缀哈希索引主存于 Python `BlockManager`，该接口主要提供 runtime 侧 reset 契约。
 
 ## 4. 调用契约
 
@@ -263,7 +327,7 @@ KV 语义补充（As-Built）：
 1. `memory_update -> re-reserve` 自动链路相关公开接口。
 2. 完整 `PP -> TG(split_only) -> PP` 三段预留策略开关或参数。
 
-## 9. 阶段2 Python/Server 接口契约（As-Built）
+## 9. 阶段2 Python/Server 接口契约（历史快照，As-Built）
 
 说明：
 
@@ -288,7 +352,7 @@ KV 语义补充（As-Built）：
 约束：
 
 1. `LLMEngine.step()` 当前支持单步多请求合批执行（continuous batching 基础形态）。
-2. 同一 ubatch 当前使用统一采样参数；每请求独立采样参数为后续增强项。
+2. 同一 step 已支持按请求应用独立采样参数；后续重点转向调度层 request-aware 优化与 prefix cache。
 
 ### 9.2 OpenAI 兼容服务接口（Python）
 
@@ -296,7 +360,7 @@ KV 语义补充（As-Built）：
 
 1. `python -m llaisys.server --model-path ... --device cpu --host 127.0.0.1 --port 8000 [--verbose]`
 
-HTTP 路由（As-Built）：
+HTTP 路由（历史快照）：
 
 1. `GET /health`
 2. `POST /v1/chat/completions`
@@ -308,7 +372,7 @@ HTTP 路由（As-Built）：
 2. 结束标记 `data: [DONE]\n\n`
 3. chunk 关键字段：`request_id`、`token_id`、`is_finished`、`choices[0].delta.content`
 
-### 9.3 WebUI 对接接口（As-Built）
+### 9.3 WebUI 对接接口（历史快照）
 
 1. WebUI 作为静态站点运行：`python -m http.server 8081 -d webui`。
 2. 前端请求固定调用 `POST /v1/chat/completions`（`stream=true`）。
@@ -324,6 +388,6 @@ HTTP 路由（As-Built）：
 ## 11. 已知差异与后续接口计划
 
 1. 目前 OpenAI 路由仅覆盖 chat-completions，`/v1/completions` 与 embeddings 为后续扩展。
-2. `sampling_params` 目前是请求级；同批不同请求采样参数并行应用未完全落地。
+2. `sampling_params` 已支持请求级并在同一 step 按请求独立应用。
 3. 监控接口当前以日志为主，标准 metrics 导出接口（Prometheus 等）为下一步。
 4. Core 已实现 unified KV + mask 隔离与 `kv_seq_add(delta)` 位置平移；滑窗与性能优化接口仍在后续阶段。

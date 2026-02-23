@@ -5,9 +5,10 @@ from pathlib import Path
 from typing import Callable, Dict
 
 from ..libllaisys import DeviceType
+from ..libllaisys.model import KvCacheLayout
 
 
-ModelFactory = Callable[[Path | str, DeviceType], object]
+ModelFactory = Callable[..., object]
 
 
 @dataclass
@@ -20,18 +21,42 @@ class ModelRegistry:
             raise ValueError("model_type must be non-empty")
         self._factories[key] = factory
 
-    def create(self, model_type: str, model_path: Path | str, device: DeviceType):
+    def create(self, model_type: str, model_path: Path | str, device: DeviceType, **model_kwargs):
         key = model_type.strip().lower()
         factory = self._factories.get(key)
         if factory is None:
             raise ValueError(f"Unsupported model_type: {model_type}")
-        return factory(model_path, device)
+        try:
+            return factory(model_path, device, **model_kwargs)
+        except TypeError:
+            # Backward compatibility for old 2-arg factories used by tests/custom code.
+            return factory(model_path, device)
 
 
-def _create_qwen2(model_path: Path | str, device: DeviceType):
+def _create_qwen2(
+    model_path: Path | str,
+    device: DeviceType,
+    kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
+    kv_cache_block_size: int = 16,
+    max_model_len: int | None = None,
+    max_num_seqs: int | None = None,
+    kv_cache_capacity_tokens: int | None = None,
+    kv_cache_auto_capacity: bool = False,
+    kv_cache_memory_utilization: float = 0.9,
+):
     from ..models.qwen2 import Qwen2
 
-    return Qwen2(model_path, device)
+    return Qwen2(
+        model_path=model_path,
+        device=device,
+        kv_cache_layout=kv_cache_layout,
+        kv_cache_block_size=kv_cache_block_size,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        kv_cache_capacity_tokens=kv_cache_capacity_tokens,
+        kv_cache_auto_capacity=kv_cache_auto_capacity,
+        kv_cache_memory_utilization=kv_cache_memory_utilization,
+    )
 
 
 def create_default_registry() -> ModelRegistry:

@@ -125,6 +125,11 @@ def check_equal(
     assert shape == torch_answer.shape
     assert torch_dtype(dtype_name(llaisys_result.dtype())) == torch_answer.dtype
 
+    # Boundary sync: kernels are launched asynchronously on runtime stream.
+    # Before reading tensor memory for comparison, synchronize device once.
+    api = llaisys.RuntimeAPI(llaisys_result.device_type())
+    api.device_synchronize()
+
     right = 0
     for i in range(len(shape)):
         if strides[i] > 0:
@@ -140,7 +145,6 @@ def check_equal(
         ),
     )
     result = torch.as_strided(tmp, shape, strides)
-    api = llaisys.RuntimeAPI(llaisys_result.device_type())
     api.memcpy_sync(
         result.data_ptr(),
         llaisys_result.data_ptr(),

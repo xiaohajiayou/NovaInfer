@@ -37,8 +37,8 @@ class RequestState:
 
 @dataclass(frozen=True)
 class SamplingParams:
-    max_new_tokens: Optional[int] = None
-    top_k: int = 1
+    max_new_tokens: Optional[int] = 16
+    top_k: int = 0
     top_p: float = 1.0
     temperature: float = 1.0
     seed: Optional[int] = None
@@ -52,6 +52,11 @@ class BatchPlan:
     logits_mask: List[int]
     pos_ids: Optional[List[int]] = None
     seq_ids: Optional[List[int]] = None
+    slot_mapping: Optional[List[int]] = None
+    context_lens: Optional[List[int]] = None
+    batch_seq_ids: Optional[List[int]] = None
+    block_tables: Optional[List[int]] = None
+    block_table_width: int = 0
 
 
 @dataclass(frozen=True)

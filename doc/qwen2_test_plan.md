@@ -3,6 +3,25 @@
 本文件定义 Qwen2 推理栈在阶段 0/1/2/3 的测试范围、执行方式、通过标准与回归规则。  
 目标：把“需求 -> 设计 -> 测试”闭环落到可执行清单，避免阶段验收口径不一致。
 
+> 文档状态更新（2026-02-18）  
+> 当前 KV 为 `SLOT/BLOCK` 双布局，且 BLOCK 为主线演进路径。  
+> 若与旧用例口径冲突，以 0.1 节“当前测试策略（2026-02）”为准。详细开发计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
+> 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
+> 测试目录口径更新（2026-02-20）：`test/core|engine|offline|online|parity|ops|utils`。
+
+## 0.2 阅读优先级（当前 vs 历史）
+
+1. 本文主体（1~9 节）为当前执行规则。
+2. 历史复盘内容已归档到 `doc/archive/qwen2_test_plan_stage2_postmortem_legacy_2026-02.md`。
+3. 若历史复盘与当前执行规则冲突，以本文当前规则为准。
+
+## 0.1 当前测试策略（2026-02）
+
+1. 基础正确性：默认在 BLOCK 布局验证主链路。
+2. 回归与对照：关键 Core/Engine 用例保留 SLOT 对照运行。
+3. `kv_seq_*`：作为兼容接口测试，不再代表 BLOCK 主语义目标。
+4. 性能对比：统一只走 `decode` 主路径，不把 `kv_seq_*` 纳入 benchmark 口径。
+
 ## 1. 测试范围与分层
 
 1. Core（C++）：`llaisysModel*` 通用接口、SoA batch/decode、logits 输出、KV 接口。
@@ -21,28 +40,28 @@
 ### 2.1 阶段 0（Core 重构 + 通用多模型 API）
 
 必须通过：
-1. 既有基线：`pytest -q test/test_infer.py --model-path /path/to/local/model`
-2. `test/test_core_model_api.py`：`create/decode/get_logits*/kv` 行为。
-3. `test/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确（含 `n_seq_id > 1` 共享 token 用例）。
-4. `test/test_core_output_api.py`：`GetLogits/GetLogitsIth/NOutputs/OutputIds` 与 `batch.logits` 对齐。
-5. `test/test_kv_cache.py`：`seq_id + pos` 隔离、`kv_seq_*` 返回码与行为。
-6. `test/test_qwen2_adapter.py`：`python/llaisys/models/qwen2.py` 基于通用 C API 可用。
-7. `test/test_model_registry.py`：多模型注册/路由（至少 `qwen2 + mock`）。
-8. `test/test_core_parity.py`：与 `transformers` 做 batch+argmax 逐步对拍（有本地模型时必跑）。
+1. 既有基线：`pytest -q test/parity/test_infer.py --model-path /path/to/local/model`
+2. `test/core/test_core_model_api.py`：`create/decode/get_logits*/kv` 行为。
+3. `test/core/test_core_decode_batch.py`：SoA batch 在单序列/多序列场景下正确（含 `n_seq_id > 1` 共享 token 用例）。
+4. `test/core/test_core_output_api.py`：`GetLogits/GetLogitsIth/NOutputs/OutputIds` 与 `batch.logits` 对齐。
+5. `test/core/test_kv_cache.py`：`seq_id + pos` 隔离、`kv_seq_*` 返回码与行为（按 SLOT/BLOCK 分支断言）。
+6. `test/core/test_qwen2_adapter.py`：`python/llaisys/models/qwen2.py` 基于通用 C API 可用。
+7. `test/core/test_model_registry.py`：多模型注册/路由（至少 `qwen2 + mock`）。
+8. `test/parity/test_core_parity.py`：与 `transformers` 做 batch+argmax 逐步对拍（有本地模型时必跑）。
 
 阶段 0 特殊约束：
-1. `test/test_infer.py` 定义为 ModelRunner 级对拍：走 `decode_batch + argmax`，不经过 Engine。
+1. `test/parity/test_infer.py` 定义为 ModelRunner 级对拍：走 `decode_batch + argmax`，不经过 Engine。
 2. 不允许在 Core `decode` 主路径内做采样决策（Core 只产 logits）。
 
 ### 2.2 阶段 1（offline + Engine 内 argmax）
 
 必须通过：
 1. 阶段 0 全量用例。
-2. `test/test_offline.py`：离线生成一致性、流式/非流式行为。
-3. `test/test_llm_entrypoint.py`：`LLM.generate/stream` 入口契约（token兼容、prompt/prompts、batch params）。
-4. `test/test_engine_state_machine.py`：状态流转（`waiting -> running -> finished_*`）与异常路径。
-5. `test/test_engine_model_registry.py`：新增模型注册不修改 Engine 主流程。
-6. `test/test_offline_parity.py`：Engine 离线链路与 `transformers` 对拍（single + multi-seq，需本地模型）。
+2. `test/offline/test_offline.py`：离线生成一致性、流式/非流式行为。
+3. `test/offline/test_llm_entrypoint.py`：`LLM.generate/stream` 入口契约（token兼容、prompt/prompts、batch params）。
+4. `test/engine/test_engine_state_machine.py`：状态流转（`waiting -> running -> finished_*`）与异常路径。
+5. `test/engine/test_engine_model_registry.py`：新增模型注册不修改 Engine 主流程。
+6. `test/parity/test_offline_parity.py`：Engine 离线链路与 `transformers` 对拍（single + multi-seq，需本地模型）。
 
 新增约束：
 1. 离线主流程必须切到 `LLM -> LLMEngine -> Scheduler -> Executor -> Worker -> Core`。
@@ -54,10 +73,10 @@
 
 必须通过：
 1. 阶段 1 全量用例。
-2. `test/test_sampling.py`：top-k/top-p/temperature 行为。
-3. `test/test_online.py`：在线并发、流式、取消、错误码。
-4. `test/test_online_stream_isolation.py`：并发流式下 request_id 隔离（DummyRunner）。
-5. `test/test_online_real_model_multisession.py`：真实模型并发流式不串线（需本地模型）。
+2. `test/engine/test_sampling.py`：top-k/top-p/temperature 行为。
+3. `test/online/test_online.py`：在线并发、流式、取消、错误码。
+4. `test/online/test_online_stream_isolation.py`：并发流式下 request_id 隔离（DummyRunner）。
+5. `test/online/test_online_real_model_multisession.py`：真实模型并发流式不串线（需本地模型）。
 
 说明：
 1. 未提供 `--model-path` 时，`requires_model` 用例会自动 skip，不影响无模型环境的快速回归。
@@ -118,7 +137,7 @@ xmake install
 1. `--suite {stage0,stage1,stage2,all}`：选择执行阶段。
 2. `--model-path /path/to/local/model`：提供本地模型路径（用于 parity/HF 相关测试）。
 3. `--run-parity {auto,always,never}`：parity 策略。
-4. `--run-hf {auto,always,never}`：阶段0中 HF 依赖测试（`test_infer.py`）策略。
+4. `--run-hf {auto,always,never}`：阶段0中 HF 依赖测试（`test/parity/test_infer.py`）策略。
 
 推荐命令：
 ```bash
@@ -140,10 +159,10 @@ python scripts/run_tests.py --suite stage2
 
 在线与采样（阶段 2 起）：
 ```bash
-pytest -q test/test_sampling.py
-pytest -q test/test_online.py
-pytest -q test/test_online_stream_isolation.py
-pytest -q test/test_online_real_model_multisession.py --model-path /path/to/local/model
+pytest -q test/engine/test_sampling.py
+pytest -q test/online/test_online.py
+pytest -q test/online/test_online_stream_isolation.py
+pytest -q test/online/test_online_real_model_multisession.py --model-path /path/to/local/model
 ```
 
 直接全量 pytest（可选）：
@@ -167,25 +186,16 @@ PYTHONPATH=python python -m pytest -q
 ### 6.1 当前状态（阶段2收敛后）
 
 1. 阶段0已通过全量测试与 parity 对拍。
-2. 阶段1已通过离线全量测试；有模型路径时通过 `test_offline_parity.py` 对拍。
+2. 阶段1已通过离线全量测试；有模型路径时通过 `test/parity/test_offline_parity.py` 对拍。
 3. 阶段2核心能力已落地：采样链、在线接口、SSE、取消、多会话并发隔离回归。
 4. 后续回归默认从 `scripts/run_tests.py` 开始，失败再下钻单测。
 5. 下一重点为阶段3吞吐优化（连续批处理、前缀缓存、投机）。
 6. Core 架构修正已完成：`decode` 真 batch 执行 + unified KV + 单轮 mask 隔离；对应核心回归已通过。
 
-## 7. 实施问题复盘（阶段2）
+## 7. 阶段2历史复盘（已归档）
 
-1. 问题：流式接口偶发缺少最后 `is_finished=true` 终止块。
-2. 解决：在 `AsyncLLMEngine.stream` 的超时分支补发终止 chunk，并加回归测试。
-3. 问题：多线程真实模型并发下出现段错误（析构路径）。
-4. 解决：显式 `close` 链 + C++ `Context` 生命周期修正（初始化、引用语义、跨线程析构风险规避）。
-5. 问题：并发首请求 Tokenizer 初始化偶发异常。
-6. 解决：Tokenizer 延迟初始化加锁，Worker 增加编码/解码降级路径。
-7. 问题：`test/test_online_http.py` 在部分环境报 `http.client.RemoteDisconnected`，且服务端无 traceback。
-8. 根因：测试进程受到环境代理变量影响（`HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`），请求未稳定直连本地 `127.0.0.1` 测试服务。
-9. 解决：在 `test/test_online_http.py` 中使用无代理 opener（`urllib.request.ProxyHandler({})`），强制 localhost 直连；README 增加排障说明。
-10. 问题：Core 曾存在“伪批处理”路径（`decode` 逐 token 调 `infer`），与动态批处理设计不一致。
-11. 解决：将 `decode` 改为单轮 batch 前向，并在 `KvCache` 引入 unified slot 语义（支持一个 token 关联多个 `seq_id`）。
+阶段2实施问题与解决过程已归档，不再作为当前执行规则正文维护。  
+参见：`doc/archive/qwen2_test_plan_stage2_postmortem_legacy_2026-02.md`
 
 ## 8. 回归规则
 
@@ -194,3 +204,28 @@ PYTHONPATH=python python -m pytest -q
 3. 改动 `python/llaisys/models/qwen2.py`：重跑 adapter + infer/offline。
 4. 改动 `engine/server`：重跑 offline/online/sampling 对应用例。
 5. 改动 `scripts/run_tests.py`：至少重跑 `--suite stage0 --run-parity never --run-hf never` 与 `--suite stage1 --run-parity never`。
+
+## 9. 性能评测口径（slot vs block）
+
+1. 统一入口：仅用 `decode` 主路径，不调用 `kv_seq_*`。
+2. 统一 workload：固定请求到达序列、prompt 长度分布、采样参数、max_new_tokens。
+3. 统一环境：同硬件、同模型、同 batch 策略、同编译参数。
+4. 指标：
+   - 吞吐：tokens/s
+   - 时延：TTFT、TPOT、P50/P95
+   - 内存：KV 占用、峰值 RSS、free block 变化
+5. 结果解释：
+   - 端到端对比可接受算子不同（方案级对比）；
+   - 需额外补“归因实验”（只换 KV 形态或只换算子）。
+
+### 9.1 NovaInfer vs vLLM 对比口径（新增）
+
+1. 统一脚本：`scripts/bench_compare_vllm.py`。
+2. 推荐模式：`--backend both`（脚本内部已改为子进程隔离执行 `novainfer/vllm`）。
+3. 统一参数：`seed/num_seqs/input-output length/max_model_len/max_num_seqs/max_num_batched_tokens` 必须一致。
+4. 计时口径：
+   - NovaInfer：输出 `init/warmup/run/total`，吞吐按 `run_seconds` 计算；
+   - vLLM：当前以端到端生成耗时统计。
+5. 注意事项：
+   - vLLM tokenized 输入需 `{"prompt_token_ids":[...]}`，不可直接传 `list[list[int]]`；
+   - 如需复现单后端结果，优先分别运行 `--backend novainfer` 与 `--backend vllm`。
