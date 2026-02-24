@@ -110,7 +110,7 @@ Sampler 在执行侧：executor.py 里 Sampler.sample(...) / sample_per_row(...)
 OutputProcessor 在 EngineCore 侧：llm_engine.py 里 _complete_request() 调用 OutputProcessor.finalize(...)
 输出对象统一：output_processor.py（GenerationOutput 组织）
 执行侧/结果组织侧边界：执行侧只回 logits/采样结果，Engine 负责拼装 output（符合描述）
-
+- 目前采样是在cpu侧,存在性能损耗.
 ### 4.8 模型适配层（models）
 
 
@@ -136,7 +136,30 @@ SSE 流式输出：已支持，chat/completions + stream 分支写 text/event-st
 2. Server 仅负责协议适配、鉴权/限流、流式转发；不负责调度、模型前向或采样。
 3. Engine 返回统一输出对象（token/text/finish_reason/usage），Server 负责序列化为 OpenAI 响应格式。
 4. 监控口径分层：Server 暴露 API 级指标；Engine 暴露调度与执行级指标（吞吐/延迟/KV/资源占用）。
+5. 目前为多线程模型,存在并发瓶颈：
+  - encode_chat_messages（apply_chat_template + tokenizer.encode）
+    在 Python 线程执行
+  - decode_tokens（给 stream 产出 text_delta）在 Python 线程执行
+  - AsyncLLMEngine 目前是单 loop 线程驱动 step + chunk 分发
 
+  所以当并发上来时，确实会出现你现象：
+  - GPU kernel 不是满载
+  - CPU 在做 tokenize/detokenize、拼装 chunk、队列调度
+  - 请求进场和 token 下发被串住
+
+  但也有一条现实：
+
+  - 真正 decode 计算在 C/CUDA，通常会释放 GIL，不是“完全假线程”
+  - 低并发下这套还够用，问题多在高并发/小请求场景暴露
+
+  可以用这两个指标快速判定是不是这个瓶颈：
+
+  1. GPU utilization 低（比如 20%~40%），但请求延迟高
+  2. Python 进程单核或少数核很高，engine loop 忙，chunk/tokenize 路
+     径耗时明显
+
+  如果要解，优先做：tokenize 前移/并行化、stream detokenize 降频或
+  批量化、控制面与推理面进一步解耦。
 ## 6. Web UI（模块需求）
 
 ### 6.1 UI 客户端

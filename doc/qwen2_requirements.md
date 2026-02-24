@@ -2,24 +2,13 @@
 
 本需求文档面向“离线推理 + 在线服务”两种形态，描述交付要求与验收标准，不包含实现细节；实现允许分阶段落地。
 
-> 文档状态更新（2026-02-18）  
-> 本文部分历史需求描述（尤其 KV 的 slot/unified 主线口径）与当前实现存在偏差。  
-> 若冲突，以 2.2 节“当前重构策略（2026-02）”为准。详细计划见 `doc/qwen2_next_dev_plan_2026-02.md`。
-> 计划口径补充：原 M2/M3 已合并为“调度与 KV 语义一次改造阶段”。
-> 目录口径补充（2026-02-20）：测试目录已重构到 `test/core|engine|offline|online|parity|ops|utils`。
-
-## 0.1 阅读优先级（当前 vs 历史）
-
-1. 当前执行口径优先：`doc/qwen2_next_dev_plan_2026-02.md`。
-2. 本文中包含多个 `As-Built` 段，均为历史阶段快照，不代表当前最新状态。
-3. 若本文历史段与当前执行版冲突，以“当前执行版”优先。
 
 ## 1. 目标与范围
 
 设计目标：
 
 1. 支持 Qwen2 在本仓库推理栈完成离线与在线推理。
-2. 阶段0即建立通用多模型接口（Core/Engine/Server），而不是仅做 Qwen2 专用实现。
+2. 建立通用多模型接口（Core/Engine/Server），而不是仅做 Qwen2 专用实现。
 3. 支持多序列并发推理，具备连续批处理与 KV-Cache 复用能力。
 4. 为后续 LLM 与多模态模型扩展预留接口。
 5. 设计需考虑后续分布式推理场景（如张量并行）。
@@ -33,8 +22,8 @@
 对齐范围（统一口径）：
 
 1. Core 层按“通用 SoA batch + 资源不足失败返回 + 多布局 KV（SLOT/BLOCK）”语义演进。
-2. Engine 离线链路按 vLLM/`nano-vllm` 的 `LLM.generate -> engine step` 思路对齐（阶段1落地）。
-3. Online 服务按 vLLM API Server 分层对齐（阶段2落地）；阶段0不要求 online 全链路实现。
+2. offline 离线链路按 vLLM/`nano-vllm` 的 `LLM.generate -> engine step` 思路对齐。
+3. Online 服务按 vLLM API Server 分层对齐；
 
 ## 2. 分层与责任边界（需求）
 
@@ -44,26 +33,11 @@
 4. Core 层（C++）：负责 batch/ubatch 执行、KV-Cache 管理与算子计算。
 5. 多模型抽象层：提供模型无关的创建/执行/输出/KV 接口，模型私有 API 仅用于内部扩展，不作为主线对外协议。
 
-### 2.1 历史实现快照（As-Built，2026-02-11）
 
-1. Core 主线接口已统一到 `llaisysModel*`，并覆盖 `create/decode/logits/kv_seq_*`。
-2. `Qwen2Model::decode` 已改为真正 batch 执行（单轮图执行处理整批 token），不再逐 token 调 `infer(..., 1)`。
-3. KV 已进入双实现并存阶段：SLOT 路径支持多 `seq_id` 关联，BLOCK 路径基于 block table 演进。
-4. 多序列隔离在同一轮前向中通过 mask 生效（`seq_id` 集合交集 + `pos` 因果约束）。
-5. Engine/Server 阶段2主链路已落地（offline + online + SSE + cancel + WebUI 基础多会话）。
-6. KV 当前为双实现并存：`SLOT(UnifiedKvImpl)` + `BLOCK(PagedKvImpl)`，通过 `kv_cache_layout` 切换。
-7. BLOCK 模式已可用但仍在性能链路重构中（page-native attention / block sparse 未完成）。
-
-### 2.2 当前重构策略（2026-02）
-
-1. `BLOCK` 是性能主线（连续批处理、前缀缓存、后续 page attention）。
-2. `SLOT` 作为兼容/回归/性能对照模式，优先保证基础可用，不再承担主要性能演进。
-3. Python 侧现有 `engine/scheduler/executor/worker` 保留；后续调度语义向 request-state + block manager 收敛。
-4. `kv_seq_*` 继续保留兼容接口，但不作为 BLOCK 长期主语义；BLOCK 下将逐步收敛到 request 生命周期接口。
 
 ## 3. Core 层需求（C++）
 
-### 3.1 通用模型接口（阶段0必须）
+### 3.1 外部接口支持
 
 1. 提供通用模型句柄与 API（如 `LlaisysModel*`）：
    - create/destroy；
@@ -71,33 +45,27 @@
    - logits 查询；
    - KV 序列管理接口。
 2. 支持模型类型枚举（至少包含 `qwen2`），并通过统一入口创建模型实例。
-3. 对外主线仅保留通用模型 C API；`qwen2` 专用包装若存在仅作为迁移期可选项，不纳入主线验收。
-4. 需提供通用权重槽位安全替换能力（`llaisysModelReplaceWeight`），用于避免重复赋值时句柄泄漏。
+3. 需提供通用权重槽位安全替换能力（`llaisysModelReplaceWeight`），用于避免重复赋值时句柄泄漏。
 
 ### 3.2 内存与资源管理
 
 1. 模型权重加载与生命周期管理。
-2. 模型计算中间 buffer 设计与复用。
-3. KV-Cache 设计与多序列支持。
-4. 输出 buffer 管理。
+2. 模型计算中间 buffer 、输出 buffer、KV-Cache buffer复用管理，避免频繁申请释放内存。
 
 ### 3.3 KV-Cache 行为要求
 
-1. 支持双布局：`SLOT`（兼容）与 `BLOCK`（主线）。
-2. 支持多序列混排，但 attention 必须按 seq_id 严格隔离。
+1. 支持双布局：`SLOT`（对齐llama.cpp）与 `BLOCK`（对齐vllm）。
+2. 支持多序列混排，但 attention 必须按 seq_id 和pos严格隔离。
 3. 资源不足默认失败返回，不自动回收或截断。
-4. （可选，阶段三）滑窗注意力不改变逻辑 pos，仅通过 mask 屏蔽窗口外 token。
-5. BLOCK 主线需提供请求级前缀复用、释放/截断、回滚与可观测接口；SLOT 仅要求基础兼容能力。
-6. Core 层默认不强制每 `seq_id` 的 slot/cell 硬配额；请求公平性与限额由 Engine/Server 层负责。
-7. 兼容期可保留 `prepare/apply_ubatch/rollback_ubatch`；目标态应收敛到 request-step 事务语义（allocate/commit/rollback/free）。
-8. 阶段2允许“单 stream 执行 + 多 stream 元数据预留”形态，但需在文档中明确未打通项，避免误判为全量对齐。
+4. BLOCK 布局需提供请求级前缀复用。
+5. Slot 布局需提供释放/截断、回滚与可观测接口。
 
 ### 3.4 计算图与算子
 
 1. 计算图覆盖 embedding -> N x block -> final norm -> lm head。
 2. block 需包含 attention（Q/K/V 投影 + RoPE + KV-Cache 读写 + 输出投影）、MLP（gate/up/down + SwiGLU）、残差连接与 RMSNorm。
 3. RoPE 位置与 KV-Cache 对齐，新增 token 使用其逻辑 pos。
-4. 支持 batch/ubatch 执行路径，prefill/decode 仅体现为输入形态差异。
+4. 支持 batch执行路径，不区分prefill/decode差异。
 5. 常用算子：embedding、linear、rms_norm、rope、self_attention、swiglu、argmax。
 6. 算子支持常见 dtype 并具备一致性检查。
 
@@ -113,7 +81,7 @@
 ### 4.2 EngineClient（客户端层）
 
 1. 负责入口层与 EngineCore（`LLMEngine`）之间的调用封装。
-2. 支持同进程直连与可切换 IPC/RPC 形态（后续多进程部署）。
+2. 支持同进程直连与可切换 IPC/RPC 形态（目前为多线程，后续多进程部署。可能存在性能阻塞）。
 3. 负责请求提交、结果拉取、流式回传、取消信号透传。
 
 ### 4.3 LLMEngine / EngineCore（核心编排层）
@@ -126,7 +94,7 @@
 ### 4.4 Scheduler
 
 1. 维护请求队列与公平调度策略（prefill/decode 混排）。
-2. 组 batch/ubatch，并控制每轮执行 token 集合与并发窗口。
+2. 组 batch，并控制每轮执行 token 集合与并发窗口。
 3. 支持连续批处理与多序列并发。
 4. 负责请求级上下文配额与增量 token 配额（防止单请求长期占用）。
 5. 仅产出执行计划，不直接做模型前向或采样。
@@ -135,20 +103,19 @@
 
 1. 接收 Scheduler 计划并组织一次 step 的执行。
 2. 协调 Worker 执行模型前向，收集 `logits + output_ids`。
-3. 触发执行侧采样链（阶段1 argmax，阶段2 top-k/top-p/temperature）。
+3. 触发执行侧采样链（argmax/top-k/top-p/temperature）。
 4. 触发停止条件判断（max_new_tokens/eos/stop token/stop string）。
 
 ### 4.6 Worker（执行单元）
 
 1. 实例化并持有模型适配器（`python/llaisys/models/*.py`）与 Core 句柄。
 2. 执行模型前向（decode/prefill），返回当前 step 的 logits 行。
-3. 仅执行计算，不负责调度策略、停止条件决策与请求生命周期管理。
+3. 仅执行计算，不负责调度策略、停止条件决策与请求生命周期管理，请求公平性与slot/cell 限额由 Engine 层负责。
 4. 采样可在 Worker/Executor 执行侧完成（对齐 vLLM“执行侧采样”口径），但入口层与 ModelRunner 不参与采样决策。
 5. 支持多设备扩展预留（单机多卡 TP 为后续目标）。
-
 ### 4.7 Sampler + OutputProcessor（执行侧采样 + 引擎侧结果组织）
 
-1. Sampler 基于 logits 与 SamplingParams 产出下一 token；采样决策在执行侧（Worker/Executor），不在入口层。
+1. Sampler 基于 logits 与 SamplingParams 产出下一 token；采样决策在执行侧（Worker/Executor）。
 2. OutputProcessor 在 EngineCore 结果聚合路径执行：将 sampled token 增量转为文本增量并维护 UTF-8 拼接正确性。
 3. OutputProcessor 统一组织输出对象（token/text/finish_reason/usage），在线流式与离线非流式复用同一语义。
 4. 执行侧与结果组织侧边界固定：执行侧产出 token 增量，EngineCore 负责请求级输出拼装。
@@ -199,7 +166,7 @@
 2. 支持 SSE 流式响应解析与渲染。
 3. 支持请求取消与错误提示。
 
-### 6.3（可选）多会话与 KV 复用
+### 6.3 多会话与 KV 复用
 
 1. 支持多会话创建/切换。
 2. 支持修改历史问题并重新生成回答。
