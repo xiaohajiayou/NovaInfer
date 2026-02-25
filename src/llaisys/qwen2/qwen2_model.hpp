@@ -10,6 +10,7 @@
 #include "../runtime/weights/weights.hpp"
 
 #include "../../ops/add/op.hpp"
+#include "../../ops/argmax/op.hpp"
 #include "../../ops/embedding/op.hpp"
 #include "../../ops/linear/op.hpp"
 #include "../../ops/rms_norm/op.hpp"
@@ -60,6 +61,7 @@ public:
     float *logits_ith(int32_t i) noexcept;
     int32_t n_outputs() const noexcept;
     const int32_t *output_ids() const noexcept;
+    const int32_t *sampled_ids() const noexcept;
 
     // KV management APIs exposed through C wrapper:
     // - SLOT layout: kv_seq_* are fully implemented.

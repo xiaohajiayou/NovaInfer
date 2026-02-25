@@ -140,5 +140,95 @@ namespace llaisys::ops::cpu {
             EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
         }
     }
+
+    void linear_indexed(tensor_t out, tensor_t in, tensor_t row_indices, tensor_t weight, tensor_t bias) {
+        const size_t B = row_indices->shape()[0];
+        const size_t M = in->shape()[0];
+        const size_t K = in->shape()[1];
+        const size_t N = weight->shape()[0];
+        ASSERT(weight->shape()[1] == K, "LinearIndexed: weight shape mismatch.");
+        ASSERT(out->shape()[0] == B && out->shape()[1] == N, "LinearIndexed: output shape mismatch.");
+        const auto *rows = reinterpret_cast<const int32_t *>(row_indices->data());
+
+        switch (out->dtype()) {
+        case LLAISYS_DTYPE_F32: {
+            auto *out_ptr = reinterpret_cast<float *>(out->data());
+            const auto *in_ptr = reinterpret_cast<const float *>(in->data());
+            const auto *w_ptr = reinterpret_cast<const float *>(weight->data());
+            const auto *b_ptr = bias ? reinterpret_cast<const float *>(bias->data()) : nullptr;
+            #if defined(_OPENMP)
+            #pragma omp parallel for collapse(2) schedule(static)
+            #endif
+            for (int64_t bi = 0; bi < static_cast<int64_t>(B); ++bi) {
+                for (int64_t ni = 0; ni < static_cast<int64_t>(N); ++ni) {
+                    const size_t b = static_cast<size_t>(bi);
+                    const size_t n = static_cast<size_t>(ni);
+                    const int32_t r = rows[b];
+                    ASSERT(r >= 0 && static_cast<size_t>(r) < M, "LinearIndexed: row index out of range.");
+                    const float *x_row = in_ptr + static_cast<size_t>(r) * K;
+                    const float *w_row = w_ptr + n * K;
+                    float acc = b_ptr ? b_ptr[n] : 0.0f;
+                    for (size_t k = 0; k < K; ++k) {
+                        acc += x_row[k] * w_row[k];
+                    }
+                    out_ptr[b * N + n] = acc;
+                }
+            }
+            return;
+        }
+        case LLAISYS_DTYPE_BF16: {
+            auto *out_ptr = reinterpret_cast<llaisys::bf16_t *>(out->data());
+            const auto *in_ptr = reinterpret_cast<const llaisys::bf16_t *>(in->data());
+            const auto *w_ptr = reinterpret_cast<const llaisys::bf16_t *>(weight->data());
+            const auto *b_ptr = bias ? reinterpret_cast<const llaisys::bf16_t *>(bias->data()) : nullptr;
+            #if defined(_OPENMP)
+            #pragma omp parallel for collapse(2) schedule(static)
+            #endif
+            for (int64_t bi = 0; bi < static_cast<int64_t>(B); ++bi) {
+                for (int64_t ni = 0; ni < static_cast<int64_t>(N); ++ni) {
+                    const size_t b = static_cast<size_t>(bi);
+                    const size_t n = static_cast<size_t>(ni);
+                    const int32_t r = rows[b];
+                    ASSERT(r >= 0 && static_cast<size_t>(r) < M, "LinearIndexed: row index out of range.");
+                    const auto *x_row = in_ptr + static_cast<size_t>(r) * K;
+                    const auto *w_row = w_ptr + n * K;
+                    float acc = b_ptr ? llaisys::utils::cast<float>(b_ptr[n]) : 0.0f;
+                    for (size_t k = 0; k < K; ++k) {
+                        acc += llaisys::utils::cast<float>(x_row[k]) * llaisys::utils::cast<float>(w_row[k]);
+                    }
+                    out_ptr[b * N + n] = llaisys::utils::cast<llaisys::bf16_t>(acc);
+                }
+            }
+            return;
+        }
+        case LLAISYS_DTYPE_F16: {
+            auto *out_ptr = reinterpret_cast<llaisys::fp16_t *>(out->data());
+            const auto *in_ptr = reinterpret_cast<const llaisys::fp16_t *>(in->data());
+            const auto *w_ptr = reinterpret_cast<const llaisys::fp16_t *>(weight->data());
+            const auto *b_ptr = bias ? reinterpret_cast<const llaisys::fp16_t *>(bias->data()) : nullptr;
+            #if defined(_OPENMP)
+            #pragma omp parallel for collapse(2) schedule(static)
+            #endif
+            for (int64_t bi = 0; bi < static_cast<int64_t>(B); ++bi) {
+                for (int64_t ni = 0; ni < static_cast<int64_t>(N); ++ni) {
+                    const size_t b = static_cast<size_t>(bi);
+                    const size_t n = static_cast<size_t>(ni);
+                    const int32_t r = rows[b];
+                    ASSERT(r >= 0 && static_cast<size_t>(r) < M, "LinearIndexed: row index out of range.");
+                    const auto *x_row = in_ptr + static_cast<size_t>(r) * K;
+                    const auto *w_row = w_ptr + n * K;
+                    float acc = b_ptr ? llaisys::utils::cast<float>(b_ptr[n]) : 0.0f;
+                    for (size_t k = 0; k < K; ++k) {
+                        acc += llaisys::utils::cast<float>(x_row[k]) * llaisys::utils::cast<float>(w_row[k]);
+                    }
+                    out_ptr[b * N + n] = llaisys::utils::cast<llaisys::fp16_t>(acc);
+                }
+            }
+            return;
+        }
+        default:
+            EXCEPTION_UNSUPPORTED_DATATYPE(out->dtype());
+        }
+    }
     
     } // namespace llaisys::ops::cpu

@@ -42,6 +42,7 @@ class SamplingParams:
     top_p: float = 1.0
     temperature: float = 1.0
     seed: Optional[int] = None
+    ignore_eos: bool = False
     stop_token_ids: Sequence[int] = field(default_factory=tuple)
     stop: Sequence[str] = field(default_factory=tuple)
 
@@ -50,6 +51,11 @@ class SamplingParams:
 class BatchPlan:
     token_ids: List[int]
     logits_mask: List[int]
+    temperatures: Optional[List[float]] = None
+    top_ps: Optional[List[float]] = None
+    top_ks: Optional[List[int]] = None
+    seeds: Optional[List[int]] = None
+    has_seeds: Optional[List[int]] = None
     pos_ids: Optional[List[int]] = None
     seq_ids: Optional[List[int]] = None
     slot_mapping: Optional[List[int]] = None
@@ -57,12 +63,6 @@ class BatchPlan:
     batch_seq_ids: Optional[List[int]] = None
     block_tables: Optional[List[int]] = None
     block_table_width: int = 0
-
-
-@dataclass(frozen=True)
-class StepResult:
-    sampled_token_ids: List[int]
-    output_ids: List[int]
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,8 @@ public:
     // dtype: source row dtype (will be converted to f32).
     // output_id: token index inside current batch.
     void append_row(const std::byte *row, llaisysDataType_t dtype, int32_t output_id);
+    // Append one output token index without materializing logits.
+    void append_output_id(int32_t output_id);
 
     // Return pointer to the first logits row, or nullptr when empty.
     float *logits() noexcept;
@@ -32,6 +34,10 @@ public:
     int32_t n_outputs() const noexcept;
     // Return row->token-index mapping buffer, or nullptr when empty.
     const int32_t *output_ids() const noexcept;
+    // Append one sampled token id for the latest decode row.
+    void append_sampled_id(int32_t sampled_id);
+    // Return sampled token ids aligned with output_ids(), or nullptr when empty.
+    const int32_t *sampled_ids() const noexcept;
 
 private:
     // Vocabulary size (number of logits per row).
@@ -40,6 +46,8 @@ private:
     std::vector<float> logits_f32_;
     // output_ids_[j] is the batch token index corresponding to row j.
     std::vector<int32_t> output_ids_;
+    // sampled_ids_[j] is sampled token id for output row j.
+    std::vector<int32_t> sampled_ids_;
 };
 
 } // namespace llaisys::runtime::output

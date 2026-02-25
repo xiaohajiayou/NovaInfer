@@ -38,6 +38,7 @@ public:
 
         output_ids_.clear();
         output_logits_.clear();
+        sampled_ids_.clear();
         for (size_t i = 0; i < ntoken; ++i) {
             const int64_t seq_id = (batch.seq_id && batch.seq_id[i]) ? batch.seq_id[i][0] : 0;
             auto it = seq_pos_max_.find(seq_id);
@@ -59,6 +60,7 @@ public:
                 output_logits_.push_back(v0 + 1.0f);
                 output_logits_.push_back(v0 + 2.0f);
                 output_logits_.push_back(v0 + 3.0f);
+                sampled_ids_.push_back(static_cast<int32_t>(batch.token[i] & 3));
             }
         }
         return 0;
@@ -78,6 +80,9 @@ public:
     }
     const int32_t *output_ids() const noexcept {
         return output_ids_.empty() ? nullptr : output_ids_.data();
+    }
+    const int32_t *sampled_ids() const noexcept {
+        return sampled_ids_.empty() ? nullptr : sampled_ids_.data();
     }
 
     KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
@@ -165,6 +170,7 @@ private:
     std::unordered_map<int64_t, int64_t> seq_pos_max_{};
     std::vector<float> output_logits_{};
     std::vector<int32_t> output_ids_{};
+    std::vector<int32_t> sampled_ids_{};
 };
 
 struct LlaisysModelImpl {
@@ -187,6 +193,11 @@ void free_batch_storage(struct LlaisysBatch &batch) {
     delete[] batch.n_seq_id;
     delete[] batch.seq_id;
     delete[] batch.logits;
+    delete[] batch.temperatures;
+    delete[] batch.top_ps;
+    delete[] batch.top_ks;
+    delete[] batch.seeds;
+    delete[] batch.has_seeds;
     delete[] batch.slot_mapping;
     delete[] batch.context_lens;
     delete[] batch.batch_seq_ids;
@@ -199,6 +210,11 @@ void free_batch_storage(struct LlaisysBatch &batch) {
     batch.n_seq_id = nullptr;
     batch.seq_id = nullptr;
     batch.logits = nullptr;
+    batch.temperatures = nullptr;
+    batch.top_ps = nullptr;
+    batch.top_ks = nullptr;
+    batch.seeds = nullptr;
+    batch.has_seeds = nullptr;
     batch.slot_mapping = nullptr;
     batch.context_lens = nullptr;
     batch.batch_seq_ids = nullptr;
@@ -235,12 +251,22 @@ __export struct LlaisysBatch llaisysBatchInit(int32_t n_tokens, int32_t embd, in
         batch.n_seq_id = new int32_t[n_tokens]();
         batch.seq_id = new int64_t *[n_tokens]();
         batch.logits = new int8_t[n_tokens]();
+        batch.temperatures = new float[n_tokens]();
+        batch.top_ps = new float[n_tokens]();
+        batch.top_ks = new int32_t[n_tokens]();
+        batch.seeds = new int64_t[n_tokens]();
+        batch.has_seeds = new int8_t[n_tokens]();
 
         for (int32_t i = 0; i < n_tokens; ++i) {
             batch.seq_id[i] = new int64_t[seq_cap]();
             batch.n_seq_id[i] = 1;
             batch.seq_id[i][0] = 0;
             batch.logits[i] = 0;
+            batch.temperatures[i] = 1.0f;
+            batch.top_ps[i] = 1.0f;
+            batch.top_ks[i] = 0;
+            batch.seeds[i] = 0;
+            batch.has_seeds[i] = 0;
         }
     } catch (const std::bad_alloc &) {
         free_batch_storage(batch);
@@ -503,6 +529,20 @@ __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model) {
         return model->impl->qwen2 ? model->impl->qwen2->output_ids() : nullptr;
     case LLAISYS_MODEL_TYPE_MOCK:
         return model->impl->mock ? model->impl->mock->output_ids() : nullptr;
+    default:
+        return nullptr;
+    }
+}
+
+__export const int32_t *llaisysModelSampledIds(struct LlaisysModel *model) {
+    if (model == nullptr || model->impl == nullptr) {
+        return nullptr;
+    }
+    switch (model->impl->type) {
+    case LLAISYS_MODEL_TYPE_QWEN2:
+        return model->impl->qwen2 ? model->impl->qwen2->sampled_ids() : nullptr;
+    case LLAISYS_MODEL_TYPE_MOCK:
+        return model->impl->mock ? model->impl->mock->sampled_ids() : nullptr;
     default:
         return nullptr;
     }

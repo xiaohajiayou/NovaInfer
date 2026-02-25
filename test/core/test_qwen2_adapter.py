@@ -39,7 +39,7 @@ def test_qwen2_adapter_uses_generic_model_api_symbols():
     assert "llaisysModelCreate" in source
     assert "llaisysModelWeights" in source
     assert "llaisysModelDecode" in source
-    assert "llaisysModelGetLogitsIth" in source
+    assert "llaisysModelSampledIds" in source
 
 
 if __name__ == "__main__":

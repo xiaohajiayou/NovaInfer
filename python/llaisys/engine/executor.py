@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-from .sampling import Sampler
 from .scheduler import SchedulerOutputs
-from .types import BatchPlan, SamplingParams, StepResult
+from .types import BatchPlan, SamplingParams
 from .worker import Worker
 
 
 class Executor:
-    """Coordinates one engine step: forward + sampling."""
+    """Coordinates one engine step: forward + native sampling."""
 
-    def __init__(self, worker: Worker, sampler: Sampler | None = None):
+    def __init__(self, worker: Worker):
         self._worker = worker
-        self._sampler = sampler if sampler is not None else Sampler()
-
-    def execute_step(self, plan: BatchPlan, sampling_params: SamplingParams) -> StepResult:
-        output_ids, logits_rows = self._worker.execute(plan)
-        sampled = self._sampler.sample(logits_rows, sampling_params)
-        return StepResult(sampled_token_ids=sampled, output_ids=output_ids)
 
     def execute_scheduler_step(
         self,
@@ -24,10 +17,12 @@ class Executor:
         sampling_params: SamplingParams | None = None,
         sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ) -> tuple[list[int], list[str]]:
-        plan, token_idx_to_req_id = self._flatten(outputs)
+        plan, token_idx_to_req_id = self._flatten(
+            outputs, sampling_params=sampling_params, sampling_params_by_req=sampling_params_by_req
+        )
         if not plan.token_ids:
             return [], []
-        output_ids, logits_rows = self._worker.execute(plan)
+        output_ids, sampled = self._worker.execute(plan)
 
         # Keep compatibility with runners that do not return explicit output_ids.
         if not output_ids:
@@ -40,36 +35,23 @@ class Executor:
                 raise RuntimeError("executor output id cannot be mapped to request")
             req_ids.append(rid)
 
-        if len(logits_rows) != len(req_ids):
-            raise RuntimeError("executor logits/output mapping size mismatch")
-
-        params_rows: list[SamplingParams] = []
-        for rid in req_ids:
-            if sampling_params_by_req is not None:
-                params = sampling_params_by_req.get(str(rid))
-                if params is not None:
-                    params_rows.append(params)
-                    continue
-            if sampling_params is None:
-                raise RuntimeError("missing sampling params for request")
-            params_rows.append(sampling_params)
-
-        if hasattr(self._sampler, "sample_per_row"):
-            sampled = [int(t) for t in self._sampler.sample_per_row(logits_rows, params_rows)]
-        else:
-            sampled = [
-                int(self._sampler.sample([row], params)[0])
-                for row, params in zip(logits_rows, params_rows)
-            ]
-
         if len(sampled) != len(req_ids):
             raise RuntimeError("executor sampled/output mapping size mismatch")
-        return sampled, req_ids
+        return [int(x) for x in sampled], req_ids
 
     @staticmethod
-    def _flatten(outputs: SchedulerOutputs) -> tuple[BatchPlan, dict[int, str]]:
+    def _flatten(
+        outputs: SchedulerOutputs,
+        sampling_params: SamplingParams | None = None,
+        sampling_params_by_req: dict[str, SamplingParams] | None = None,
+    ) -> tuple[BatchPlan, dict[int, str]]:
         token_ids: list[int] = []
         logits_mask: list[int] = []
+        temperatures: list[float] = []
+        top_ps: list[float] = []
+        top_ks: list[int] = []
+        seeds: list[int] = []
+        has_seeds: list[int] = []
         seq_ids: list[int] = []
         pos_ids: list[int] = []
         token_index_to_request_id: dict[int, str] = {}
@@ -91,8 +73,24 @@ class Executor:
                 seq_pos = [len(seq) - 1]
                 seq_mask = [1]
 
+            rid = str(seq.request_id)
+            params = sampling_params_by_req.get(rid) if sampling_params_by_req is not None else None
+            if params is None:
+                if sampling_params is None:
+                    raise RuntimeError("missing sampling params for request")
+                params = sampling_params
+
             token_ids.extend(seq_tokens)
             logits_mask.extend(seq_mask)
+            temperatures.extend([float(params.temperature)] * len(seq_tokens))
+            top_ps.extend([float(params.top_p)] * len(seq_tokens))
+            top_ks.extend([int(params.top_k)] * len(seq_tokens))
+            if params.seed is None:
+                has_seeds.extend([0] * len(seq_tokens))
+                seeds.extend([0] * len(seq_tokens))
+            else:
+                has_seeds.extend([1] * len(seq_tokens))
+                seeds.extend([int(params.seed)] * len(seq_tokens))
             pos_ids.extend(seq_pos)
             seq_ids.extend([int(seq.seq_id)] * len(seq_tokens))
             if seq.block_table:
@@ -127,6 +125,11 @@ class Executor:
             BatchPlan(
                 token_ids=token_ids,
                 logits_mask=logits_mask,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                top_ks=top_ks,
+                seeds=seeds,
+                has_seeds=has_seeds,
                 pos_ids=pos_ids,
                 seq_ids=seq_ids,
                 slot_mapping=slot_mapping if slot_mapping else None,

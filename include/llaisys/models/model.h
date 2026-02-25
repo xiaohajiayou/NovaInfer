@@ -65,6 +65,7 @@ __C {
     __export float *llaisysModelGetLogitsIth(struct LlaisysModel *model, int32_t i);
     __export int32_t llaisysModelNOutputs(struct LlaisysModel *model);
     __export const int32_t *llaisysModelOutputIds(struct LlaisysModel *model);
+    __export const int32_t *llaisysModelSampledIds(struct LlaisysModel *model);
 
     // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):
     // 0: OK

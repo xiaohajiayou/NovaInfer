@@ -17,6 +17,12 @@ __C {
         int32_t *n_seq_id; // [n_tokens], optional seq-id count per token
         int64_t **seq_id;  // [n_tokens][n_seq_id[i]], optional seq-id set per token
         int8_t *logits;    // [n_tokens], non-zero means keep logits for this token
+        // ---- Per-token sampling controls (optional; consumed when logits[i] != 0) ----
+        float *temperatures; // [n_tokens], default 1.0 when null
+        float *top_ps;       // [n_tokens], default 1.0 when null
+        int32_t *top_ks;     // [n_tokens], default 0 when null
+        int64_t *seeds;      // [n_tokens], seed values when has_seeds[i] != 0
+        int8_t *has_seeds;   // [n_tokens], non-zero means seeds[i] is valid
 
         // ---- Paged/BLOCK explicit mapping fields (required in BLOCK mode) ----
         int32_t *slot_mapping;    // [n_tokens], physical KV slot index per token

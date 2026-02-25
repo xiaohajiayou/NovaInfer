@@ -104,26 +104,45 @@ class Worker:
         return self._kv_cache_capacity_tokens
 
     def execute(self, plan: BatchPlan):
+        def _normalize(result):
+            output_ids, second = result
+            if not second:
+                return output_ids, []
+            first = second[0]
+            if isinstance(first, (int, bool)):
+                return output_ids, [int(x) for x in second]
+            # Legacy runners may still return logits rows; map to greedy token ids.
+            sampled = []
+            for row in second:
+                best_idx = max(range(len(row)), key=lambda idx: row[idx])
+                sampled.append(int(best_idx))
+            return output_ids, sampled
+
         try:
-            return self._model_runner.decode_batch(
+            return _normalize(self._model_runner.decode_batch(
                 token_ids=plan.token_ids,
                 pos_ids=plan.pos_ids,
                 seq_ids=plan.seq_ids,
                 logits_mask=plan.logits_mask,
+                temperatures=plan.temperatures,
+                top_ps=plan.top_ps,
+                top_ks=plan.top_ks,
+                seeds=plan.seeds,
+                has_seeds=plan.has_seeds,
                 slot_mapping=plan.slot_mapping,
                 context_lens=plan.context_lens,
                 batch_seq_ids=plan.batch_seq_ids,
                 block_tables=plan.block_tables,
                 block_table_width=plan.block_table_width,
-            )
+            ))
         except TypeError:
             # Backward-compatible fallback for dummy/stub runners in tests.
-            return self._model_runner.decode_batch(
+            return _normalize(self._model_runner.decode_batch(
                 token_ids=plan.token_ids,
                 pos_ids=plan.pos_ids,
                 seq_ids=plan.seq_ids,
                 logits_mask=plan.logits_mask,
-            )
+            ))
 
     def free_request(self, seq_id: int) -> None:
         # Capability probing to avoid coupling engine lifecycle to one runner API.

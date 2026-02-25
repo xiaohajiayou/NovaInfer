@@ -559,7 +559,7 @@ class LLMEngine:
 
     def _maybe_finish_reason(self, request_context: _RequestContext, token_id: int) -> str | None:
         sampling_params = request_context.sampling_params
-        if token_id == self._worker.end_token_id:
+        if (not bool(sampling_params.ignore_eos)) and token_id == self._worker.end_token_id:
             return "eos_token"
         if sampling_params.stop_token_ids and token_id in set(sampling_params.stop_token_ids):
             return "stop_token"

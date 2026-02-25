@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ctypes import POINTER, byref, c_int, c_int32, c_void_p, cast
+from ctypes import POINTER, byref, c_int, c_void_p, cast
 from dataclasses import dataclass
 
 import numpy as np
@@ -132,20 +132,10 @@ def test_output_rows_match_logits_mask_and_ith_access():
         output_ids = np.ctypeslib.as_array(output_ids_ptr, shape=(n_outputs,))
         assert output_ids.tolist() == [0, 2]
 
-        logits_ptr = LIB_LLAISYS.llaisysModelGetLogits(model)
-        assert bool(logits_ptr)
-        logits = np.ctypeslib.as_array(logits_ptr, shape=(n_outputs * meta.voc,)).reshape(n_outputs, meta.voc)
-
-        row0_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(0))
-        row1_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(1))
-        assert bool(row0_ptr)
-        assert bool(row1_ptr)
-
-        row0 = np.ctypeslib.as_array(row0_ptr, shape=(meta.voc,))
-        row1 = np.ctypeslib.as_array(row1_ptr, shape=(meta.voc,))
-        assert np.allclose(logits[0], row0)
-        assert np.allclose(logits[1], row1)
-        assert not bool(LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(2)))
+        sampled_ids_ptr = LIB_LLAISYS.llaisysModelSampledIds(model)
+        assert bool(sampled_ids_ptr)
+        sampled_ids = np.ctypeslib.as_array(sampled_ids_ptr, shape=(n_outputs,))
+        assert sampled_ids.shape[0] == n_outputs
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
 
@@ -171,10 +161,10 @@ def test_default_logits_behavior_returns_last_row_only():
         assert int(LIB_LLAISYS.llaisysModelNOutputs(model)) == 1
         output_ids = np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model), shape=(1,))
         assert output_ids.tolist() == [2]
-        last_row = LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(0))
-        assert bool(last_row)
-        row = np.ctypeslib.as_array(last_row, shape=(meta.voc,))
-        assert row.shape[0] == meta.voc
+        sampled_ids_ptr = LIB_LLAISYS.llaisysModelSampledIds(model)
+        assert bool(sampled_ids_ptr)
+        sampled_ids = np.ctypeslib.as_array(sampled_ids_ptr, shape=(1,))
+        assert sampled_ids.shape[0] == 1
     finally:
         LIB_LLAISYS.llaisysModelDestroy(model)
 

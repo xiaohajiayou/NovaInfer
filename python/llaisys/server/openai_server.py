@@ -10,12 +10,6 @@ from .schemas import ChatCompletionRequest, ChatMessage
 
 
 @dataclass
-class _ReasoningSplit:
-    reasoning: str
-    content: str
-
-
-@dataclass
 class _StreamingReasoningState:
     previous_text: str = ""
 

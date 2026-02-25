@@ -128,9 +128,8 @@ def test_model_create_decode_logits_and_kv_api():
 
         n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(model))
         assert n_outputs == 1
-        assert bool(LIB_LLAISYS.llaisysModelGetLogits(model))
-        assert bool(LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(0)))
-        assert not bool(LIB_LLAISYS.llaisysModelGetLogitsIth(model, c_int32(1)))
+        sampled_ids = LIB_LLAISYS.llaisysModelSampledIds(model)
+        assert bool(sampled_ids)
 
         keep0 = int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(0)))
         keep1 = int(LIB_LLAISYS.llaisysModelKvSeqKeep(model, c_int64(1)))

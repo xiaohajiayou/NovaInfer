@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import gc
 
-import numpy as np
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -130,13 +129,13 @@ def llaisys_model_runner_infer(
         )
 
     if is_block_layout:
-        _, logits_rows = _decode_block(input_tokens, pos_start=0)
+        _, sampled_ids = _decode_block(input_tokens, pos_start=0)
     else:
-        _, logits_rows = model_runner.decode_batch(token_ids=input_tokens)
-    if not logits_rows:
-        raise RuntimeError("ModelRunner prefill returned no logits")
+        _, sampled_ids = model_runner.decode_batch(token_ids=input_tokens)
+    if not sampled_ids:
+        raise RuntimeError("ModelRunner prefill returned no sampled ids")
 
-    next_token = int(np.argmax(logits_rows[-1]))
+    next_token = int(sampled_ids[-1])
     output_tokens.append(next_token)
     decode_pos = len(input_tokens)
 
@@ -144,12 +143,12 @@ def llaisys_model_runner_infer(
         if next_token == int(model_runner.end_token_id):
             break
         if is_block_layout:
-            _, logits_rows = _decode_block([next_token], pos_start=decode_pos)
+            _, sampled_ids = _decode_block([next_token], pos_start=decode_pos)
         else:
-            _, logits_rows = model_runner.decode_batch(token_ids=[next_token])
-        if not logits_rows:
-            raise RuntimeError("ModelRunner decode returned no logits")
-        next_token = int(np.argmax(logits_rows[-1]))
+            _, sampled_ids = model_runner.decode_batch(token_ids=[next_token])
+        if not sampled_ids:
+            raise RuntimeError("ModelRunner decode returned no sampled ids")
+        next_token = int(sampled_ids[-1])
         output_tokens.append(next_token)
         decode_pos += 1
         if next_token == int(model_runner.end_token_id):

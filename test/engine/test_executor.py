@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
-
 from llaisys.engine.executor import Executor
 from llaisys.engine.scheduler import SchedulerOutputs
 from llaisys.engine.sequence import Sequence
@@ -13,11 +11,8 @@ class DummyWorker:
         _ = plan
         # Return out order intentionally swapped to validate req-id mapping.
         output_ids = [1, 0]
-        logits_rows = [
-            np.array([0.1, 0.2], dtype=np.float32),
-            np.array([0.3, 0.4], dtype=np.float32),
-        ]
-        return output_ids, logits_rows
+        sampled_ids = [22, 11]
+        return output_ids, sampled_ids
 
 
 class CaptureWorker:
@@ -27,25 +22,13 @@ class CaptureWorker:
     def execute(self, plan):
         self.last_plan = plan
         output_ids = [1]
-        logits_rows = [np.array([0.0, 1.0], dtype=np.float32)]
-        return output_ids, logits_rows
-
-
-class FakeSampler:
-    def sample(self, logits_rows, params):
-        _ = (logits_rows, params)
-        raise AssertionError("sample() should not be called in this test")
-
-    def sample_per_row(self, logits_rows, params_rows):
-        _ = logits_rows
-        # Encode params identity into outputs for assertion.
-        return [int(p.top_k) for p in params_rows]
+        sampled_ids = [7]
+        return output_ids, sampled_ids
 
 
 def test_executor_uses_per_request_sampling_params_in_output_order():
     worker = DummyWorker()
-    sampler = FakeSampler()
-    ex = Executor(worker=worker, sampler=sampler)
+    ex = Executor(worker=worker)
 
     seq1 = Sequence(
         request_id="req-1",
@@ -77,7 +60,7 @@ def test_executor_uses_per_request_sampling_params_in_output_order():
 
 def test_executor_prefill_flattens_only_uncached_suffix():
     worker = CaptureWorker()
-    ex = Executor(worker=worker, sampler=FakeSampler())
+    ex = Executor(worker=worker)
     seq = Sequence(
         request_id="req-1",
         seq_id=1,
@@ -97,3 +80,7 @@ def test_executor_prefill_flattens_only_uncached_suffix():
     assert worker.last_plan is not None
     assert worker.last_plan.token_ids == [12, 13]
     assert worker.last_plan.pos_ids == [2, 3]
+    assert worker.last_plan.logits_mask == [0, 1]
+    assert worker.last_plan.temperatures == [1.0, 1.0]
+    assert worker.last_plan.top_ps == [1.0, 1.0]
+    assert worker.last_plan.top_ks == [7, 7]

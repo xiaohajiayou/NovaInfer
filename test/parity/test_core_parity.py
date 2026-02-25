@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from ctypes import c_int32
 
 import numpy as np
 import pytest
@@ -49,12 +48,6 @@ def _torch_device(device_name: str):
     raise ValueError(f"Unsupported device: {device_name}")
 
 
-def _argmax_and_top5_from_numpy(row: np.ndarray):
-    token = int(np.argmax(row))
-    top5 = np.argsort(row)[-5:][::-1].astype(np.int64).tolist()
-    return token, top5
-
-
 def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask, *, is_block_layout=False, block_state=None, block_size=16):
     built = build_decode_batch(
         tokens,
@@ -77,11 +70,11 @@ def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask, *, is_block_
         .astype(np.int64)
         .tolist()
     )
-    logits_rows = []
-    for i in range(n_outputs):
-        ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(model_handle, c_int32(i))
-        logits_rows.append(ptr)
-    return output_ids, logits_rows
+    sampled_ptr = LIB_LLAISYS.llaisysModelSampledIds(model_handle)
+    if not sampled_ptr:
+        raise RuntimeError("llaisysModelSampledIds returned null pointer")
+    sampled_ids = np.ctypeslib.as_array(sampled_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
+    return output_ids, sampled_ids
 
 
 def _hf_generate_batch(model, prompt_ids, max_new_tokens):
@@ -118,8 +111,6 @@ def _hf_generate_batch(model, prompt_ids, max_new_tokens):
 def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
     seq_ids = [1000 + i for i in range(len(prompt_ids))]
     generated = [[] for _ in range(len(prompt_ids))]
-    traces = [[] for _ in range(len(prompt_ids))]
-    vocab = int(llaisys_model._meta_info.voc)
     handle = llaisys_model._model
     is_block_layout = int(llaisys_model._kv_cache_layout) == int(KvCacheLayout.BLOCK)
     block_size = int(getattr(llaisys_model, "_kv_cache_block_size", 16))
@@ -139,7 +130,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
                 bpos.append(t)
                 blogits.append(1 if t == len(ids) - 1 else 0)
                 bidx_to_seq.append(i)
-        out_ids, out_rows = _decode_batch(
+        out_ids, sampled_ids = _decode_batch(
             handle,
             btok,
             bseq,
@@ -151,10 +142,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
         )
         for ridx, bidx in enumerate(out_ids):
             seq_i = bidx_to_seq[bidx]
-            row = np.ctypeslib.as_array(out_rows[ridx], shape=(vocab,))
-            tok, top5 = _argmax_and_top5_from_numpy(row)
-            generated[seq_i].append(tok)
-            traces[seq_i].append(top5)
+            generated[seq_i].append(int(sampled_ids[ridx]))
 
     for i in range(len(prompt_ids)):
         if len(generated[i]) != 1:
@@ -171,7 +159,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
             bpos.append(len(ids) + step - 1)
             blogits.append(1)
 
-        out_ids, out_rows = _decode_batch(
+        out_ids, sampled_ids = _decode_batch(
             handle,
             btok,
             bseq,
@@ -182,9 +170,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
             block_size=block_size,
         )
         for ridx, bidx in enumerate(out_ids):
-            row = np.ctypeslib.as_array(out_rows[ridx], shape=(vocab,))
-            tok, _ = _argmax_and_top5_from_numpy(row)
-            generated[bidx].append(tok)
+            generated[bidx].append(int(sampled_ids[ridx]))
     return generated
 
 

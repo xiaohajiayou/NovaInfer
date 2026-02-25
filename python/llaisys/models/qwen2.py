@@ -15,7 +15,7 @@ import numpy as np
 import safetensors
 import torch
 
-from ctypes import POINTER, byref, cast, c_int, c_int8, c_int32, c_int64, c_void_p
+from ctypes import POINTER, byref, cast, c_float, c_int, c_int8, c_int32, c_int64, c_void_p
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
 from ..libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysKvStats, LlaisysModelCreateParams, ModelType
@@ -589,6 +589,11 @@ class Qwen2:
         pos_ids: Optional[Sequence[int]] = None,
         seq_ids: Optional[Sequence[int]] = None,
         logits_mask: Optional[Sequence[int]] = None,
+        temperatures: Optional[Sequence[float]] = None,
+        top_ps: Optional[Sequence[float]] = None,
+        top_ks: Optional[Sequence[int]] = None,
+        seeds: Optional[Sequence[int]] = None,
+        has_seeds: Optional[Sequence[int]] = None,
         slot_mapping: Optional[Sequence[int]] = None,
         context_lens: Optional[Sequence[int]] = None,
         batch_seq_ids: Optional[Sequence[int]] = None,
@@ -613,6 +618,31 @@ class Qwen2:
         if len(logits_mask) != n_tokens:
             raise ValueError("logits_mask length mismatch")
         logits_buf = (c_int8 * n_tokens)(*[int(x) for x in logits_mask])
+        temperatures_buf = None
+        if temperatures is not None:
+            if len(temperatures) != n_tokens:
+                raise ValueError("temperatures length mismatch")
+            temperatures_buf = (c_float * n_tokens)(*[float(x) for x in temperatures])
+        top_ps_buf = None
+        if top_ps is not None:
+            if len(top_ps) != n_tokens:
+                raise ValueError("top_ps length mismatch")
+            top_ps_buf = (c_float * n_tokens)(*[float(x) for x in top_ps])
+        top_ks_buf = None
+        if top_ks is not None:
+            if len(top_ks) != n_tokens:
+                raise ValueError("top_ks length mismatch")
+            top_ks_buf = (c_int32 * n_tokens)(*[int(x) for x in top_ks])
+        seeds_buf = None
+        if seeds is not None:
+            if len(seeds) != n_tokens:
+                raise ValueError("seeds length mismatch")
+            seeds_buf = (c_int64 * n_tokens)(*[int(x) for x in seeds])
+        has_seeds_buf = None
+        if has_seeds is not None:
+            if len(has_seeds) != n_tokens:
+                raise ValueError("has_seeds length mismatch")
+            has_seeds_buf = (c_int8 * n_tokens)(*[int(x) for x in has_seeds])
 
         n_seq_buf = None
         seq_ptr_buf = None
@@ -676,6 +706,11 @@ class Qwen2:
         batch.n_seq_id = n_seq_buf
         batch.seq_id = seq_ptr_buf
         batch.logits = logits_buf
+        batch.temperatures = temperatures_buf
+        batch.top_ps = top_ps_buf
+        batch.top_ks = top_ks_buf
+        batch.seeds = seeds_buf
+        batch.has_seeds = has_seeds_buf
         batch.slot_mapping = slot_mapping_buf
         batch.context_lens = context_lens_buf
         batch.batch_seq_ids = batch_seq_ids_buf
@@ -697,16 +732,11 @@ class Qwen2:
         if not output_ids_ptr:
             raise RuntimeError("Decode returned outputs without output_ids")
         output_ids = np.ctypeslib.as_array(output_ids_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
-
-        logits_rows = []
-        for i in range(n_outputs):
-            logits_ptr = LIB_LLAISYS.llaisysModelGetLogitsIth(self._model, c_int32(i))
-            if not logits_ptr:
-                raise RuntimeError(f"Failed to get logits row: {i}")
-            row = np.ctypeslib.as_array(logits_ptr, shape=(self._meta_info.voc,))
-            logits_rows.append(np.array(row, copy=True))
-
-        return output_ids, logits_rows
+        sampled_ids_ptr = LIB_LLAISYS.llaisysModelSampledIds(self._model)
+        if not sampled_ids_ptr:
+            raise RuntimeError("Decode returned outputs without sampled_ids")
+        sampled_ids = np.ctypeslib.as_array(sampled_ids_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
+        return output_ids, sampled_ids
 
     def request_free(self, seq_id: int) -> int:
         if not self._model:

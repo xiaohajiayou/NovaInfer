@@ -42,12 +42,14 @@ void OutputBuffer::clear() {
     // Keep allocated memory for next step; reset logical contents only.
     logits_f32_.clear();
     output_ids_.clear();
+    sampled_ids_.clear();
 }
 
 void OutputBuffer::reserve_rows(size_t n_rows) {
     // Reserve payload and mapping buffers together to keep append_row amortized O(1).
     logits_f32_.reserve(n_rows * voc_);
     output_ids_.reserve(n_rows);
+    sampled_ids_.reserve(n_rows);
 }
 
 void OutputBuffer::append_row(const std::byte *row, llaisysDataType_t dtype, int32_t output_id) {
@@ -55,6 +57,10 @@ void OutputBuffer::append_row(const std::byte *row, llaisysDataType_t dtype, int
     const size_t old = logits_f32_.size();
     logits_f32_.resize(old + voc_);
     copy_row_to_f32(row, dtype, voc_, logits_f32_.data() + old);
+    output_ids_.push_back(output_id);
+}
+
+void OutputBuffer::append_output_id(int32_t output_id) {
     output_ids_.push_back(output_id);
 }
 
@@ -76,6 +82,14 @@ int32_t OutputBuffer::n_outputs() const noexcept {
 
 const int32_t *OutputBuffer::output_ids() const noexcept {
     return output_ids_.empty() ? nullptr : output_ids_.data();
+}
+
+void OutputBuffer::append_sampled_id(int32_t sampled_id) {
+    sampled_ids_.push_back(sampled_id);
+}
+
+const int32_t *OutputBuffer::sampled_ids() const noexcept {
+    return sampled_ids_.empty() ? nullptr : sampled_ids_.data();
 }
 
 } // namespace llaisys::runtime::output

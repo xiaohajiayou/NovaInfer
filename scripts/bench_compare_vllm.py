@@ -60,6 +60,7 @@ def _run_novainfer(
             top_k=1,
             top_p=1.0,
             max_new_tokens=out_len,
+            ignore_eos=True,
         )
         for out_len in out_lens
     ]
@@ -247,7 +248,7 @@ def main() -> int:
         f"backend={args.backend} model={args.model_path} num_seqs={len(prompts)} "
         f"seed={args.seed} in=[{args.min_input_len},{args.max_input_len}] "
         f"out=[{args.min_output_len},{args.max_output_len}] max_model_len={args.max_model_len} "
-        f"vllm_fair_mode={bool(args.vllm_fair_mode)}"
+        f"vllm_fair_mode={bool(args.vllm_fair_mode)} ignore_eos=True"
     )
     print(f"[bench] expected_total_tokens={sum(out_lens)}")
 

@@ -36,6 +36,11 @@ class LlaisysBatch(Structure):
         ("n_seq_id", POINTER(c_int32)),
         ("seq_id", POINTER(POINTER(c_int64))),
         ("logits", POINTER(c_int8)),
+        ("temperatures", POINTER(c_float)),
+        ("top_ps", POINTER(c_float)),
+        ("top_ks", POINTER(c_int32)),
+        ("seeds", POINTER(c_int64)),
+        ("has_seeds", POINTER(c_int8)),
         ("slot_mapping", POINTER(c_int32)),
         ("context_lens", POINTER(c_int32)),
         ("batch_seq_ids", POINTER(c_int64)),
@@ -97,6 +102,9 @@ def load_model(lib):
 
     lib.llaisysModelOutputIds.argtypes = [llaisysModel_t]
     lib.llaisysModelOutputIds.restype = POINTER(c_int32)
+
+    lib.llaisysModelSampledIds.argtypes = [llaisysModel_t]
+    lib.llaisysModelSampledIds.restype = POINTER(c_int32)
 
     lib.llaisysModelKvSeqCp.argtypes = [llaisysModel_t, c_int64, c_int64, c_int64, c_int64]
     lib.llaisysModelKvSeqCp.restype = c_int

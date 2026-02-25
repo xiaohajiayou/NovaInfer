@@ -34,4 +34,45 @@ void argmax(std::byte *max_idx, std::byte *max_val, const std::byte *vals, llais
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
 }
+
+template <typename T>
+void argmax_rows_(int64_t *max_idx, T *max_val, const T *vals, size_t nrow, size_t ncol) {
+    for (size_t r = 0; r < nrow; ++r) {
+        const T *row = vals + r * ncol;
+        argmax_(&max_idx[r], &max_val[r], row, ncol);
+    }
+}
+
+void argmax_rows(std::byte *max_idx,
+                 std::byte *max_val,
+                 const std::byte *vals,
+                 llaisysDataType_t type,
+                 size_t nrow,
+                 size_t ncol) {
+    switch (type) {
+    case LLAISYS_DTYPE_F32:
+        return argmax_rows_(
+            reinterpret_cast<int64_t *>(max_idx),
+            reinterpret_cast<float *>(max_val),
+            reinterpret_cast<const float *>(vals),
+            nrow,
+            ncol);
+    case LLAISYS_DTYPE_BF16:
+        return argmax_rows_(
+            reinterpret_cast<int64_t *>(max_idx),
+            reinterpret_cast<llaisys::bf16_t *>(max_val),
+            reinterpret_cast<const llaisys::bf16_t *>(vals),
+            nrow,
+            ncol);
+    case LLAISYS_DTYPE_F16:
+        return argmax_rows_(
+            reinterpret_cast<int64_t *>(max_idx),
+            reinterpret_cast<llaisys::fp16_t *>(max_val),
+            reinterpret_cast<const llaisys::fp16_t *>(vals),
+            nrow,
+            ncol);
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(type);
+    }
+}
 } // namespace llaisys::ops::cpu

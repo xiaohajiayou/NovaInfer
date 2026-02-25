@@ -299,11 +299,9 @@ void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::v
 }
 
 tensor_t Qwen2Model::upload_slot_indices_(const std::vector<int32_t> &slot_idxs) {
-#ifdef ENABLE_NVIDIA_API
     if (slot_idxs.empty()) {
         return nullptr;
     }
-    CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_NVIDIA, "Qwen2: slot index upload requires CUDA device");
     if (slot_idxs_i32_ == nullptr || slot_idxs_i32_->shape().empty() || slot_idxs_i32_->shape()[0] < slot_idxs.size()) {
         slot_idxs_i32_ = Tensor::create({slot_idxs.size()}, LLAISYS_DTYPE_I32, device_type_, device_id_);
     }
@@ -311,10 +309,6 @@ tensor_t Qwen2Model::upload_slot_indices_(const std::vector<int32_t> &slot_idxs)
     const size_t nbytes = slot_idxs.size() * sizeof(int32_t);
     runtime_copy_bytes(out->deviceType(), out->data(), LLAISYS_DEVICE_CPU, reinterpret_cast<const std::byte *>(slot_idxs.data()), nbytes);
     return out;
-#else
-    (void)slot_idxs;
-    return nullptr;
-#endif
 }
 
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
@@ -540,11 +534,6 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         ops::add(hidden, hidden, down);
     }
 
-    tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
-    ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
-    tensor_t logits = slice_tokens_(ws.logits, ntoken);
-    ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
-
     std::vector<int32_t> collected_rows;
     collected_rows.reserve(ntoken);
     for (size_t i = 0; i < ntoken; ++i) {
@@ -557,21 +546,31 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         return;
     }
 
-    const size_t row_bytes = meta_.voc * utils::dsize(meta_.dtype);
-    if (device_type_ == LLAISYS_DEVICE_CPU) {
-        for (int32_t row_id : collected_rows) {
-            const std::byte *row = ws.logits->data() + static_cast<size_t>(row_id) * row_bytes;
-            output_->append_row(row, meta_.dtype, row_id);
-        }
-    } else {
-        // GPU path: collapse many tiny D2H row copies into one batched D2H copy.
-        const size_t all_rows_bytes = ntoken * row_bytes;
-        std::vector<std::byte> host_logits(all_rows_bytes);
-        runtime_copy_bytes(LLAISYS_DEVICE_CPU, host_logits.data(), device_type_, ws.logits->data(), all_rows_bytes);
-        for (int32_t row_id : collected_rows) {
-            const std::byte *row = host_logits.data() + static_cast<size_t>(row_id) * row_bytes;
-            output_->append_row(row, meta_.dtype, row_id);
-        }
+    tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
+    ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
+
+    const size_t n_selected = collected_rows.size();
+    tensor_t row_indices = upload_slot_indices_(collected_rows);
+    CHECK_ARGUMENT(row_indices != nullptr, "Qwen2: failed to upload lmhead row indices");
+    tensor_t logits = slice_tokens_(ws.logits, n_selected);
+    ops::linear_indexed(logits, final_normed, row_indices, weights_.out_embed->tensor, zero_bias_logits_);
+
+    tensor_t max_idx = Tensor::create({n_selected}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    tensor_t max_val = Tensor::create({n_selected}, meta_.dtype, device_type_, device_id_);
+    ops::argmax_rows(max_idx, max_val, logits);
+
+    std::vector<int64_t> sampled_host(n_selected, 0);
+    runtime_copy_bytes(
+        LLAISYS_DEVICE_CPU,
+        reinterpret_cast<std::byte *>(sampled_host.data()),
+        device_type_,
+        max_idx->data(),
+        n_selected * sizeof(int64_t));
+
+    for (size_t out_i = 0; out_i < n_selected; ++out_i) {
+        const int32_t row_id = collected_rows[out_i];
+        output_->append_output_id(row_id);
+        output_->append_sampled_id(static_cast<int32_t>(sampled_host[out_i]));
     }
 }
 
@@ -831,6 +830,10 @@ int32_t Qwen2Model::n_outputs() const noexcept {
 
 const int32_t *Qwen2Model::output_ids() const noexcept {
     return output_ ? output_->output_ids() : nullptr;
+}
+
+const int32_t *Qwen2Model::sampled_ids() const noexcept {
+    return output_ ? output_->sampled_ids() : nullptr;
 }
 
 // ===== KV management APIs =====

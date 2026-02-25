@@ -60,6 +60,49 @@ __global__ void argmax_kernel(std::int64_t *out_idx,
 }
 
 template <typename T>
+__global__ void argmax_rows_kernel(std::int64_t *out_idx,
+                                   T *out_val,
+                                   const T *vals,
+                                   std::int32_t ncol) {
+    const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
+    __shared__ float s_val[256];
+    __shared__ std::int32_t s_idx[256];
+
+    const std::int32_t tid = static_cast<std::int32_t>(threadIdx.x);
+    const T *row_vals = vals + static_cast<std::size_t>(row) * static_cast<std::size_t>(ncol);
+
+    float best_val = llaisys::device::nvidia::dtype::to_float<T>(row_vals[0]);
+    std::int32_t best_idx = 0;
+    for (std::int32_t i = tid; i < ncol; i += blockDim.x) {
+        const float v = llaisys::device::nvidia::dtype::to_float<T>(row_vals[i]);
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    s_val[tid] = best_val;
+    s_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (std::int32_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float rhs_v = s_val[tid + stride];
+            const std::int32_t rhs_i = s_idx[tid + stride];
+            if (rhs_v > s_val[tid]) {
+                s_val[tid] = rhs_v;
+                s_idx[tid] = rhs_i;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_idx[row] = static_cast<std::int64_t>(s_idx[0]);
+        out_val[row] = llaisys::device::nvidia::dtype::from_float<T>(s_val[0]);
+    }
+}
+
+template <typename T>
 void launch_argmax(std::byte *max_idx, std::byte *max_val, const std::byte *vals, std::int32_t numel) {
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
     argmax_kernel<T><<<1, 256, 0, stream>>>(
@@ -67,6 +110,21 @@ void launch_argmax(std::byte *max_idx, std::byte *max_val, const std::byte *vals
         reinterpret_cast<T *>(max_val),
         reinterpret_cast<const T *>(vals),
         numel);
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void launch_argmax_rows(std::byte *max_idx,
+                        std::byte *max_val,
+                        const std::byte *vals,
+                        std::int32_t nrow,
+                        std::int32_t ncol) {
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    argmax_rows_kernel<T><<<nrow, 256, 0, stream>>>(
+        reinterpret_cast<std::int64_t *>(max_idx),
+        reinterpret_cast<T *>(max_val),
+        reinterpret_cast<const T *>(vals),
+        ncol);
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -87,6 +145,32 @@ void argmax(std::byte *max_idx, std::byte *max_val, const std::byte *vals, llais
         return;
     case LLAISYS_DTYPE_BF16:
         launch_argmax<llaisys::bf16_t>(max_idx, max_val, vals, numel);
+        return;
+    default:
+        EXCEPTION_UNSUPPORTED_DATATYPE(type);
+    }
+}
+
+void argmax_rows(std::byte *max_idx,
+                 std::byte *max_val,
+                 const std::byte *vals,
+                 llaisysDataType_t type,
+                 size_t nrow,
+                 size_t ncol) {
+    const std::int32_t row = static_cast<std::int32_t>(nrow);
+    const std::int32_t col = static_cast<std::int32_t>(ncol);
+    if (row <= 0 || col <= 0) {
+        return;
+    }
+    switch (type) {
+    case LLAISYS_DTYPE_F32:
+        launch_argmax_rows<float>(max_idx, max_val, vals, row, col);
+        return;
+    case LLAISYS_DTYPE_F16:
+        launch_argmax_rows<llaisys::fp16_t>(max_idx, max_val, vals, row, col);
+        return;
+    case LLAISYS_DTYPE_BF16:
+        launch_argmax_rows<llaisys::bf16_t>(max_idx, max_val, vals, row, col);
         return;
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(type);

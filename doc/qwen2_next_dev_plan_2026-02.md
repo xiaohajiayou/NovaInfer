@@ -54,17 +54,55 @@
 8. `kv_cache_capacity_mode=auto`
 9. `seed=0`
 
+指令:
+```shell
+CUDA_VISIBLE_DEVICES=2 \
+  LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+  /home/xiaohajiayou/.conda/envs/infer_lab/bin/python scripts/bench_compare_vllm.py\
+    --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --backend novainfer \
+    --num-seqs 256 \
+    --min-input-len 100 \
+    --max-input-len 1024 \
+    --min-output-len 100 \
+    --max-output-len 1024 \
+    --max-model-len 4096 \
+    --seed 0 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 16384 \
+    --kv-cache-capacity-mode auto
+
+CUDA_VISIBLE_DEVICES=2 \
+  /home/xiaohajiayou/.conda/envs/infer_lab/bin/python scripts/bench_compare_vllm.py\
+    --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --backend vllm \
+    --num-seqs 256 \
+    --min-input-len 100 \
+    --max-input-len 1024 \
+    --min-output-len 100 \
+    --max-output-len 1024 \
+    --max-model-len 4096 \
+    --seed 0 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 16384 \
+    --kv-cache-capacity-mode auto \
+    --vllm-fair-mode
+```
 结果记录（持续追加）：
 
 | Date | Model | Device | Backend | num_seqs | max_model_len | expected_total_tokens | init_seconds | warmup_seconds | run_seconds | total_seconds | tokens_per_sec(run) | Status | Notes |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
 | 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | novainfer | 256 | 4096 | 140084 | 6.6772 | 2.8732 | 664.8953 | 674.4868 | 210.6858 | PASS | `auto_max_num_seqs=256`，KV auto capacity 生效 |
 | 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | vllm | 256 | 4096 | 140084 | N/A | N/A | N/A | N/A | N/A | FAIL | 首次失败：`AttributeError: 'list' object has no attribute 'get'`（vLLM 输入需 `{"prompt_token_ids":[...]}`） |
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | novainfer (cudnn) | 256 | 4096 | 140084 | 7.9637 | 9.5716 | 234.6837 | 252.2567 | 596.9055 | PASS | 引入 cudnn 初期基线：`actual_total_tokens=139064`，`throughput_actual=592.5592` |
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | novainfer (cudnn) | 256 | 4096 | 140084 | 6.7936 | 8.8010 | 58.4499 | 74.1362 | 2396.6492 | PASS | `actual_total_tokens=135554`（当时未强制 `ignore_eos`，存在提前 EOS） |
+| 2026-02-21 | DeepSeek-R1-Distill-Qwen-1.5B | nvidia | vllm (`--vllm-fair-mode`) | 256 | 4096 | 140084 | N/A | N/A | 15.7866 | 15.7866 | 8873.6197 | PASS | `expected_total_tokens=actual_total_tokens=140084` |
 
 修复与口径说明：
 1. `scripts/bench_compare_vllm.py` 已修复 vLLM tokenized prompt 输入格式（`prompt_token_ids`）。
 2. `--backend both` 已改为子进程隔离执行 `novainfer/vllm`，避免同进程 CUDA 初始化冲突。
 3. NovaInfer 吞吐按 `run_seconds` 统计，不包含 `init/warmup/close`。
+4. 基准脚本已统一对齐 `ignore_eos` 口径（两侧固定 `ignore_eos=True`），用于消除提前 EOS 对总 token 的干扰。
 
 ### 3.2 本轮实现与修复清单（2026-02-21）
 
