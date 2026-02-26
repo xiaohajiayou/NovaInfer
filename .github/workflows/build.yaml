@@ -62,7 +62,9 @@ jobs:
           test/offline/test_llm_entrypoint.py \
           test/engine/test_engine_model_registry.py \
           test/engine/test_engine_state_machine.py \
-          test/engine/test_sampling.py \
+          test/engine/test_executor.py \
+          test/engine/test_scheduler.py \
+          test/engine/test_block_manager.py \
           test/online/test_online.py \
           test/online/test_online_http.py \
           test/online/test_online_stream_isolation.py \

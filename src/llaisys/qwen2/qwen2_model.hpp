@@ -105,9 +105,10 @@ private:
     ops::cuda::PagedAttentionPrepared paged_attn_prepared_{};
     // Switch point for staged FlashInfer migration (NATIVE by default).
     ops::cuda::PagedAttentionBackend paged_attn_backend_{ops::cuda::PagedAttentionBackend::NATIVE};
-    // Reused CUDA buffer for slot mapping of current decode step.
-    tensor_t slot_idxs_i32_{};
 #endif
+    // Reused device-local int32 buffer for slot mapping / selected row indices.
+    // Kept outside CUDA macro so CPU-only builds can still compile upload_slot_indices_.
+    tensor_t slot_idxs_i32_{};
 
     bool validate_decode_batch_(const LlaisysBatch &batch) const;
 

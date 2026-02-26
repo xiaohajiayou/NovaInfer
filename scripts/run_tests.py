@@ -31,7 +31,9 @@ STAGE1_PYTEST_FILES = [
 ]
 
 STAGE2_PYTEST_FILES = [
-    "test/engine/test_sampling.py",
+    "test/engine/test_executor.py",
+    "test/engine/test_scheduler.py",
+    "test/engine/test_block_manager.py",
     "test/online/test_online.py",
     "test/online/test_online_http.py",
     "test/online/test_online_stream_isolation.py",
