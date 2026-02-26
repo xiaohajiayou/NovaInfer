@@ -101,8 +101,12 @@ private:
     tensor_t zero_bias_mlp_down_{};
     tensor_t zero_bias_logits_{};
 #ifdef ENABLE_NVIDIA_API
-    // Step-level paged-attention metadata uploaded once and reused by all layers.
-    ops::cuda::PagedAttentionPrepared paged_attn_prepared_{};
+    // Step-level attention metadata uploaded once and reused by all layers.
+    ops::cuda::CommonAttentionMetadata common_attn_metadata_{};
+    // Persistent seq-id -> row mapping cache for BLOCK layout metadata.
+    std::unordered_map<int64_t, int32_t> block_seq_row_cache_{};
+    std::vector<int64_t> block_seq_row_ids_{};
+    int32_t block_seq_row_width_{0};
     // Switch point for staged FlashInfer migration (NATIVE by default).
     ops::cuda::PagedAttentionBackend paged_attn_backend_{ops::cuda::PagedAttentionBackend::NATIVE};
 #endif
@@ -122,6 +126,7 @@ private:
 
     void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
     tensor_t upload_slot_indices_(const std::vector<int32_t> &slot_idxs);
+    void refresh_block_seq_row_cache_(const LlaisysBatch &batch);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
 

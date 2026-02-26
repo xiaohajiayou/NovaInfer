@@ -58,6 +58,14 @@ void upload_device_i32(int32_t *&ptr, size_t &cap, const std::vector<int32_t> &h
     LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
 }
 
+void upload_device_i32_raw(int32_t *&ptr, size_t &cap, const int32_t *host, size_t n) {
+    if (host == nullptr || n == 0) {
+        return;
+    }
+    ensure_device_i32_capacity(ptr, cap, n);
+    LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host, n * sizeof(int32_t), cudaMemcpyHostToDevice));
+}
+
 template <typename T>
 __global__ void self_attention_kernel(T *out,
                                       const T *q,
@@ -386,7 +394,7 @@ void launch_paged_attention_prepared(tensor_t attn_val,
                                      tensor_t q,
                                      tensor_t k_cache,
                                      tensor_t v_cache,
-                                     const PagedAttentionPrepared &prepared,
+                                     const CommonAttentionMetadata &prepared,
                                      std::int32_t block_table_width,
                                      std::int32_t block_size,
                                      float scale,
@@ -468,8 +476,8 @@ struct CudnnPagedPlan {
     void *workspace{nullptr};
     size_t workspace_cap{0};
 
-    const PagedAttentionPrepared *last_prepared{nullptr};
-    uint64_t last_host_revision{0};
+    const CommonAttentionMetadata *last_prepared{nullptr};
+    uint64_t last_revision{0};
 #endif
 
     ~CudnnPagedPlan() {
@@ -498,15 +506,57 @@ struct CudnnMetaBuffer {
     }
 };
 
-bool cudnn_try_paged_attention(tensor_t attn_val,
-                               tensor_t q,
-                               tensor_t k_cache,
-                               tensor_t v_cache,
-                               const PagedAttentionPrepared &prepared,
-                               int32_t block_table_width,
-                               int32_t block_size,
-                               float scale) {
-#ifdef ENABLE_CUDNN_FRONTEND
+constexpr int64_t Q_UID = 1;
+constexpr int64_t K_UID = 2;
+constexpr int64_t V_UID = 3;
+constexpr int64_t O_UID = 4;
+constexpr int64_t SEQ_LEN_Q_UID = 7;
+constexpr int64_t SEQ_LEN_KV_UID = 8;
+constexpr int64_t PAGE_TABLE_K_UID = 9;
+constexpr int64_t PAGE_TABLE_V_UID = 10;
+
+struct CudnnRuntimeState {
+    cudnnHandle_t handle{nullptr};
+    std::unordered_map<CudnnPlanKey, std::unique_ptr<CudnnPagedPlan>, CudnnPlanKeyHash> plan_cache;
+    std::unordered_map<size_t, int64_t> prebuilt_max_bucket;
+    CudnnMetaBuffer meta_buf;
+    CudnnPagedPlan *meta_owner_plan{nullptr};
+};
+
+struct CudnnProblemShape {
+    int64_t seqlen{0};
+    int64_t nhead{0};
+    int64_t head_dim{0};
+    int64_t nslot{0};
+    int64_t nkvhead{0};
+    int64_t b_exec{0};
+    int32_t block_table_capacity{0};
+    int64_t table_size{0};
+    int64_t num_blocks{0};
+    int64_t max_seq_len_kv{0};
+};
+
+struct CudnnMetaPtrs {
+    int32_t *d_seq_q{nullptr};
+    int32_t *d_seq_kv{nullptr};
+    int32_t *d_page{nullptr};
+    size_t bsz{0};
+    size_t page_n{0};
+    size_t meta_n{0};
+};
+
+static CudnnRuntimeState &cudnn_runtime_state() {
+    static thread_local CudnnRuntimeState state{};
+    return state;
+}
+
+static bool cudnn_validate_inputs(tensor_t q,
+                                  tensor_t k_cache,
+                                  tensor_t v_cache,
+                                  const CommonAttentionMetadata &prepared,
+                                  int32_t block_table_width,
+                                  int32_t block_size,
+                                  CudnnProblemShape &shape) {
     if (cudnnGetVersion() < 90500) {
         static bool warned_version = false;
         if (!warned_version) {
@@ -521,48 +571,31 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
     if (q->dtype() != k_cache->dtype() || q->dtype() != v_cache->dtype()) {
         return false;
     }
-    const int64_t seqlen = static_cast<int64_t>(q->shape()[0]);
-    const int64_t nhead = static_cast<int64_t>(q->shape()[1]);
-    const int64_t head_dim = static_cast<int64_t>(q->shape()[2]);
-    const int64_t nslot = static_cast<int64_t>(k_cache->shape()[0]);
-    const int64_t nkvhead = static_cast<int64_t>(k_cache->shape()[1]);
-    if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
+    shape.seqlen = static_cast<int64_t>(q->shape()[0]);
+    shape.nhead = static_cast<int64_t>(q->shape()[1]);
+    shape.head_dim = static_cast<int64_t>(q->shape()[2]);
+    shape.nslot = static_cast<int64_t>(k_cache->shape()[0]);
+    shape.nkvhead = static_cast<int64_t>(k_cache->shape()[1]);
+    if (shape.seqlen <= 0 || shape.nhead <= 0 || shape.head_dim <= 0 || shape.nslot <= 0 || shape.nkvhead <= 0) {
         return false;
     }
-    if (block_size <= 0 || block_table_width <= 0 || (nslot % block_size) != 0) {
+    if (block_size <= 0 || block_table_width <= 0 || (shape.nslot % block_size) != 0) {
         return false;
     }
-    if (prepared.host_q_seq_rows.size() != static_cast<size_t>(seqlen) ||
-        prepared.host_q_pos.size() != static_cast<size_t>(seqlen) ||
-        prepared.host_seq_lens.empty() ||
-        prepared.host_block_tables.size() != static_cast<size_t>(prepared.nseq) * static_cast<size_t>(block_table_width)) {
+    if (prepared.q_seq_rows == nullptr || prepared.q_pos == nullptr || prepared.seq_lens == nullptr ||
+        prepared.block_tables == nullptr || prepared.nseq <= 0) {
         return false;
     }
 
-    namespace fe = cudnn_frontend;
-
-    constexpr int64_t Q_UID = 1;
-    constexpr int64_t K_UID = 2;
-    constexpr int64_t V_UID = 3;
-    constexpr int64_t O_UID = 4;
-    constexpr int64_t SEQ_LEN_Q_UID = 7;
-    constexpr int64_t SEQ_LEN_KV_UID = 8;
-    constexpr int64_t PAGE_TABLE_K_UID = 9;
-    constexpr int64_t PAGE_TABLE_V_UID = 10;
-
-    auto io_dtype = q->dtype() == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
-
-    const int64_t b = seqlen;
-    int64_t b_exec = 1;
-    while (b_exec < b) {
-        b_exec <<= 1;
+    shape.b_exec = 1;
+    while (shape.b_exec < shape.seqlen) {
+        shape.b_exec <<= 1;
     }
-    const int64_t s_q = 1;
     int32_t width_p2 = 1;
     while (width_p2 < block_table_width) {
         width_p2 <<= 1;
     }
-    int32_t block_table_capacity = width_p2;
+    shape.block_table_capacity = width_p2;
     if (const char *raw = std::getenv("LLAISYS_CUDNN_BLOCK_TABLE_CAP"); raw != nullptr) {
         int32_t cfg_cap = static_cast<int32_t>(std::atoi(raw));
         if (cfg_cap > 0) {
@@ -570,136 +603,194 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
             while (cfg_p2 < cfg_cap) {
                 cfg_p2 <<= 1;
             }
-            block_table_capacity = std::max<int32_t>(block_table_capacity, cfg_p2);
+            shape.block_table_capacity = std::max<int32_t>(shape.block_table_capacity, cfg_p2);
         }
     }
-    const int64_t table_size = block_table_capacity;
-    const int64_t num_blocks = nslot / block_size;
-    const int64_t max_seq_len_kv = static_cast<int64_t>(block_table_capacity) * static_cast<int64_t>(block_size);
+    shape.table_size = shape.block_table_capacity;
+    shape.num_blocks = shape.nslot / block_size;
+    shape.max_seq_len_kv = static_cast<int64_t>(shape.block_table_capacity) * static_cast<int64_t>(block_size);
+    return true;
+}
 
-    static thread_local cudnnHandle_t handle = nullptr;
-    static thread_local std::unordered_map<CudnnPlanKey, std::unique_ptr<CudnnPagedPlan>, CudnnPlanKeyHash> plan_cache;
-    static thread_local std::unordered_map<size_t, int64_t> prebuilt_max_bucket;
-    static thread_local CudnnMetaBuffer meta_buf;
-    static thread_local CudnnPagedPlan *meta_owner_plan = nullptr;
+static CudnnPlanKey make_cudnn_plan_key(llaisysDataType_t dtype,
+                                        const CudnnProblemShape &shape,
+                                        int32_t block_size,
+                                        int64_t b_key) {
+    return CudnnPlanKey{
+        dtype, b_key, shape.nhead, shape.nkvhead, shape.head_dim, shape.nslot, block_size, shape.block_table_capacity};
+}
 
-    auto make_key = [&](int64_t b_key) {
-        return CudnnPlanKey{q->dtype(), b_key, nhead, nkvhead, head_dim, nslot, block_size, block_table_capacity};
+static size_t make_cudnn_bucket_signature(llaisysDataType_t dtype, const CudnnProblemShape &shape, int32_t block_size) {
+    size_t sig = 1469598103934665603ull;
+    auto mix_sig = [&](uint64_t v) {
+        sig ^= static_cast<size_t>(v + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2));
     };
+    mix_sig(static_cast<uint64_t>(dtype));
+    mix_sig(static_cast<uint64_t>(shape.nhead));
+    mix_sig(static_cast<uint64_t>(shape.nkvhead));
+    mix_sig(static_cast<uint64_t>(shape.head_dim));
+    mix_sig(static_cast<uint64_t>(shape.nslot));
+    mix_sig(static_cast<uint64_t>(block_size));
+    mix_sig(static_cast<uint64_t>(shape.block_table_capacity));
+    return sig;
+}
 
-    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+static bool cudnn_set_stream(cudnnHandle_t &handle, cudaStream_t stream) {
     if (handle == nullptr) {
         if (cudnnCreate(&handle) != CUDNN_STATUS_SUCCESS) {
             return false;
         }
     }
-    if (cudnnSetStream(handle, stream) != CUDNN_STATUS_SUCCESS) {
-        return false;
+    return cudnnSetStream(handle, stream) == CUDNN_STATUS_SUCCESS;
+}
+
+#ifdef ENABLE_CUDNN_FRONTEND
+__global__ void build_cudnn_meta_kernel(int64_t b_exec,
+                                        int64_t b_valid,
+                                        int32_t table_size,
+                                        int32_t block_table_width,
+                                        int32_t nseq,
+                                        const int32_t *q_seq_rows,
+                                        const int32_t *q_pos,
+                                        const int32_t *seq_lens,
+                                        const int32_t *block_tables,
+                                        int32_t *seq_q_out,
+                                        int32_t *seq_kv_out,
+                                        int32_t *page_out) {
+    const int64_t row_idx = static_cast<int64_t>(blockIdx.x);
+    if (row_idx >= b_exec) {
+        return;
     }
 
-    auto ensure_plan_ready = [&](CudnnPagedPlan &plan, int64_t b_plan) -> bool {
-        if (plan.graph_ready) {
-            return true;
+    int32_t row = -1;
+    int32_t visible = 0;
+    if (row_idx < b_valid) {
+        row = q_seq_rows[row_idx];
+        if (row >= 0 && row < nseq) {
+            const int32_t seq_len = seq_lens[row];
+            const int32_t qpos = q_pos[row_idx];
+            const int32_t q_visible = qpos + 1;
+            visible = q_visible < 0 ? 0 : (q_visible > seq_len ? seq_len : q_visible);
         }
-        plan.graph = std::make_shared<fe::graph::Graph>();
-        plan.graph->set_io_data_type(io_dtype)
-            .set_intermediate_data_type(fe::DataType_t::FLOAT)
-            .set_compute_data_type(fe::DataType_t::FLOAT);
+    }
 
-        auto Q = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                         .set_name("Q")
-                                         .set_uid(Q_UID)
-                                         .set_dim({b_plan, nhead, s_q, head_dim})
-                                         .set_stride({nhead * s_q * head_dim, s_q * head_dim, head_dim, 1}));
+    seq_q_out[row_idx] = 1;
+    seq_kv_out[row_idx] = visible;
 
-        // cuDNN paged SDPA expects K/V head axis to be dim-1 (B, Hk, S, D),
-        // but NovaInfer physical cache is [nslot, Hk, D] with
-        // nslot = num_blocks * block_size and slot = block * block_size + offset.
-        // Use custom strides so [block, head, offset, d] maps to
-        // ((block * block_size + offset) * Hk + head) * D + d.
-        auto K = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                         .set_name("container_K")
-                                         .set_uid(K_UID)
-                                         .set_dim({num_blocks, nkvhead, block_size, head_dim})
-                                         .set_stride({block_size * nkvhead * head_dim, head_dim, nkvhead * head_dim, 1}));
-
-        auto V = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                         .set_name("container_V")
-                                         .set_uid(V_UID)
-                                         .set_dim({num_blocks, nkvhead, block_size, head_dim})
-                                         .set_stride({block_size * nkvhead * head_dim, head_dim, nkvhead * head_dim, 1}));
-
-        auto seq_q = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                             .set_name("seq_q")
-                                             .set_uid(SEQ_LEN_Q_UID)
-                                             .set_dim({b_plan, 1, 1, 1})
-                                             .set_stride({1, 1, 1, 1})
-                                             .set_data_type(fe::DataType_t::INT32));
-        auto seq_kv = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                              .set_name("seq_kv")
-                                              .set_uid(SEQ_LEN_KV_UID)
-                                              .set_dim({b_plan, 1, 1, 1})
-                                              .set_stride({1, 1, 1, 1})
-                                              .set_data_type(fe::DataType_t::INT32));
-        auto page_table_k = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                                    .set_name("page_table_k")
-                                                    .set_uid(PAGE_TABLE_K_UID)
-                                                    .set_dim({b_plan, 1, table_size, 1})
-                                                    .set_stride({table_size, table_size, 1, 1})
-                                                    .set_data_type(fe::DataType_t::INT32));
-        auto page_table_v = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                                    .set_name("page_table_v")
-                                                    .set_uid(PAGE_TABLE_V_UID)
-                                                    .set_dim({b_plan, 1, table_size, 1})
-                                                    .set_stride({table_size, table_size, 1, 1})
-                                                    .set_data_type(fe::DataType_t::INT32));
-
-        auto sdpa_options = fe::graph::SDPA_attributes()
-                                .set_name("novainfer_paged_sdpa")
-                                .set_generate_stats(false)
-                                .set_attn_scale(scale);
-        sdpa_options.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
-        sdpa_options.set_paged_attention_k_table(page_table_k);
-        sdpa_options.set_paged_attention_v_table(page_table_v);
-        sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(max_seq_len_kv));
-
-        auto [O, Stats] = plan.graph->sdpa(Q, K, V, sdpa_options);
-        (void)Stats;
-        O->set_output(true).set_uid(O_UID).set_dim({b_plan, nhead, s_q, head_dim}).set_stride(
-            {nhead * s_q * head_dim, s_q * head_dim, head_dim, 1});
-
-        auto build_status = plan.graph->build(handle, {fe::HeurMode_t::A});
-        if (build_status.is_bad()) {
-            static bool warned_build = false;
-            if (!warned_build) {
-                warned_build = true;
-                printf("[warn] self_attention_paged: CUDNN build failed: %s; fallback to NATIVE\n",
-                       build_status.get_message().c_str());
-            }
-            plan.graph_ready = false;
-            return false;
+    const int64_t dst_base = row_idx * static_cast<int64_t>(table_size);
+    for (int32_t c = static_cast<int32_t>(threadIdx.x); c < table_size; c += static_cast<int32_t>(blockDim.x)) {
+        int32_t v = -1;
+        if (row >= 0 && row < nseq && c < block_table_width) {
+            const int64_t src_idx = static_cast<int64_t>(row) * static_cast<int64_t>(block_table_width) + c;
+            v = block_tables[src_idx];
         }
-        plan.graph_ready = true;
-        plan.last_prepared = nullptr;
-        plan.last_host_revision = 0;
+        page_out[dst_base + static_cast<int64_t>(c)] = v;
+    }
+}
+
+static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
+                                    cudnnHandle_t handle,
+                                    llaisysDataType_t dtype,
+                                    const CudnnProblemShape &shape,
+                                    int32_t block_size,
+                                    int64_t b_plan,
+                                    float scale) {
+    namespace fe = cudnn_frontend;
+    if (plan.graph_ready) {
         return true;
-    };
+    }
 
-    size_t sig = 1469598103934665603ull;
-    auto mix_sig = [&](uint64_t v) {
-        sig ^= static_cast<size_t>(v + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2));
-    };
-    mix_sig(static_cast<uint64_t>(q->dtype()));
-    mix_sig(static_cast<uint64_t>(nhead));
-    mix_sig(static_cast<uint64_t>(nkvhead));
-    mix_sig(static_cast<uint64_t>(head_dim));
-    mix_sig(static_cast<uint64_t>(nslot));
-    mix_sig(static_cast<uint64_t>(block_size));
-    mix_sig(static_cast<uint64_t>(block_table_capacity));
+    auto io_dtype = dtype == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
+    constexpr int64_t s_q = 1;
+    plan.graph = std::make_shared<fe::graph::Graph>();
+    plan.graph->set_io_data_type(io_dtype).set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(
+        fe::DataType_t::FLOAT);
 
-    // Default to a stable prebuild floor to avoid run-time graph builds when
-    // decode micro-batch size jitters across small buckets.
-    int64_t warmup_target = std::max<int64_t>(b_exec, 64);
+    auto Q = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("Q")
+                                     .set_uid(Q_UID)
+                                     .set_dim({b_plan, shape.nhead, s_q, shape.head_dim})
+                                     .set_stride({shape.nhead * s_q * shape.head_dim, s_q * shape.head_dim, shape.head_dim, 1}));
+
+    auto K = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("container_K")
+                                     .set_uid(K_UID)
+                                     .set_dim({shape.num_blocks, shape.nkvhead, static_cast<int64_t>(block_size), shape.head_dim})
+                                     .set_stride({static_cast<int64_t>(block_size) * shape.nkvhead * shape.head_dim,
+                                                  shape.head_dim,
+                                                  shape.nkvhead * shape.head_dim,
+                                                  1}));
+
+    auto V = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                     .set_name("container_V")
+                                     .set_uid(V_UID)
+                                     .set_dim({shape.num_blocks, shape.nkvhead, static_cast<int64_t>(block_size), shape.head_dim})
+                                     .set_stride({static_cast<int64_t>(block_size) * shape.nkvhead * shape.head_dim,
+                                                  shape.head_dim,
+                                                  shape.nkvhead * shape.head_dim,
+                                                  1}));
+
+    auto seq_q = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                         .set_name("seq_q")
+                                         .set_uid(SEQ_LEN_Q_UID)
+                                         .set_dim({b_plan, 1, 1, 1})
+                                         .set_stride({1, 1, 1, 1})
+                                         .set_data_type(fe::DataType_t::INT32));
+    auto seq_kv = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                          .set_name("seq_kv")
+                                          .set_uid(SEQ_LEN_KV_UID)
+                                          .set_dim({b_plan, 1, 1, 1})
+                                          .set_stride({1, 1, 1, 1})
+                                          .set_data_type(fe::DataType_t::INT32));
+    auto page_table_k = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                                .set_name("page_table_k")
+                                                .set_uid(PAGE_TABLE_K_UID)
+                                                .set_dim({b_plan, 1, shape.table_size, 1})
+                                                .set_stride({shape.table_size, shape.table_size, 1, 1})
+                                                .set_data_type(fe::DataType_t::INT32));
+    auto page_table_v = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                                .set_name("page_table_v")
+                                                .set_uid(PAGE_TABLE_V_UID)
+                                                .set_dim({b_plan, 1, shape.table_size, 1})
+                                                .set_stride({shape.table_size, shape.table_size, 1, 1})
+                                                .set_data_type(fe::DataType_t::INT32));
+
+    auto sdpa_options =
+        fe::graph::SDPA_attributes().set_name("novainfer_paged_sdpa").set_generate_stats(false).set_attn_scale(scale);
+    sdpa_options.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
+    sdpa_options.set_paged_attention_k_table(page_table_k);
+    sdpa_options.set_paged_attention_v_table(page_table_v);
+    sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(shape.max_seq_len_kv));
+
+    auto [O, Stats] = plan.graph->sdpa(Q, K, V, sdpa_options);
+    (void)Stats;
+    O->set_output(true).set_uid(O_UID).set_dim({b_plan, shape.nhead, s_q, shape.head_dim}).set_stride(
+        {shape.nhead * s_q * shape.head_dim, s_q * shape.head_dim, shape.head_dim, 1});
+
+    auto build_status = plan.graph->build(handle, {fe::HeurMode_t::A});
+    if (build_status.is_bad()) {
+        static bool warned_build = false;
+        if (!warned_build) {
+            warned_build = true;
+            printf("[warn] self_attention_paged: CUDNN build failed: %s; fallback to NATIVE\n",
+                   build_status.get_message().c_str());
+        }
+        plan.graph_ready = false;
+        return false;
+    }
+    plan.graph_ready = true;
+    plan.last_prepared = nullptr;
+    plan.last_revision = 0;
+    return true;
+}
+
+static bool prebuild_cudnn_buckets(CudnnRuntimeState &state,
+                                   llaisysDataType_t dtype,
+                                   const CudnnProblemShape &shape,
+                                   int32_t block_size,
+                                   float scale) {
+    const size_t sig = make_cudnn_bucket_signature(dtype, shape, block_size);
+    int64_t warmup_target = std::max<int64_t>(shape.b_exec, 64);
     if (const char *raw = std::getenv("LLAISYS_CUDNN_PREBUILD_MAX_B"); raw != nullptr) {
         int64_t parsed = std::atoll(raw);
         if (parsed > 0) {
@@ -710,143 +801,89 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
             warmup_target = std::max<int64_t>(warmup_target, p2);
         }
     }
-    int64_t &built_max = prebuilt_max_bucket[sig];
+    int64_t &built_max = state.prebuilt_max_bucket[sig];
     if (built_max < warmup_target) {
         int64_t bb = built_max > 0 ? (built_max << 1) : 1;
         while (bb <= warmup_target) {
-            auto &pp = plan_cache[make_key(bb)];
+            auto &pp = state.plan_cache[make_cudnn_plan_key(dtype, shape, block_size, bb)];
             if (!pp) {
                 pp = std::make_unique<CudnnPagedPlan>();
             }
-            if (!ensure_plan_ready(*pp, bb)) {
+            if (!ensure_cudnn_plan_ready(*pp, state.handle, dtype, shape, block_size, bb, scale)) {
                 return false;
             }
             bb <<= 1;
         }
         built_max = warmup_target;
     }
+    return true;
+}
 
-    auto &plan_ptr = plan_cache[make_key(b_exec)];
-    if (!plan_ptr) {
-        plan_ptr = std::make_unique<CudnnPagedPlan>();
-    }
-    auto &plan = *plan_ptr;
-    if (!ensure_plan_ready(plan, b_exec)) {
-        return false;
-    }
-
-    const size_t bsz = static_cast<size_t>(b_exec);
-    const size_t page_n = bsz * static_cast<size_t>(table_size);
-    const size_t meta_n = bsz * 2 + page_n;
-    if (meta_buf.cap < meta_n) {
-        if (meta_buf.d_meta != nullptr) {
-            cudaFree(meta_buf.d_meta);
-            meta_buf.d_meta = nullptr;
+static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, CudnnPagedPlan &plan, const CudnnProblemShape &shape) {
+    CudnnMetaPtrs ptrs{};
+    ptrs.bsz = static_cast<size_t>(shape.b_exec);
+    ptrs.page_n = ptrs.bsz * static_cast<size_t>(shape.table_size);
+    ptrs.meta_n = ptrs.bsz * 2 + ptrs.page_n;
+    if (state.meta_buf.cap < ptrs.meta_n) {
+        if (state.meta_buf.d_meta != nullptr) {
+            cudaFree(state.meta_buf.d_meta);
+            state.meta_buf.d_meta = nullptr;
         }
-        if (meta_buf.h_meta != nullptr) {
-            cudaFreeHost(meta_buf.h_meta);
-            meta_buf.h_meta = nullptr;
-        }
-        LLAISYS_CUDA_CHECK(cudaMalloc(&meta_buf.d_meta, meta_n * sizeof(int32_t)));
-        LLAISYS_CUDA_CHECK(cudaHostAlloc(&meta_buf.h_meta, meta_n * sizeof(int32_t), cudaHostAllocDefault));
-        meta_buf.cap = meta_n;
+        LLAISYS_CUDA_CHECK(cudaMalloc(&state.meta_buf.d_meta, ptrs.meta_n * sizeof(int32_t)));
+        state.meta_buf.cap = ptrs.meta_n;
         plan.meta_initialized = false;
-        meta_owner_plan = nullptr;
+        state.meta_owner_plan = nullptr;
     }
-    int32_t *d_seq_q = meta_buf.d_meta;
-    int32_t *d_seq_kv = meta_buf.d_meta + static_cast<std::ptrdiff_t>(bsz);
-    int32_t *d_page = meta_buf.d_meta + static_cast<std::ptrdiff_t>(bsz * 2);
-    int32_t *h_seq_q = meta_buf.h_meta;
-    int32_t *h_seq_kv = meta_buf.h_meta + static_cast<std::ptrdiff_t>(bsz);
-    int32_t *h_page = meta_buf.h_meta + static_cast<std::ptrdiff_t>(bsz * 2);
+    ptrs.d_seq_q = state.meta_buf.d_meta;
+    ptrs.d_seq_kv = state.meta_buf.d_meta + static_cast<std::ptrdiff_t>(ptrs.bsz);
+    ptrs.d_page = state.meta_buf.d_meta + static_cast<std::ptrdiff_t>(ptrs.bsz * 2);
+    return ptrs;
+}
 
-    const bool meta_changed =
-        (plan.last_prepared != &prepared) || (plan.last_host_revision != prepared.host_revision);
-    if (!plan.meta_initialized || plan.meta_b != b_exec || meta_owner_plan != &plan) {
-        std::fill_n(h_seq_q, static_cast<std::ptrdiff_t>(bsz), 1);
-        std::fill_n(h_seq_kv, static_cast<std::ptrdiff_t>(bsz), 0);
-        std::fill_n(h_page, static_cast<std::ptrdiff_t>(page_n), -1);
-        plan.meta_initialized = true;
-        plan.meta_b = b_exec;
-        meta_owner_plan = &plan;
-        LLAISYS_CUDA_CHECK(cudaMemcpyAsync(meta_buf.d_meta, meta_buf.h_meta, meta_n * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    }
-    if (meta_changed) {
-        int64_t seq_min = b_exec;
-        int64_t seq_max = -1;
-        int64_t page_min = static_cast<int64_t>(page_n);
-        int64_t page_max = -1;
-
-        for (int64_t i = 0; i < b_exec; ++i) {
-            int32_t visible = 0;
-            int32_t row = -1;
-            if (i < b) {
-                row = prepared.host_q_seq_rows[static_cast<size_t>(i)];
-                if (row >= 0 && row < prepared.nseq) {
-                    const int32_t seq_len = prepared.host_seq_lens[static_cast<size_t>(row)];
-                    const int32_t qpos = prepared.host_q_pos[static_cast<size_t>(i)];
-                    visible = std::max<int32_t>(0, std::min<int32_t>(seq_len, qpos + 1));
-                }
-            }
-            if (h_seq_kv[static_cast<size_t>(i)] != visible) {
-                h_seq_kv[static_cast<size_t>(i)] = visible;
-                seq_min = std::min(seq_min, i);
-                seq_max = std::max(seq_max, i);
-            }
-
-            const size_t dst_off = static_cast<size_t>(i) * static_cast<size_t>(table_size);
-            if (row < 0 || row >= prepared.nseq) {
-                for (int32_t c = 0; c < block_table_capacity; ++c) {
-                    const size_t idx = dst_off + static_cast<size_t>(c);
-                    if (h_page[idx] != -1) {
-                        h_page[idx] = -1;
-                        page_min = std::min(page_min, static_cast<int64_t>(idx));
-                        page_max = std::max(page_max, static_cast<int64_t>(idx));
-                    }
-                }
-                continue;
-            }
-
-            const size_t src_off = static_cast<size_t>(row) * static_cast<size_t>(block_table_width);
-            for (int32_t c = 0; c < block_table_capacity; ++c) {
-                int32_t next = -1;
-                if (c < block_table_width) {
-                    next = prepared.host_block_tables[src_off + static_cast<size_t>(c)];
-                }
-                const size_t idx = dst_off + static_cast<size_t>(c);
-                if (h_page[idx] != next) {
-                    h_page[idx] = next;
-                    page_min = std::min(page_min, static_cast<int64_t>(idx));
-                    page_max = std::max(page_max, static_cast<int64_t>(idx));
-                }
-            }
-        }
-
-        if (seq_max >= seq_min) {
-            const size_t off = static_cast<size_t>(seq_min);
-            const size_t len = static_cast<size_t>(seq_max - seq_min + 1);
-            LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
-                d_seq_kv + static_cast<std::ptrdiff_t>(off),
-                h_seq_kv + static_cast<std::ptrdiff_t>(off),
-                len * sizeof(int32_t),
-                cudaMemcpyHostToDevice,
-                stream));
-        }
-        if (page_max >= page_min) {
-            const size_t off = static_cast<size_t>(page_min);
-            const size_t len = static_cast<size_t>(page_max - page_min + 1);
-            LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
-                d_page + static_cast<std::ptrdiff_t>(off),
-                h_page + static_cast<std::ptrdiff_t>(off),
-                len * sizeof(int32_t),
-                cudaMemcpyHostToDevice,
-                stream));
-        }
-
-        plan.last_prepared = &prepared;
-        plan.last_host_revision = prepared.host_revision;
+static void refresh_cudnn_meta_if_needed(const CommonAttentionMetadata &prepared,
+                                         CudnnPagedPlan &plan,
+                                         CudnnRuntimeState &state,
+                                         const CudnnProblemShape &shape,
+                                         int32_t block_table_width,
+                                         const CudnnMetaPtrs &ptrs,
+                                         cudaStream_t stream) {
+    const bool meta_changed = (plan.last_prepared != &prepared) || (plan.last_revision != prepared.revision);
+    const bool needs_rebuild = !plan.meta_initialized || plan.meta_b != shape.b_exec || state.meta_owner_plan != &plan || meta_changed;
+    if (!needs_rebuild) {
+        return;
     }
 
+    const int32_t *q_seq_rows_dev = prepared.q_seq_rows;
+    const int32_t *q_pos_dev = prepared.q_pos;
+    const int32_t *seq_lens_dev = prepared.seq_lens;
+    const int32_t *block_tables_dev = prepared.block_tables;
+    if (q_seq_rows_dev == nullptr || q_pos_dev == nullptr || seq_lens_dev == nullptr || block_tables_dev == nullptr) {
+        return;
+    }
+    const dim3 grid(static_cast<unsigned int>(shape.b_exec));
+    const dim3 block(256);
+    build_cudnn_meta_kernel<<<grid, block, 0, stream>>>(shape.b_exec,
+                                                         shape.seqlen,
+                                                         shape.block_table_capacity,
+                                                         block_table_width,
+                                                         prepared.nseq,
+                                                         q_seq_rows_dev,
+                                                         q_pos_dev,
+                                                         seq_lens_dev,
+                                                         block_tables_dev,
+                                                         ptrs.d_seq_q,
+                                                         ptrs.d_seq_kv,
+                                                         ptrs.d_page);
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+
+    plan.last_prepared = &prepared;
+    plan.last_revision = prepared.revision;
+    plan.meta_initialized = true;
+    plan.meta_b = shape.b_exec;
+    state.meta_owner_plan = &plan;
+}
+
+static bool ensure_cudnn_workspace(CudnnPagedPlan &plan) {
     int64_t workspace_size = 0;
     auto ws_status = plan.graph->get_workspace_size(workspace_size);
     if (ws_status.is_bad()) {
@@ -862,19 +899,58 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
         }
         plan.workspace_cap = static_cast<size_t>(workspace_size);
     }
+    return true;
+}
+#endif
+
+bool cudnn_try_paged_attention(tensor_t attn_val,
+                               tensor_t q,
+                               tensor_t k_cache,
+                               tensor_t v_cache,
+                               const CommonAttentionMetadata &prepared,
+                               int32_t block_table_width,
+                               int32_t block_size,
+                               float scale) {
+#ifdef ENABLE_CUDNN_FRONTEND
+    CudnnProblemShape shape{};
+    if (!cudnn_validate_inputs(q, k_cache, v_cache, prepared, block_table_width, block_size, shape)) {
+        return false;
+    }
+    CudnnRuntimeState &state = cudnn_runtime_state();
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    if (!cudnn_set_stream(state.handle, stream)) {
+        return false;
+    }
+    if (!prebuild_cudnn_buckets(state, q->dtype(), shape, block_size, scale)) {
+        return false;
+    }
+
+    auto &plan_ptr = state.plan_cache[make_cudnn_plan_key(q->dtype(), shape, block_size, shape.b_exec)];
+    if (!plan_ptr) {
+        plan_ptr = std::make_unique<CudnnPagedPlan>();
+    }
+    auto &plan = *plan_ptr;
+    if (!ensure_cudnn_plan_ready(plan, state.handle, q->dtype(), shape, block_size, shape.b_exec, scale)) {
+        return false;
+    }
+    const CudnnMetaPtrs ptrs = ensure_cudnn_meta_buffer(state, plan, shape);
+    refresh_cudnn_meta_if_needed(prepared, plan, state, shape, block_table_width, ptrs, stream);
+    if (!ensure_cudnn_workspace(plan)) {
+        return false;
+    }
 
     std::unordered_map<int64_t, void *> variant_pack = {
         {Q_UID, q->data()},
         {K_UID, k_cache->data()},
         {V_UID, v_cache->data()},
         {O_UID, attn_val->data()},
-        {SEQ_LEN_Q_UID, d_seq_q},
-        {SEQ_LEN_KV_UID, d_seq_kv},
-        {PAGE_TABLE_K_UID, d_page},
-        {PAGE_TABLE_V_UID, d_page},
+        {SEQ_LEN_Q_UID, ptrs.d_seq_q},
+        {SEQ_LEN_KV_UID, ptrs.d_seq_kv},
+        {PAGE_TABLE_K_UID, ptrs.d_page},
+        {PAGE_TABLE_V_UID, ptrs.d_page},
     };
 
-    auto exec_status = plan.graph->execute(handle, variant_pack, plan.workspace);
+    auto exec_status = plan.graph->execute(state.handle, variant_pack, plan.workspace);
     if (exec_status.is_bad()) {
         static bool warned_exec = false;
         if (!warned_exec) {
@@ -898,7 +974,7 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
 
 } // namespace
 
-PagedAttentionPrepared::~PagedAttentionPrepared() {
+CommonAttentionMetadata::~CommonAttentionMetadata() {
     release_device_i32(q_seq_rows);
     release_device_i32(q_pos);
     release_device_i32(block_tables);
@@ -912,39 +988,42 @@ PagedAttentionPrepared::~PagedAttentionPrepared() {
     nseq = 0;
 }
 
-void prepare_paged_attention(PagedAttentionPrepared &prepared,
-                             const std::vector<int32_t> &q_seq_rows,
-                             const std::vector<int32_t> &q_pos,
-                             const std::vector<int32_t> &block_tables,
-                             const std::vector<int32_t> &seq_lens,
-                             int32_t block_size,
-                             bool upload_device_metadata) {
-    prepared.host_q_seq_rows = q_seq_rows;
-    prepared.host_q_pos = q_pos;
-    prepared.host_block_tables = block_tables;
-    prepared.host_seq_lens = seq_lens;
+void build_attn_metadata(CommonAttentionMetadata &prepared,
+                         const std::vector<int32_t> &q_seq_rows,
+                         const std::vector<int32_t> &q_pos,
+                         const std::vector<int32_t> &block_tables,
+                         const std::vector<int32_t> &seq_lens,
+                         int32_t block_size,
+                         bool upload_device_metadata) {
+    build_attn_metadata(prepared,
+                        q_seq_rows,
+                        q_pos,
+                        block_tables.empty() ? nullptr : block_tables.data(),
+                        block_tables.size(),
+                        seq_lens.empty() ? nullptr : seq_lens.data(),
+                        seq_lens.size(),
+                        block_size,
+                        upload_device_metadata);
+}
 
+void build_attn_metadata(CommonAttentionMetadata &prepared,
+                         const std::vector<int32_t> &q_seq_rows,
+                         const std::vector<int32_t> &q_pos,
+                         const int32_t *block_tables,
+                         size_t block_tables_len,
+                         const int32_t *seq_lens,
+                         size_t seq_lens_len,
+                         int32_t block_size,
+                         bool upload_device_metadata) {
     if (upload_device_metadata) {
         upload_device_i32(prepared.q_seq_rows, prepared.q_seq_rows_cap, q_seq_rows);
         upload_device_i32(prepared.q_pos, prepared.q_pos_cap, q_pos);
-        upload_device_i32(prepared.block_tables, prepared.block_tables_cap, block_tables);
-        upload_device_i32(prepared.seq_lens, prepared.seq_lens_cap, seq_lens);
+        upload_device_i32_raw(prepared.block_tables, prepared.block_tables_cap, block_tables, block_tables_len);
+        upload_device_i32_raw(prepared.seq_lens, prepared.seq_lens_cap, seq_lens, seq_lens_len);
     }
-    std::vector<int32_t> last_page_lens(seq_lens.size(), 0);
-    if (block_size > 0) {
-        for (size_t i = 0; i < seq_lens.size(); ++i) {
-            const int32_t len = seq_lens[i];
-            if (len > 0) {
-                last_page_lens[i] = ((len - 1) % block_size) + 1;
-            }
-        }
-    }
-    prepared.host_last_page_lens = last_page_lens;
-    prepared.host_revision += 1;
-    if (upload_device_metadata) {
-        upload_device_i32(prepared.last_page_lens, prepared.last_page_lens_cap, last_page_lens);
-    }
-    prepared.nseq = static_cast<int32_t>(seq_lens.size());
+    (void)block_size;
+    prepared.revision += 1;
+    prepared.nseq = static_cast<int32_t>(seq_lens_len);
 }
 
 void scatter_kv_cache_by_slots(tensor_t k_cache,
@@ -1072,7 +1151,7 @@ void self_attention_paged_prepared(tensor_t attn_val,
                                    tensor_t q,
                                    tensor_t k_cache,
                                    tensor_t v_cache,
-                                   const PagedAttentionPrepared &prepared,
+                                   const CommonAttentionMetadata &prepared,
                                    int32_t block_table_width,
                                    int32_t block_size,
                                    float scale) {
@@ -1110,15 +1189,15 @@ void self_attention_paged_prepared(tensor_t attn_val,
     }
 }
 
-void self_attention_paged_prepared_with_backend(tensor_t attn_val,
-                                                tensor_t q,
-                                                tensor_t k_cache,
-                                                tensor_t v_cache,
-                                                const PagedAttentionPrepared &prepared,
-                                                PagedAttentionBackend backend,
-                                                int32_t block_table_width,
-                                                int32_t block_size,
-                                                float scale) {
+void dispatch_attention_with_backend(tensor_t attn_val,
+                                     tensor_t q,
+                                     tensor_t k_cache,
+                                     tensor_t v_cache,
+                                     const CommonAttentionMetadata &prepared,
+                                     PagedAttentionBackend backend,
+                                     int32_t block_table_width,
+                                     int32_t block_size,
+                                     float scale) {
     if (backend == PagedAttentionBackend::FLASHINFER) {
         // Stage-1 FlashInfer migration scaffold: keep behavior stable via native fallback
         // while preserving a dedicated backend switch point for later real integration.
@@ -1167,9 +1246,9 @@ void self_attention_paged(tensor_t attn_val,
     }
 
     // Compatibility path: keep one-shot API by preparing metadata internally.
-    static thread_local PagedAttentionPrepared prepared{};
-    prepare_paged_attention(prepared, q_seq_rows, q_pos, block_tables, seq_lens, block_size);
-    self_attention_paged_prepared_with_backend(
+    static thread_local CommonAttentionMetadata prepared{};
+    build_attn_metadata(prepared, q_seq_rows, q_pos, block_tables, seq_lens, block_size);
+    dispatch_attention_with_backend(
         attn_val, q, k_cache, v_cache, prepared, PagedAttentionBackend::NATIVE, block_table_width, block_size, scale);
 }
 

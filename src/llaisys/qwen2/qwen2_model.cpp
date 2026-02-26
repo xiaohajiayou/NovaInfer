@@ -311,6 +311,30 @@ tensor_t Qwen2Model::upload_slot_indices_(const std::vector<int32_t> &slot_idxs)
     return out;
 }
 
+void Qwen2Model::refresh_block_seq_row_cache_(const LlaisysBatch &batch) {
+    const int32_t n_batch_seq = batch.n_batch_seq;
+    const int32_t width = batch.block_table_width;
+    bool need_rebuild = (block_seq_row_width_ != width) || (block_seq_row_ids_.size() != static_cast<size_t>(n_batch_seq));
+    if (!need_rebuild) {
+        for (int32_t r = 0; r < n_batch_seq; ++r) {
+            if (block_seq_row_ids_[static_cast<size_t>(r)] != batch.batch_seq_ids[r]) {
+                need_rebuild = true;
+                break;
+            }
+        }
+    }
+    if (!need_rebuild) {
+        return;
+    }
+    block_seq_row_width_ = width;
+    block_seq_row_ids_.assign(batch.batch_seq_ids, batch.batch_seq_ids + n_batch_seq);
+    block_seq_row_cache_.clear();
+    block_seq_row_cache_.reserve(static_cast<size_t>(n_batch_seq) * 2);
+    for (int32_t r = 0; r < n_batch_seq; ++r) {
+        block_seq_row_cache_[batch.batch_seq_ids[r]] = r;
+    }
+}
+
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
     ASSERT(cache->deviceType() == src->deviceType(), "Qwen2: cache/src device mismatch");
     ASSERT(cache->dtype() == src->dtype(), "Qwen2: cache/src dtype mismatch");
@@ -480,12 +504,12 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         if (paged_attention) {
 #ifdef ENABLE_NVIDIA_API
             if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
-                ops::cuda::self_attention_paged_prepared_with_backend(
+                ops::cuda::dispatch_attention_with_backend(
                     attn_out,
                     rope_q,
                     layer_k_cache,
                     layer_v_cache,
-                    paged_attn_prepared_,
+                    common_attn_metadata_,
                     paged_attn_backend_,
                     block_table_width,
                     static_cast<int32_t>(kv_block_size_),
@@ -659,49 +683,45 @@ int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
         slot_idxs.push_back(batch.slot_mapping[i]);
     }
 
-    // Step 1) Build seq_id -> row index map for block_tables/context_lens lookup.
     const int32_t n_batch_seq = batch.n_batch_seq;
     const int32_t width = batch.block_table_width;
-    std::vector<int32_t> seq_lens(static_cast<size_t>(n_batch_seq), 0);
-    std::vector<int32_t> block_tables(static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width), -1);
-    std::unordered_map<int64_t, int32_t> seq_row;
-    seq_row.reserve(static_cast<size_t>(n_batch_seq) * 2);
-    for (int32_t r = 0; r < n_batch_seq; ++r) {
-        seq_row[batch.batch_seq_ids[r]] = r;
-        seq_lens[static_cast<size_t>(r)] = batch.context_lens[r];
-        for (int32_t c = 0; c < width; ++c) {
-            block_tables[static_cast<size_t>(r) * static_cast<size_t>(width) + static_cast<size_t>(c)] =
-                batch.block_tables[r * width + c];
-        }
-    }
+    refresh_block_seq_row_cache_(batch);
 
     // Step 2) Build token-level row/position vectors for paged attention.
     std::vector<int32_t> q_seq_rows(ntoken, -1);
     std::vector<int32_t> q_pos(ntoken, -1);
     for (size_t i = 0; i < ntoken; ++i) {
         const int64_t sid = seq_ids_flat[i];
-        auto it = seq_row.find(sid);
-        CHECK_ARGUMENT(it != seq_row.end(), "Qwen2: seq id missing in block metadata");
+        auto it = block_seq_row_cache_.find(sid);
+        CHECK_ARGUMENT(it != block_seq_row_cache_.end(), "Qwen2: seq id missing in block metadata");
         const int32_t row = it->second;
         q_seq_rows[i] = row;
         q_pos[i] = static_cast<int32_t>(pos_values[i]);
     }
 
+    std::vector<int32_t> seq_lens;
+    std::vector<int32_t> block_tables;
 #ifdef ENABLE_NVIDIA_API
     if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
         // Always keep device metadata fresh. cuDNN path can fallback to native at
         // runtime (build/exec failure), and native path requires device metadata.
         const bool upload_device_metadata = true;
-        ops::cuda::prepare_paged_attention(
-            paged_attn_prepared_,
+        ops::cuda::build_attn_metadata(
+            common_attn_metadata_,
             q_seq_rows,
             q_pos,
-            block_tables,
-            seq_lens,
+            batch.block_tables,
+            static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width),
+            batch.context_lens,
+            static_cast<size_t>(n_batch_seq),
             static_cast<int32_t>(kv_block_size_),
             upload_device_metadata);
-    }
+    } else
 #endif
+    {
+        seq_lens.assign(batch.context_lens, batch.context_lens + n_batch_seq);
+        block_tables.assign(batch.block_tables, batch.block_tables + static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width));
+    }
 
     run_layers_and_collect_(
         batch, ntoken, hidden, pos_ids, slot_idxs, {}, {}, q_seq_rows, q_pos, block_tables, seq_lens, width, true);

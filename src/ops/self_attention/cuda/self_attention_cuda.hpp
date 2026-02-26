@@ -13,7 +13,7 @@ enum class PagedAttentionBackend : int32_t {
     CUDNN = 2,
 };
 
-struct PagedAttentionPrepared {
+struct CommonAttentionMetadata {
     int32_t *q_seq_rows{nullptr};
     int32_t *q_pos{nullptr};
     int32_t *block_tables{nullptr};
@@ -26,28 +26,30 @@ struct PagedAttentionPrepared {
     size_t last_page_lens_cap{0};
     int32_t nseq{0};
 
-    // Host mirrors used by backend integrations that need to rebuild token-level
-    // page tables/sequence metadata at runtime (e.g., cuDNN frontend SDPA).
-    std::vector<int32_t> host_q_seq_rows;
-    std::vector<int32_t> host_q_pos;
-    std::vector<int32_t> host_block_tables;
-    std::vector<int32_t> host_seq_lens;
-    std::vector<int32_t> host_last_page_lens;
-    uint64_t host_revision{0};
+    uint64_t revision{0};
 
-    PagedAttentionPrepared() = default;
-    ~PagedAttentionPrepared();
-    PagedAttentionPrepared(const PagedAttentionPrepared &) = delete;
-    PagedAttentionPrepared &operator=(const PagedAttentionPrepared &) = delete;
+    CommonAttentionMetadata() = default;
+    ~CommonAttentionMetadata();
+    CommonAttentionMetadata(const CommonAttentionMetadata &) = delete;
+    CommonAttentionMetadata &operator=(const CommonAttentionMetadata &) = delete;
 };
 
-void prepare_paged_attention(PagedAttentionPrepared &prepared,
-                             const std::vector<int32_t> &q_seq_rows,
-                             const std::vector<int32_t> &q_pos,
-                             const std::vector<int32_t> &block_tables,
-                             const std::vector<int32_t> &seq_lens,
-                             int32_t block_size,
-                             bool upload_device_metadata = true);
+void build_attn_metadata(CommonAttentionMetadata &metadata,
+                         const std::vector<int32_t> &q_seq_rows,
+                         const std::vector<int32_t> &q_pos,
+                         const std::vector<int32_t> &block_tables,
+                         const std::vector<int32_t> &seq_lens,
+                         int32_t block_size,
+                         bool upload_device_metadata = true);
+void build_attn_metadata(CommonAttentionMetadata &metadata,
+                         const std::vector<int32_t> &q_seq_rows,
+                         const std::vector<int32_t> &q_pos,
+                         const int32_t *block_tables,
+                         size_t block_tables_len,
+                         const int32_t *seq_lens,
+                         size_t seq_lens_len,
+                         int32_t block_size,
+                         bool upload_device_metadata = true);
 
 void scatter_kv_cache_by_slots(tensor_t k_cache,
                                tensor_t v_cache,
@@ -62,20 +64,20 @@ void scatter_kv_cache_by_slots_device_indices(tensor_t k_cache,
                                               tensor_t slot_idxs_i32);
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale);
-void self_attention_paged_prepared_with_backend(tensor_t attn_val,
-                                                tensor_t q,
-                                                tensor_t k_cache,
-                                                tensor_t v_cache,
-                                                const PagedAttentionPrepared &prepared,
-                                                PagedAttentionBackend backend,
-                                                int32_t block_table_width,
-                                                int32_t block_size,
-                                                float scale);
+void dispatch_attention_with_backend(tensor_t attn_val,
+                                     tensor_t q,
+                                     tensor_t k_cache,
+                                     tensor_t v_cache,
+                                     const CommonAttentionMetadata &metadata,
+                                     PagedAttentionBackend backend,
+                                     int32_t block_table_width,
+                                     int32_t block_size,
+                                     float scale);
 void self_attention_paged_prepared(tensor_t attn_val,
                                    tensor_t q,
                                    tensor_t k_cache,
                                    tensor_t v_cache,
-                                   const PagedAttentionPrepared &prepared,
+                                   const CommonAttentionMetadata &prepared,
                                    int32_t block_table_width,
                                    int32_t block_size,
                                    float scale);
@@ -90,5 +92,29 @@ void self_attention_paged(tensor_t attn_val,
                           int32_t block_table_width,
                           int32_t block_size,
                           float scale);
+
+// Backward-compatible aliases for existing call sites.
+using PagedAttentionPrepared = CommonAttentionMetadata;
+inline void prepare_paged_attention(CommonAttentionMetadata &prepared,
+                                    const std::vector<int32_t> &q_seq_rows,
+                                    const std::vector<int32_t> &q_pos,
+                                    const std::vector<int32_t> &block_tables,
+                                    const std::vector<int32_t> &seq_lens,
+                                    int32_t block_size,
+                                    bool upload_device_metadata = true) {
+    build_attn_metadata(prepared, q_seq_rows, q_pos, block_tables, seq_lens, block_size, upload_device_metadata);
+}
+inline void self_attention_paged_prepared_with_backend(tensor_t attn_val,
+                                                       tensor_t q,
+                                                       tensor_t k_cache,
+                                                       tensor_t v_cache,
+                                                       const CommonAttentionMetadata &prepared,
+                                                       PagedAttentionBackend backend,
+                                                       int32_t block_table_width,
+                                                       int32_t block_size,
+                                                       float scale) {
+    dispatch_attention_with_backend(
+        attn_val, q, k_cache, v_cache, prepared, backend, block_table_width, block_size, scale);
+}
 
 } // namespace llaisys::ops::cuda
