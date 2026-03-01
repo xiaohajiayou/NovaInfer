@@ -32,6 +32,9 @@ target("llaisys-utils")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
+    if has_config("nv-gpu") then
+        add_links("nvToolsExt")
+    end
 
     add_files("src/utils/*.cpp")
 

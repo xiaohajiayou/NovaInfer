@@ -93,28 +93,4 @@ void self_attention_paged(tensor_t attn_val,
                           int32_t block_size,
                           float scale);
 
-// Backward-compatible aliases for existing call sites.
-using PagedAttentionPrepared = CommonAttentionMetadata;
-inline void prepare_paged_attention(CommonAttentionMetadata &prepared,
-                                    const std::vector<int32_t> &q_seq_rows,
-                                    const std::vector<int32_t> &q_pos,
-                                    const std::vector<int32_t> &block_tables,
-                                    const std::vector<int32_t> &seq_lens,
-                                    int32_t block_size,
-                                    bool upload_device_metadata = true) {
-    build_attn_metadata(prepared, q_seq_rows, q_pos, block_tables, seq_lens, block_size, upload_device_metadata);
-}
-inline void self_attention_paged_prepared_with_backend(tensor_t attn_val,
-                                                       tensor_t q,
-                                                       tensor_t k_cache,
-                                                       tensor_t v_cache,
-                                                       const CommonAttentionMetadata &prepared,
-                                                       PagedAttentionBackend backend,
-                                                       int32_t block_table_width,
-                                                       int32_t block_size,
-                                                       float scale) {
-    dispatch_attention_with_backend(
-        attn_val, q, k_cache, v_cache, prepared, backend, block_table_width, block_size, scale);
-}
-
 } // namespace llaisys::ops::cuda

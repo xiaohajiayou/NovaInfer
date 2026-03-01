@@ -158,7 +158,11 @@ sequenceDiagram
 ## Build
 
 ### 1. Build native library
-
+Install compile tool - xmake
+```bash
+curl -fsSL https://xmake.io/shget.text | bash
+source ~/.xmake/profile
+```
 CPU (Linux):
 
 ```bash

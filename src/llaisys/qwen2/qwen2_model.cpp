@@ -52,8 +52,10 @@ void runtime_copy_bytes(llaisysDeviceType_t dst_dev, std::byte *dst, llaisysDevi
     if (nbytes == 0) {
         return;
     }
+    const llaisysMemcpyKind_t kind = choose_memcpy_kind(dst_dev, src_dev);
+    utils::NvtxScope nvtx_scope(utils::nvtx_memcpy_tag(kind, false));
     const auto *api = core::context().runtime().api();
-    api->memcpy_sync(dst, src, nbytes, choose_memcpy_kind(dst_dev, src_dev));
+    api->memcpy_sync(dst, src, nbytes, kind);
 }
 
 #ifdef ENABLE_NVIDIA_API
@@ -288,6 +290,7 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
 }
 
 void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values) {
+    LLAISYS_NVTX_SCOPE("decode/fill_pos_ids");
     ASSERT(pos_ids->dtype() == LLAISYS_DTYPE_I64, "Qwen2: pos_ids dtype must be int64");
     ASSERT(pos_ids->shape()[0] == pos_values.size(), "Qwen2: pos_ids length mismatch");
     const size_t nbytes = pos_values.size() * sizeof(int64_t);
@@ -298,7 +301,36 @@ void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::v
                        nbytes);
 }
 
+void Qwen2Model::build_hidden_and_pos_(const std::vector<int64_t> &tokens,
+                                       const std::vector<int64_t> &pos_values,
+                                       tensor_t *hidden,
+                                       tensor_t *pos_ids) {
+    CHECK_ARGUMENT(hidden != nullptr, "Qwen2: hidden output pointer is null");
+    CHECK_ARGUMENT(pos_ids != nullptr, "Qwen2: pos_ids output pointer is null");
+    ASSERT(workspace_ != nullptr, "Qwen2: workspace is null");
+    CHECK_ARGUMENT(tokens.size() == pos_values.size(), "Qwen2: tokens/pos_values size mismatch");
+
+    const size_t ntoken = tokens.size();
+    const auto &ws = workspace_->view();
+
+    tensor_t input_ids = slice_tokens_(ws.input_ids, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("decode/input_ids_load");
+        input_ids->load(tokens.data());
+    }
+
+    *hidden = slice_tokens_(ws.hidden, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("decode/embedding");
+        ops::embedding(*hidden, input_ids, weights_.in_embed->tensor);
+    }
+
+    *pos_ids = slice_tokens_(ws.pos_ids, ntoken);
+    fill_pos_ids_from_values_(*pos_ids, pos_values);
+}
+
 tensor_t Qwen2Model::upload_slot_indices_(const std::vector<int32_t> &slot_idxs) {
+    LLAISYS_NVTX_SCOPE("decode/upload_slot_indices");
     if (slot_idxs.empty()) {
         return nullptr;
     }
@@ -336,6 +368,7 @@ void Qwen2Model::refresh_block_seq_row_cache_(const LlaisysBatch &batch) {
 }
 
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
+    LLAISYS_NVTX_SCOPE("decode/copy_token_into_cache");
     ASSERT(cache->deviceType() == src->deviceType(), "Qwen2: cache/src device mismatch");
     ASSERT(cache->dtype() == src->dtype(), "Qwen2: cache/src dtype mismatch");
     ASSERT(cache->shape()[1] == src->shape()[1] && cache->shape()[2] == src->shape()[2],
@@ -352,6 +385,7 @@ void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const ten
 }
 
 tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer) {
+    LLAISYS_NVTX_SCOPE("decode/gather_cache_by_slots");
     ASSERT(cache->deviceType() == LLAISYS_DEVICE_CPU, "Qwen2: cache must be on CPU");
     ASSERT(buffer->deviceType() == LLAISYS_DEVICE_CPU, "Qwen2: buffer must be on CPU");
     ASSERT(cache->dtype() == buffer->dtype(), "Qwen2: cache/buffer dtype mismatch");
@@ -445,6 +479,7 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
                                          const std::vector<int32_t> &seq_lens,
                                          int32_t block_table_width,
                                          bool paged_attention) {
+    LLAISYS_NVTX_SCOPE("decode/run_layers_and_collect");
     ASSERT(workspace_ != nullptr, "Qwen2: workspace is null");
     const auto &ws = workspace_->view();
     const size_t nh = meta_.nh;
@@ -462,6 +497,7 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
     // Shared transformer forward path. SLOT/BLOCK differ only in attention input form
     // (dense mask vs CSR paged plan), then merge into the same per-layer pipeline.
     for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
+        LLAISYS_NVTX_SCOPE("decode/layer");
         tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
         ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
 
@@ -469,12 +505,15 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
         tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
 
-        ops::linear(
-            q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
-        ops::linear(
-            k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
-        ops::linear(
-            v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+        {
+            LLAISYS_NVTX_SCOPE("decode/layer/qkv_linear");
+            ops::linear(
+                q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
+            ops::linear(
+                k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
+            ops::linear(
+                v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+        }
 
         tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
         tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
@@ -482,18 +521,23 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
 
         tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
         tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
-        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
-        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+        {
+            LLAISYS_NVTX_SCOPE("decode/layer/rope");
+            ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
+            ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+        }
 
         tensor_t layer_k_cache = kv_layer_k(kv_cache_.get(), kv_layout_, layer);
         tensor_t layer_v_cache = kv_layer_v(kv_cache_.get(), kv_layout_, layer);
 #ifdef ENABLE_NVIDIA_API
         if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+            LLAISYS_NVTX_SCOPE("decode/layer/kv_scatter_cuda");
             ops::cuda::scatter_kv_cache_by_slots_device_indices(
                 layer_k_cache, layer_v_cache, rope_k, v_new_3d, slot_idxs_dev);
         } else
 #endif
         {
+            LLAISYS_NVTX_SCOPE("decode/layer/kv_scatter_cpu");
             for (size_t i = 0; i < ntoken; ++i) {
                 copy_token_into_cache_(layer_k_cache, slot_idxs[i], rope_k, i);
                 copy_token_into_cache_(layer_v_cache, slot_idxs[i], v_new_3d, i);
@@ -502,6 +546,7 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
 
         tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
         if (paged_attention) {
+            LLAISYS_NVTX_SCOPE("decode/layer/attention_paged");
 #ifdef ENABLE_NVIDIA_API
             if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
                 ops::cuda::dispatch_attention_with_backend(
@@ -531,6 +576,7 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
                 scale);
             }
         } else {
+            LLAISYS_NVTX_SCOPE("decode/layer/attention_masked");
             tensor_t k_full = gather_cache_by_slots_(layer_k_cache, used_slots, kvlen, ws.k_ctx);
             tensor_t v_full = gather_cache_by_slots_(layer_v_cache, used_slots, kvlen, ws.v_ctx);
             ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_mask, scale);
@@ -539,7 +585,10 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
         tensor_t attn_out_2d = attn_out->view({ntoken, nh * dh});
 
         tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
-        ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
+        {
+            LLAISYS_NVTX_SCOPE("decode/layer/attn_out_linear");
+            ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
+        }
         ops::add(hidden, hidden, attn_proj);
 
         tensor_t mlp_normed = slice_tokens_(ws.mlp_normed, ntoken);
@@ -547,14 +596,20 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
 
         tensor_t gate = slice_tokens_(ws.gate, ntoken);
         tensor_t up = slice_tokens_(ws.up, ntoken);
-        ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
-        ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
+        {
+            LLAISYS_NVTX_SCOPE("decode/layer/mlp_up_gate_linear");
+            ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
+            ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
+        }
 
         tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
         ops::swiglu(swiglu, gate, up);
 
         tensor_t down = slice_tokens_(ws.down, ntoken);
-        ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
+        {
+            LLAISYS_NVTX_SCOPE("decode/layer/mlp_down_linear");
+            ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
+        }
         ops::add(hidden, hidden, down);
     }
 
@@ -573,38 +628,99 @@ void Qwen2Model::run_layers_and_collect_(const LlaisysBatch &batch,
     tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
     ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
 
-    const size_t n_selected = collected_rows.size();
-    tensor_t row_indices = upload_slot_indices_(collected_rows);
-    CHECK_ARGUMENT(row_indices != nullptr, "Qwen2: failed to upload lmhead row indices");
-    tensor_t logits = slice_tokens_(ws.logits, n_selected);
-    ops::linear_indexed(logits, final_normed, row_indices, weights_.out_embed->tensor, zero_bias_logits_);
+    // Always run full lm_head projection for the whole token batch; output
+    // selection is applied after argmax based on collected_rows.
+    tensor_t logits = slice_tokens_(ws.logits, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("decode/lm_head_linear");
+        ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
+    }
 
-    tensor_t max_idx = Tensor::create({n_selected}, LLAISYS_DTYPE_I64, device_type_, device_id_);
-    tensor_t max_val = Tensor::create({n_selected}, meta_.dtype, device_type_, device_id_);
+    tensor_t max_idx = Tensor::create({ntoken}, LLAISYS_DTYPE_I64, device_type_, device_id_);
+    tensor_t max_val = Tensor::create({ntoken}, meta_.dtype, device_type_, device_id_);
     ops::argmax_rows(max_idx, max_val, logits);
 
-    std::vector<int64_t> sampled_host(n_selected, 0);
-    runtime_copy_bytes(
-        LLAISYS_DEVICE_CPU,
-        reinterpret_cast<std::byte *>(sampled_host.data()),
-        device_type_,
-        max_idx->data(),
-        n_selected * sizeof(int64_t));
+    std::vector<int64_t> sampled_host(ntoken, 0);
+    {
+        LLAISYS_NVTX_SCOPE("decode/sampled_ids_d2h");
+        runtime_copy_bytes(
+            LLAISYS_DEVICE_CPU,
+            reinterpret_cast<std::byte *>(sampled_host.data()),
+            device_type_,
+            max_idx->data(),
+            ntoken * sizeof(int64_t));
+    }
 
-    for (size_t out_i = 0; out_i < n_selected; ++out_i) {
-        const int32_t row_id = collected_rows[out_i];
+    for (int32_t row_id : collected_rows) {
         output_->append_output_id(row_id);
-        output_->append_sampled_id(static_cast<int32_t>(sampled_host[out_i]));
+        output_->append_sampled_id(static_cast<int32_t>(sampled_host[static_cast<size_t>(row_id)]));
     }
 }
 
-int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
-                                      size_t ntoken,
-                                      const std::vector<std::vector<int64_t>> &seq_sets,
-                                      const std::vector<int64_t> &pos_values,
-                                      const std::vector<int32_t> &nseq_values,
-                                      tensor_t hidden,
-                                      tensor_t pos_ids) {
+int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch) {
+    LLAISYS_NVTX_SCOPE("decode/slot_path");
+    const size_t ntoken = static_cast<size_t>(batch.n_tokens);
+
+    std::vector<int64_t> tokens(ntoken, 0);
+    std::vector<std::vector<int64_t>> seq_sets(ntoken);
+    std::vector<int64_t> pos_values(ntoken, 0);
+    std::vector<int32_t> nseq_values(ntoken, 0);
+    std::unordered_map<int64_t, int64_t> next_pos_by_seq;
+
+    for (size_t i = 0; i < ntoken; ++i) {
+        tokens[i] = batch.token[i];
+
+        const int32_t req_nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+        const int64_t *src_seq_ptr = (batch.seq_id && batch.seq_id[i]) ? batch.seq_id[i] : nullptr;
+
+        std::vector<int64_t> uniq_seq;
+        uniq_seq.reserve(static_cast<size_t>(req_nseq));
+        if (src_seq_ptr == nullptr) {
+            if (batch.seq_id != nullptr) {
+                return -1;
+            }
+            uniq_seq.push_back(0);
+        } else {
+            for (int32_t j = 0; j < req_nseq; ++j) {
+                const int64_t sid = src_seq_ptr[j];
+                if (std::find(uniq_seq.begin(), uniq_seq.end(), sid) == uniq_seq.end()) {
+                    uniq_seq.push_back(sid);
+                }
+            }
+        }
+        if (uniq_seq.empty()) {
+            return -1;
+        }
+        seq_sets[i] = std::move(uniq_seq);
+        nseq_values[i] = static_cast<int32_t>(seq_sets[i].size());
+
+        int64_t expected_pos = -1;
+        for (int64_t sid : seq_sets[i]) {
+            auto it = next_pos_by_seq.find(sid);
+            if (it == next_pos_by_seq.end()) {
+                it = next_pos_by_seq.emplace(sid, kv_cache_->seq_pos_max(sid) + 1).first;
+            }
+            if (expected_pos < 0) {
+                expected_pos = it->second;
+            } else if (expected_pos != it->second) {
+                return -1;
+            }
+        }
+
+        const int64_t pos = batch.pos ? batch.pos[i] : expected_pos;
+        if (pos != expected_pos) {
+            return -1;
+        }
+        pos_values[i] = pos;
+        for (int64_t sid : seq_sets[i]) {
+            next_pos_by_seq[sid] = pos + 1;
+        }
+    }
+
+    tensor_t hidden{};
+    tensor_t pos_ids{};
+    build_hidden_and_pos_(tokens, pos_values, &hidden, &pos_ids);
+
     llaisys::runtime::kv_cache::KvUBatch kv_ubatch;
     llaisys::runtime::kv_cache::KvSlotInfo slot_info;
     bool kv_applied = false;
@@ -640,17 +756,23 @@ int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
     const auto &ws = workspace_->view();
     // Build mask on host first; attn_mask may live on GPU in NVIDIA mode.
     std::vector<uint8_t> host_mask(ntoken * kvlen, static_cast<uint8_t>(0));
-    for (size_t i = 0; i < ntoken; ++i) {
-        bool has_visible = false;
-        for (size_t k = 0; k < kvlen; ++k) {
-            const bool visible = kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
-            host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-            has_visible = has_visible || visible;
+    {
+        LLAISYS_NVTX_SCOPE("decode/slot/build_dense_mask");
+        for (size_t i = 0; i < ntoken; ++i) {
+            bool has_visible = false;
+            for (size_t k = 0; k < kvlen; ++k) {
+                const bool visible = kv_cache_->slot_visible_for(used_slots[k], seq_sets[i].data(), nseq_values[i], pos_values[i]);
+                host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+                has_visible = has_visible || visible;
+            }
+            CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
         }
-        CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
     }
     tensor_t attn_mask_flat = ws.attn_mask_flat->slice(0, 0, ntoken * kvlen);
-    attn_mask_flat->load(host_mask.data());
+    {
+        LLAISYS_NVTX_SCOPE("decode/slot/attn_mask_load");
+        attn_mask_flat->load(host_mask.data());
+    }
     tensor_t attn_mask = attn_mask_flat->view({ntoken, kvlen});
 
     run_layers_and_collect_(batch, ntoken, hidden, pos_ids, slot_idxs, used_slots, attn_mask, {}, {}, {}, {}, 0, false);
@@ -668,20 +790,25 @@ int32_t Qwen2Model::decode_slot_path_(const LlaisysBatch &batch,
     }
 }
 
-int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
-                                       size_t ntoken,
-                                       const std::vector<int64_t> &seq_ids_flat,
-                                       const std::vector<int64_t> &pos_values,
-                                       tensor_t hidden,
-                                       tensor_t pos_ids) {
-    // BLOCK path: consume caller-provided block context directly.
-    // Keep a local vector here to reuse the same run_layers_and_collect_ signature
-    // shared by SLOT and BLOCK paths.
+int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch) {
+    LLAISYS_NVTX_SCOPE("decode/block_path");
+    const size_t ntoken = static_cast<size_t>(batch.n_tokens);
+
+    std::vector<int64_t> tokens(ntoken, 0);
+    std::vector<int64_t> seq_ids_flat(ntoken, 0);
+    std::vector<int64_t> pos_values(ntoken, 0);
     std::vector<int32_t> slot_idxs;
     slot_idxs.reserve(ntoken);
     for (size_t i = 0; i < ntoken; ++i) {
+        tokens[i] = batch.token[i];
+        seq_ids_flat[i] = batch.seq_id[i][0];
+        pos_values[i] = batch.pos[i];
         slot_idxs.push_back(batch.slot_mapping[i]);
     }
+
+    tensor_t hidden{};
+    tensor_t pos_ids{};
+    build_hidden_and_pos_(tokens, pos_values, &hidden, &pos_ids);
 
     const int32_t n_batch_seq = batch.n_batch_seq;
     const int32_t width = batch.block_table_width;
@@ -706,16 +833,19 @@ int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
         // Always keep device metadata fresh. cuDNN path can fallback to native at
         // runtime (build/exec failure), and native path requires device metadata.
         const bool upload_device_metadata = true;
-        ops::cuda::build_attn_metadata(
-            common_attn_metadata_,
-            q_seq_rows,
-            q_pos,
-            batch.block_tables,
-            static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width),
-            batch.context_lens,
-            static_cast<size_t>(n_batch_seq),
-            static_cast<int32_t>(kv_block_size_),
-            upload_device_metadata);
+        {
+            LLAISYS_NVTX_SCOPE("decode/block/build_attn_metadata");
+            ops::cuda::build_attn_metadata(
+                common_attn_metadata_,
+                q_seq_rows,
+                q_pos,
+                batch.block_tables,
+                static_cast<size_t>(n_batch_seq) * static_cast<size_t>(width),
+                batch.context_lens,
+                static_cast<size_t>(n_batch_seq),
+                static_cast<int32_t>(kv_block_size_),
+                upload_device_metadata);
+        }
     } else
 #endif
     {
@@ -729,6 +859,7 @@ int32_t Qwen2Model::decode_block_path_(const LlaisysBatch &batch,
 }
 
 int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
+    LLAISYS_NVTX_SCOPE("decode/main");
     if (!validate_decode_batch_(batch)) {
         return -1;
     }
@@ -738,10 +869,6 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
     output_->clear();
     output_->reserve_rows(ntoken);
 
-    std::vector<std::vector<int64_t>> seq_sets(ntoken);
-    std::vector<int64_t> seq_ids_flat(ntoken, 0);
-    std::vector<int64_t> pos_values(ntoken);
-
     // Validate static model state (weights/meta invariants) before touching runtime buffers.
     validate_or_die_();
     // decode() requires a live KV runtime instance.
@@ -749,91 +876,10 @@ int32_t Qwen2Model::decode(const LlaisysBatch &batch) {
 
     // Ensure workspace tensors are large enough for current ntoken.
     ensure_workspace_(ntoken);
-    const auto &ws = workspace_->view();
-
-    // Flat token ids used by embedding op.
-    std::vector<int64_t> tokens(ntoken);
-    // Number of effective sequence ids per token after de-duplication (SLOT path only).
-    std::vector<int32_t> nseq_values(ntoken, 0);
-
     if (kv_layout_ == KvCacheLayout::BLOCK) {
-        // BLOCK mainline: one token belongs to one seq; seq/block mapping is provided by scheduler.
-        for (size_t i = 0; i < ntoken; ++i) {
-            tokens[i] = batch.token[i];
-            seq_ids_flat[i] = batch.seq_id[i][0];
-            pos_values[i] = batch.pos[i];
-        }
-    } else {
-        // SLOT path: derive per-token seq set and infer/validate positions from kv state.
-        std::unordered_map<int64_t, int64_t> next_pos_by_seq;
-        for (size_t i = 0; i < ntoken; ++i) {
-            tokens[i] = batch.token[i];
-
-            const int32_t req_nseq = batch.n_seq_id ? batch.n_seq_id[i] : 1;
-            const int64_t *src_seq_ptr = (batch.seq_id && batch.seq_id[i]) ? batch.seq_id[i] : nullptr;
-
-            std::vector<int64_t> uniq_seq;
-            uniq_seq.reserve(static_cast<size_t>(req_nseq));
-            if (src_seq_ptr == nullptr) {
-                if (batch.seq_id != nullptr) {
-                    return -1;
-                }
-                uniq_seq.push_back(0);
-            } else {
-                for (int32_t j = 0; j < req_nseq; ++j) {
-                    const int64_t sid = src_seq_ptr[j];
-                    if (std::find(uniq_seq.begin(), uniq_seq.end(), sid) == uniq_seq.end()) {
-                        uniq_seq.push_back(sid);
-                    }
-                }
-            }
-            if (uniq_seq.empty()) {
-                return -1;
-            }
-            seq_sets[i] = std::move(uniq_seq);
-            nseq_values[i] = static_cast<int32_t>(seq_sets[i].size());
-
-            int64_t expected_pos = -1;
-            for (int64_t sid : seq_sets[i]) {
-                auto it = next_pos_by_seq.find(sid);
-                if (it == next_pos_by_seq.end()) {
-                    it = next_pos_by_seq.emplace(sid, kv_cache_->seq_pos_max(sid) + 1).first;
-                }
-                if (expected_pos < 0) {
-                    expected_pos = it->second;
-                } else if (expected_pos != it->second) {
-                    return -1;
-                }
-            }
-
-            const int64_t pos = batch.pos ? batch.pos[i] : expected_pos;
-            if (pos != expected_pos) {
-                return -1;
-            }
-            pos_values[i] = pos;
-            for (int64_t sid : seq_sets[i]) {
-                next_pos_by_seq[sid] = pos + 1;
-            }
-        }
+        return decode_block_path_(batch);
     }
-
-    // Reuse workspace i64 buffer for input token ids [ntoken].
-    tensor_t input_ids = slice_tokens_(ws.input_ids, ntoken);
-    input_ids->load(tokens.data());
-
-    // Project token ids to hidden states with embedding table.
-    tensor_t hidden = slice_tokens_(ws.hidden, ntoken);
-    ops::embedding(hidden, input_ids, weights_.in_embed->tensor);
-
-    // Build position ids tensor for RoPE.
-    tensor_t pos_ids = slice_tokens_(ws.pos_ids, ntoken);
-    fill_pos_ids_from_values_(pos_ids, pos_values);
-
-    // Dispatch only after all common decode state is prepared.
-    if (kv_layout_ == KvCacheLayout::BLOCK) {
-        return decode_block_path_(batch, ntoken, seq_ids_flat, pos_values, hidden, pos_ids);
-    }
-    return decode_slot_path_(batch, ntoken, seq_sets, pos_values, nseq_values, hidden, pos_ids);
+    return decode_slot_path_(batch);
 }
 
 float *Qwen2Model::logits() noexcept {

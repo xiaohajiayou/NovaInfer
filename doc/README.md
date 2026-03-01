@@ -8,6 +8,7 @@
 4. `doc/qwen2_test_plan.md`：测试策略与回归规则
 5. `doc/qwen2_next_dev_plan_2026-02.md`：执行计划与未完成清单
 6. `doc/qwen2_cuda_perf_tracking_2026-02-21.md`：本轮 CUDA/cudnn 性能数据、适配现状与问题复盘
+7. `doc/python_cpp_runner_alignment_plan_2026-03-01.md`：Python->C++ 全链路对齐 vLLM Runner 的重构方案与验收标准
 
 ## 2. 归档文档
 
@@ -19,3 +20,15 @@
 1. 测试目录已重构：`test/core|engine|offline|online|parity|ops|utils`
 2. CI 与 `scripts/run_tests.py` 已同步到上述新路径。
 3. 对比基准脚本：`scripts/bench_compare_vllm.py`（NovaInfer/vLLM 同口径基准）。
+
+## 4. NVTX + nsys（性能分析）
+
+1. 工具函数位置：`src/utils/nvtx.hpp`、`src/utils/nvtx.cpp`
+2. 用法（RAII）：
+   `LLAISYS_NVTX_SCOPE("qwen2.decode.layer")`
+3. 用法（手动）：
+   `llaisys::utils::nvtx_range_push("qwen2.decode"); ...; llaisys::utils::nvtx_range_pop();`
+4. 采集命令示例：
+   `nsys profile -t cuda,nvtx,osrt -o novainfer_report --force-overwrite true <your_run_cmd>`
+5. 查看报告：
+   `nsys stats novainfer_report.nsys-rep`

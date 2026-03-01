@@ -96,6 +96,7 @@ void memcpySync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kin
     if (size == 0) {
         return;
     }
+    LLAISYS_NVTX_SCOPE(llaisys::utils::nvtx_memcpy_tag(kind, false));
     LLAISYS_CUDA_CHECK(cudaMemcpy(dst, src, size, to_cuda_memcpy_kind(kind)));
 }
 
@@ -103,6 +104,7 @@ void memcpyAsync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t ki
     if (size == 0) {
         return;
     }
+    LLAISYS_NVTX_SCOPE(llaisys::utils::nvtx_memcpy_tag(kind, true));
     LLAISYS_CUDA_CHECK(cudaMemcpyAsync(dst,
                                        src,
                                        size,

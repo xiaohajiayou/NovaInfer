@@ -46,10 +46,12 @@ void freeHost(void *ptr) {
 }
 
 void memcpySync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind) {
+    LLAISYS_NVTX_SCOPE(llaisys::utils::nvtx_memcpy_tag(kind, false));
     std::memcpy(dst, src, size);
 }
 
 void memcpyAsync(void *dst, const void *src, size_t size, llaisysMemcpyKind_t kind, llaisysStream_t stream) {
+    LLAISYS_NVTX_SCOPE(llaisys::utils::nvtx_memcpy_tag(kind, true));
     memcpySync(dst, src, size, kind);
 }
 

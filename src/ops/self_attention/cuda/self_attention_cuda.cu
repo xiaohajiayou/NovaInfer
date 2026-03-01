@@ -50,6 +50,7 @@ void ensure_device_i32_capacity(int32_t *&ptr, size_t &cap, size_t n) {
 }
 
 void upload_device_i32(int32_t *&ptr, size_t &cap, const std::vector<int32_t> &host) {
+    LLAISYS_NVTX_SCOPE("attn/meta_upload_i32");
     const size_t n = host.size();
     if (n == 0) {
         return;
@@ -59,6 +60,7 @@ void upload_device_i32(int32_t *&ptr, size_t &cap, const std::vector<int32_t> &h
 }
 
 void upload_device_i32_raw(int32_t *&ptr, size_t &cap, const int32_t *host, size_t n) {
+    LLAISYS_NVTX_SCOPE("attn/meta_upload_i32_raw");
     if (host == nullptr || n == 0) {
         return;
     }
@@ -1015,6 +1017,7 @@ void build_attn_metadata(CommonAttentionMetadata &prepared,
                          size_t seq_lens_len,
                          int32_t block_size,
                          bool upload_device_metadata) {
+    LLAISYS_NVTX_SCOPE("attn/build_metadata");
     if (upload_device_metadata) {
         upload_device_i32(prepared.q_seq_rows, prepared.q_seq_rows_cap, q_seq_rows);
         upload_device_i32(prepared.q_pos, prepared.q_pos_cap, q_pos);
@@ -1031,6 +1034,7 @@ void scatter_kv_cache_by_slots(tensor_t k_cache,
                                tensor_t k_src,
                                tensor_t v_src,
                                const std::vector<int32_t> &slot_idxs) {
+    LLAISYS_NVTX_SCOPE("attn/scatter_kv_cache_by_slots");
     if (slot_idxs.empty()) {
         return;
     }
@@ -1051,8 +1055,11 @@ void scatter_kv_cache_by_slots(tensor_t k_cache,
     static thread_local size_t d_slot_cap = 0;
     ensure_device_i32_capacity(d_slot_idxs, d_slot_cap, slot_idxs.size());
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
-        d_slot_idxs, slot_idxs.data(), slot_idxs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    {
+        LLAISYS_NVTX_SCOPE("memcpy/async/h2d/slot_indices");
+        LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
+            d_slot_idxs, slot_idxs.data(), slot_idxs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    }
 
     switch (k_src->dtype()) {
     case LLAISYS_DTYPE_F32:
@@ -1077,6 +1084,7 @@ void scatter_kv_cache_by_slots_device_indices(tensor_t k_cache,
                                               tensor_t k_src,
                                               tensor_t v_src,
                                               tensor_t slot_idxs_i32) {
+    LLAISYS_NVTX_SCOPE("attn/scatter_kv_cache_by_device_indices");
     CHECK_ARGUMENT(k_cache->deviceType() == LLAISYS_DEVICE_NVIDIA,
                    "scatter_kv_cache_by_slots_device_indices: k_cache must be CUDA");
     CHECK_ARGUMENT(v_cache->deviceType() == LLAISYS_DEVICE_NVIDIA,
@@ -1123,6 +1131,7 @@ void scatter_kv_cache_by_slots_device_indices(tensor_t k_cache,
 }
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
+    LLAISYS_NVTX_SCOPE("attn/self_attention");
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
     const std::int32_t nhead = static_cast<std::int32_t>(q->shape()[1]);
     const std::int32_t head_dim = static_cast<std::int32_t>(q->shape()[2]);
@@ -1155,6 +1164,7 @@ void self_attention_paged_prepared(tensor_t attn_val,
                                    int32_t block_table_width,
                                    int32_t block_size,
                                    float scale) {
+    LLAISYS_NVTX_SCOPE("attn/self_attention_paged_prepared");
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
     const std::int32_t nhead = static_cast<std::int32_t>(q->shape()[1]);
     const std::int32_t head_dim = static_cast<std::int32_t>(q->shape()[2]);

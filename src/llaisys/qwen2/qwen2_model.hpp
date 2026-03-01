@@ -125,6 +125,10 @@ private:
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
     void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
+    void build_hidden_and_pos_(const std::vector<int64_t> &tokens,
+                               const std::vector<int64_t> &pos_values,
+                               tensor_t *hidden,
+                               tensor_t *pos_ids);
     tensor_t upload_slot_indices_(const std::vector<int32_t> &slot_idxs);
     void refresh_block_seq_row_cache_(const LlaisysBatch &batch);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
@@ -144,19 +148,8 @@ private:
                                  const std::vector<int32_t> &seq_lens,
                                  int32_t block_table_width,
                                  bool paged_attention);
-    int32_t decode_slot_path_(const LlaisysBatch &batch,
-                              size_t ntoken,
-                              const std::vector<std::vector<int64_t>> &seq_sets,
-                              const std::vector<int64_t> &pos_values,
-                              const std::vector<int32_t> &nseq_values,
-                              tensor_t hidden,
-                              tensor_t pos_ids);
-    int32_t decode_block_path_(const LlaisysBatch &batch,
-                               size_t ntoken,
-                               const std::vector<int64_t> &seq_ids_flat,
-                               const std::vector<int64_t> &pos_values,
-                               tensor_t hidden,
-                               tensor_t pos_ids);
+    int32_t decode_slot_path_(const LlaisysBatch &batch);
+    int32_t decode_block_path_(const LlaisysBatch &batch);
 
     void check_meta_invariants_() const;
     void check_tensor_(const llaisysTensor_t handle,

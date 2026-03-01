@@ -58,8 +58,8 @@
 ```shell
 CUDA_VISIBLE_DEVICES=2 \
   LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
-  /home/xiaohajiayou/.conda/envs/infer_lab/bin/python scripts/bench_compare_vllm.py\
-    --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+   python scripts/bench_compare_vllm.py\
+    --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --backend novainfer \
     --num-seqs 256 \
     --min-input-len 100 \
@@ -73,8 +73,8 @@ CUDA_VISIBLE_DEVICES=2 \
     --kv-cache-capacity-mode auto
 
 CUDA_VISIBLE_DEVICES=2 \
-  /home/xiaohajiayou/.conda/envs/infer_lab/bin/python scripts/bench_compare_vllm.py\
-    --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+   python scripts/bench_compare_vllm.py\
+    --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --backend vllm \
     --num-seqs 256 \
     --min-input-len 100 \
