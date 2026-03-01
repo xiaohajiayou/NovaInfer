@@ -338,11 +338,27 @@ class LLMEngine:
             request_context.request.request_id: request_context.sampling_params
             for request_context in active_contexts
         }
-        sampled, sampled_req_ids = self._executor.execute_scheduler_step(
+        output_ids_t, sampled_t, token_idx_to_req_id = self._executor.execute_scheduler_step(
             SchedulerOutputs(scheduled_seqs=active_seqs, is_prefill=sched.is_prefill),
             sampling_params_by_req=sampling_params_by_req,
         )
         self._observe_runtime_kv_peak()
+        if output_ids_t is None or sampled_t is None:
+            return completions
+
+        output_ids_cpu = output_ids_t.to(DeviceType.CPU, 0) if output_ids_t.device_type() != DeviceType.CPU else output_ids_t
+        sampled_cpu = sampled_t.to(DeviceType.CPU, 0) if sampled_t.device_type() != DeviceType.CPU else sampled_t
+        output_ids = output_ids_cpu.tolist()
+        sampled = sampled_cpu.tolist()
+        if len(output_ids) != len(sampled):
+            raise RuntimeError("executor sampled/output mapping size mismatch")
+
+        sampled_req_ids: list[str] = []
+        for out_idx in output_ids:
+            rid = token_idx_to_req_id.get(int(out_idx))
+            if rid is None:
+                raise RuntimeError("executor output id cannot be mapped to request")
+            sampled_req_ids.append(rid)
 
         # Apply sampled tokens and finalize requests that hit stop/length.
         for req_id, token in zip(sampled_req_ids, sampled):

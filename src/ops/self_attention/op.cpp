@@ -98,10 +98,10 @@ void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
                           tensor_t v_cache,
-                          const std::vector<int32_t> &q_seq_rows,
-                          const std::vector<int32_t> &q_pos,
-                          const std::vector<int32_t> &block_tables,
-                          const std::vector<int32_t> &seq_lens,
+                          tensor_t q_seq_rows,
+                          tensor_t q_pos,
+                          tensor_t block_tables,
+                          tensor_t seq_lens,
                           int32_t block_table_width,
                           int32_t block_size,
                           float scale) {
@@ -120,19 +120,51 @@ void self_attention_paged(tensor_t attn_val,
            "SelfAttentionPaged: all tensors must be contiguous.");
     ASSERT(block_table_width > 0, "SelfAttentionPaged: block_table_width must be > 0.");
     ASSERT(block_size > 0, "SelfAttentionPaged: block_size must be > 0.");
-    ASSERT(q_seq_rows.size() == q->shape()[0], "SelfAttentionPaged: q_seq_rows size mismatch.");
-    ASSERT(q_pos.size() == q->shape()[0], "SelfAttentionPaged: q_pos size mismatch.");
-    ASSERT(!seq_lens.empty(), "SelfAttentionPaged: seq_lens must be non-empty.");
-    ASSERT(block_tables.size() == seq_lens.size() * static_cast<size_t>(block_table_width),
+    ASSERT(q_seq_rows != nullptr && q_pos != nullptr && block_tables != nullptr && seq_lens != nullptr,
+           "SelfAttentionPaged: metadata tensors must be non-null.");
+    ASSERT(q_seq_rows->deviceType() == LLAISYS_DEVICE_CPU && q_pos->deviceType() == LLAISYS_DEVICE_CPU &&
+               block_tables->deviceType() == LLAISYS_DEVICE_CPU && seq_lens->deviceType() == LLAISYS_DEVICE_CPU,
+           "SelfAttentionPaged: metadata tensors must be CPU.");
+    ASSERT(q_seq_rows->dtype() == LLAISYS_DTYPE_I32 && q_pos->dtype() == LLAISYS_DTYPE_I32 &&
+               block_tables->dtype() == LLAISYS_DTYPE_I32 && seq_lens->dtype() == LLAISYS_DTYPE_I32,
+           "SelfAttentionPaged: metadata dtype must be I32.");
+    ASSERT(q_seq_rows->ndim() == 1 && q_pos->ndim() == 1 && block_tables->ndim() == 1 && seq_lens->ndim() == 1,
+           "SelfAttentionPaged: metadata tensors must be 1-D.");
+    ASSERT(q_seq_rows->isContiguous() && q_pos->isContiguous() && block_tables->isContiguous() && seq_lens->isContiguous(),
+           "SelfAttentionPaged: metadata tensors must be contiguous.");
+    ASSERT(q_seq_rows->shape()[0] == q->shape()[0], "SelfAttentionPaged: q_seq_rows size mismatch.");
+    ASSERT(q_pos->shape()[0] == q->shape()[0], "SelfAttentionPaged: q_pos size mismatch.");
+    ASSERT(seq_lens->shape()[0] > 0, "SelfAttentionPaged: seq_lens must be non-empty.");
+    ASSERT(block_tables->shape()[0] == seq_lens->shape()[0] * static_cast<size_t>(block_table_width),
            "SelfAttentionPaged: block_tables size mismatch.");
     switch (attn_val->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::self_attention_paged(
-            attn_val, q, k_cache, v_cache, q_seq_rows, q_pos, block_tables, seq_lens, block_table_width, block_size, scale);
+            attn_val,
+            q,
+            k_cache,
+            v_cache,
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            block_table_width,
+            block_size,
+            scale);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return cuda::self_attention_paged(
-            attn_val, q, k_cache, v_cache, q_seq_rows, q_pos, block_tables, seq_lens, block_table_width, block_size, scale);
+            attn_val,
+            q,
+            k_cache,
+            v_cache,
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            block_table_width,
+            block_size,
+            scale);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

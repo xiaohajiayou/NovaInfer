@@ -6,10 +6,9 @@ from pathlib import Path
 from ..libllaisys import DeviceType
 from ..libllaisys.model import KvCacheLayout
 from .config import EngineConfig
+from .input_processor import InputProcessor
+from .model_runner import ModelRunner
 from .model_registry import ModelRegistry, create_default_registry
-from .types import BatchPlan
-
-
 class Worker:
     """Executes model forward for a batch plan."""
 
@@ -52,9 +51,14 @@ class Worker:
         self._kv_cache_auto_capacity = bool(cfg.kv_cache_auto_capacity)
         self._kv_cache_memory_utilization = float(cfg.kv_cache_memory_utilization)
         self._model_registry = model_registry if model_registry is not None else create_default_registry()
-        self._model_runner = model_runner if model_runner is not None else self._create_model_runner()
+        runner_obj = model_runner if model_runner is not None else self._create_model_wrapper()
+        if hasattr(runner_obj, "execute_model") and hasattr(runner_obj, "sample_tokens"):
+            self._model_runner = runner_obj
+        else:
+            self._model_runner = ModelRunner(runner_obj, self._device, kv_cache_layout=self._kv_cache_layout)
+        self._input_processor = InputProcessor(self._model_path)
 
-    def _create_model_runner(self):
+    def _create_model_wrapper(self):
         if self._model_path is None:
             raise ValueError("model_path is required when model_runner is not provided")
         return self._model_registry.create(
@@ -86,13 +90,13 @@ class Worker:
     def max_seq_len(self) -> int:
         if hasattr(self._model_runner, "max_seq_len"):
             return int(self._model_runner.max_seq_len)
-        return int(self._model_runner._meta_info.maxseq)
+        return int(self._model_runner.model._meta_info.maxseq)
 
     @property
     def end_token_id(self) -> int:
         if hasattr(self._model_runner, "end_token_id"):
             return int(self._model_runner.end_token_id)
-        return int(self._model_runner._meta_info.end_token)
+        return int(self._model_runner.model._meta_info.end_token)
 
     @property
     def kv_cache_capacity_tokens(self) -> int | None:
@@ -103,75 +107,43 @@ class Worker:
                 return self._kv_cache_capacity_tokens
         return self._kv_cache_capacity_tokens
 
-    def execute(self, plan: BatchPlan):
-        def _normalize(result):
-            output_ids, second = result
-            if not second:
-                return output_ids, []
-            first = second[0]
-            if isinstance(first, (int, bool)):
-                return output_ids, [int(x) for x in second]
-            # Legacy runners may still return logits rows; map to greedy token ids.
-            sampled = []
-            for row in second:
-                best_idx = max(range(len(row)), key=lambda idx: row[idx])
-                sampled.append(int(best_idx))
-            return output_ids, sampled
+    def execute_model(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
+        return self._model_runner.execute_model(
+            scheduler_outputs,
+            sampling_params=sampling_params,
+            sampling_params_by_req=sampling_params_by_req,
+        )
 
-        try:
-            return _normalize(self._model_runner.decode_batch(
-                token_ids=plan.token_ids,
-                pos_ids=plan.pos_ids,
-                seq_ids=plan.seq_ids,
-                logits_mask=plan.logits_mask,
-                temperatures=plan.temperatures,
-                top_ps=plan.top_ps,
-                top_ks=plan.top_ks,
-                seeds=plan.seeds,
-                has_seeds=plan.has_seeds,
-                slot_mapping=plan.slot_mapping,
-                context_lens=plan.context_lens,
-                batch_seq_ids=plan.batch_seq_ids,
-                block_tables=plan.block_tables,
-                block_table_width=plan.block_table_width,
-            ))
-        except TypeError:
-            # Backward-compatible fallback for dummy/stub runners in tests.
-            return _normalize(self._model_runner.decode_batch(
-                token_ids=plan.token_ids,
-                pos_ids=plan.pos_ids,
-                seq_ids=plan.seq_ids,
-                logits_mask=plan.logits_mask,
-            ))
+    def sample_tokens(self, output_ids, logits_handle, plan):
+        return self._model_runner.sample_tokens(output_ids, logits_handle, plan)
+
+    def execute(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
+        return self._model_runner.execute_step(
+            scheduler_outputs,
+            sampling_params=sampling_params,
+            sampling_params_by_req=sampling_params_by_req,
+        )
 
     def free_request(self, seq_id: int) -> None:
-        # Capability probing to avoid coupling engine lifecycle to one runner API.
-        for fn_name in ("request_free", "free_request", "kv_request_free"):
-            fn = getattr(self._model_runner, fn_name, None)
-            if callable(fn):
-                try:
-                    fn(int(seq_id))
-                except Exception:
-                    pass
-                return
-
-    def decode_tokens(self, token_ids: list[int]) -> str | None:
-        if hasattr(self._model_runner, "decode_tokens"):
+        fn = getattr(self._model_runner, "request_free", None)
+        if callable(fn):
             try:
-                return self._model_runner.decode_tokens(token_ids)
-            except Exception:
-                return None
-        return None
-
-    def encode_chat_messages(self, messages: list[dict]) -> list[int]:
-        if hasattr(self._model_runner, "encode_chat_messages"):
-            try:
-                return [int(t) for t in self._model_runner.encode_chat_messages(messages)]
+                fn(int(seq_id))
             except Exception:
                 pass
-        # Fallback for dummy runners in tests.
-        text = "\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
-        return [int(b) for b in text.encode("utf-8")]
+
+    def decode_tokens(self, token_ids: list[int]) -> str | None:
+        try:
+            return self._input_processor.decode_tokens(token_ids)
+        except Exception:
+            return None
+
+    def encode_chat_messages(self, messages: list[dict]) -> list[int]:
+        try:
+            return [int(t) for t in self._input_processor.encode_chat_messages(messages)]
+        except Exception:
+            text = "\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
+            return [int(b) for b in text.encode("utf-8")]
 
     def get_default_sampling_params(self) -> dict:
         # vLLM-like neutral defaults. Note: for OpenAI chat, max_tokens default

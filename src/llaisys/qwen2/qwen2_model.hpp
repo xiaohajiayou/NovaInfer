@@ -34,62 +34,63 @@
 #include <utility>
 #include <vector>
 
+struct ModelForwardInput;
+struct ModelForwardOutput;
+struct AttentionMetadata;
+
 namespace llaisys::models::qwen2 {
 
 class Qwen2Model {
 public:
-    struct KvStatsSnapshot {
-        int64_t capacity_tokens{0};
-        int64_t used_tokens{0};
-        int64_t free_tokens{0};
-        int64_t peak_used_tokens{0};
-    };
-
     Qwen2Model(const LlaisysQwen2Meta &meta,
                llaisysDeviceType_t device,
                int *device_ids,
-               int ndevice,
-               runtime::kv_cache::KvCacheLayout kv_layout,
-               size_t kv_block_size,
-               size_t kv_cache_capacity_tokens);
+               int ndevice);
     ~Qwen2Model();
+
+    int configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
+                          size_t kv_block_size,
+                          size_t kv_cache_capacity_tokens,
+                          int64_t max_model_len);
 
     LlaisysQwen2Weights *weights() noexcept { return &weights_; }
     size_t nlayer() const noexcept { return meta_.nlayer; }
-    int32_t decode(const LlaisysBatch &batch);
-    float *logits() noexcept;
-    float *logits_ith(int32_t i) noexcept;
-    int32_t n_outputs() const noexcept;
-    const int32_t *output_ids() const noexcept;
-    const int32_t *sampled_ids() const noexcept;
-
-    // KV management APIs exposed through C wrapper:
-    // - SLOT layout: kv_seq_* are fully implemented.
-    // - BLOCK layout: kv_seq_* are compatibility APIs and may return INTERNAL_ERROR
-    //   if the underlying KV implementation does not support that operation.
-    runtime::kv_cache::KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
-    runtime::kv_cache::KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1);
-    runtime::kv_cache::KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
-    runtime::kv_cache::KvStatus kv_seq_keep(int64_t seq_id);
-    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept;
-    runtime::kv_cache::KvStatus request_free(int64_t seq_id);
-    runtime::kv_cache::KvStatus kv_reset_prefix_cache();
-    bool kv_stats(KvStatsSnapshot *out) const noexcept;
+    size_t vocab_size() const noexcept { return meta_.voc; }
+    int32_t forward(const ::ModelForwardInput &input, ::ModelForwardOutput *output);
+    tensor_t step_logits() const noexcept { return step_logits_; }
+    runtime::kv_cache::KvCacheBase *kv_cache() noexcept { return runtime_.kv_cache.get(); }
+    const runtime::kv_cache::KvCacheBase *kv_cache() const noexcept { return runtime_.kv_cache.get(); }
+    runtime::kv_cache::KvCacheLayout kv_layout() const noexcept { return runtime_.kv_layout; }
+    size_t kv_cache_capacity_tokens() const noexcept { return runtime_.kv_cache_capacity_tokens; }
+    int64_t kv_peak_used_tokens() const noexcept { return runtime_.kv_peak_used_tokens; }
+    void set_kv_peak_used_tokens(int64_t value) noexcept { runtime_.kv_peak_used_tokens = value; }
+    size_t nkvh() const noexcept { return meta_.nkvh; }
+    size_t dh() const noexcept { return meta_.dh; }
+    llaisysDataType_t dtype() const noexcept { return meta_.dtype; }
+    tensor_t kv_layer_k(size_t layer) const;
+    tensor_t kv_layer_v(size_t layer) const;
 
 private:
+    struct RuntimeState {
+        runtime::kv_cache::KvCacheLayout kv_layout{runtime::kv_cache::KvCacheLayout::BLOCK};
+        size_t kv_block_size{16};
+        size_t max_model_len{0};
+        size_t kv_cache_capacity_tokens{0};
+        std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache{};
+        std::unique_ptr<runtime::output::OutputBuffer> output{};
+        mutable int64_t kv_peak_used_tokens{0};
+    };
+
     LlaisysQwen2Meta meta_{};
     llaisysDeviceType_t device_type_{LLAISYS_DEVICE_CPU};
     int device_id_{0};
-    runtime::kv_cache::KvCacheLayout kv_layout_{runtime::kv_cache::KvCacheLayout::BLOCK};
-    size_t kv_block_size_{16};
-    size_t kv_cache_capacity_tokens_{0};
 
     LlaisysQwen2Weights weights_{};
     bool validated_{false};
 
-    std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache_{};
-    std::unique_ptr<runtime::output::OutputBuffer> output_{};
+    RuntimeState runtime_{};
     runtime::workspace::qwen2_workspace_t workspace_{};
+    tensor_t step_logits_{};
 
     // Zero biases used when the source weights do not provide a bias tensor.
     tensor_t zero_bias_attn_o_{};
@@ -101,23 +102,24 @@ private:
     tensor_t zero_bias_mlp_down_{};
     tensor_t zero_bias_logits_{};
 #ifdef ENABLE_NVIDIA_API
-    // Step-level attention metadata uploaded once and reused by all layers.
-    ops::cuda::CommonAttentionMetadata common_attn_metadata_{};
-    // Persistent seq-id -> row mapping cache for BLOCK layout metadata.
-    std::unordered_map<int64_t, int32_t> block_seq_row_cache_{};
-    std::vector<int64_t> block_seq_row_ids_{};
-    int32_t block_seq_row_width_{0};
     // Switch point for staged FlashInfer migration (NATIVE by default).
     ops::cuda::PagedAttentionBackend paged_attn_backend_{ops::cuda::PagedAttentionBackend::NATIVE};
 #endif
-    // Reused device-local int32 buffer for slot mapping / selected row indices.
-    // Kept outside CUDA macro so CPU-only builds can still compile upload_slot_indices_.
-    tensor_t slot_idxs_i32_{};
-
-    bool validate_decode_batch_(const LlaisysBatch &batch) const;
+    struct AttentionExecState {
+        bool paged_attention{false};
+        int32_t block_table_width{0};
+        tensor_t attn_mask{};
+        tensor_t q_seq_rows{};
+        tensor_t q_pos{};
+        tensor_t slot_mapping{};
+        tensor_t seq_lens{};
+        tensor_t block_tables{};
+        std::vector<int32_t> slot_idxs{};
+        std::vector<int32_t> used_slots{};
+    };
 
     void init_weight_slots_();
-    void init_kv_cache_();
+    void init_runtime_state_();
     void validate_or_die_();
     void ensure_workspace_(size_t ntoken);
 
@@ -129,27 +131,22 @@ private:
                                const std::vector<int64_t> &pos_values,
                                tensor_t *hidden,
                                tensor_t *pos_ids);
-    tensor_t upload_slot_indices_(const std::vector<int32_t> &slot_idxs);
-    void refresh_block_seq_row_cache_(const LlaisysBatch &batch);
+    int32_t prepare_slot_attention_state_(size_t ntoken,
+                                          const tensor_t &seq_ids_t,
+                                          const tensor_t &pos_ids_host_t,
+                                          AttentionExecState *state);
+    int32_t validate_and_bind_block_attention_state_(const ::AttentionMetadata &attn,
+                                                     size_t ntoken,
+                                                     AttentionExecState *state);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
+    tensor_t run_attention_layer_(size_t layer,
+                                  size_t ntoken,
+                                  const tensor_t &attn_normed,
+                                  const tensor_t &pos_ids,
+                                  const AttentionExecState &attn_state);
 
     tensor_t create_zero_tensor_(const std::vector<size_t> &shape, llaisysDataType_t dtype) const;
-    void run_layers_and_collect_(const LlaisysBatch &batch,
-                                 size_t ntoken,
-                                 tensor_t hidden,
-                                 tensor_t pos_ids,
-                                 const std::vector<int32_t> &slot_idxs,
-                                 const std::vector<int32_t> &used_slots,
-                                 tensor_t attn_mask,
-                                 const std::vector<int32_t> &q_seq_rows,
-                                 const std::vector<int32_t> &q_pos,
-                                 const std::vector<int32_t> &block_tables,
-                                 const std::vector<int32_t> &seq_lens,
-                                 int32_t block_table_width,
-                                 bool paged_attention);
-    int32_t decode_slot_path_(const LlaisysBatch &batch);
-    int32_t decode_block_path_(const LlaisysBatch &batch);
 
     void check_meta_invariants_() const;
     void check_tensor_(const llaisysTensor_t handle,
@@ -159,7 +156,6 @@ private:
     tensor_t bias_or_zero_(llaisysTensor_t handle, const tensor_t &zero_bias) const;
 
     void destroy_weights_();
-    mutable int64_t kv_peak_used_tokens_{0};
 };
 
 } // namespace llaisys::models::qwen2

@@ -3,10 +3,11 @@ from __future__ import annotations
 import queue
 import time
 
-import numpy as np
+import pytest
 
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import SamplingParams
+from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.openai_server import (
     OpenAIServer,
@@ -14,42 +15,31 @@ from llaisys.server.openai_server import (
     _ThinkingReasoningParser,
 )
 from llaisys.server.schemas import ChatCompletionRequest, ChatMessage
+from test.utils.dummy_model_runner import DummyModelRunner
 
 
-class DummyRunner:
-    def __init__(self):
-        self.max_seq_len = 64
-        self.end_token_id = 4
-
-    def decode_batch(self, token_ids, pos_ids=None, seq_ids=None, logits_mask=None):
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if int(logits_mask[i]) == 0:
-                continue
-            out_ids.append(i)
-            row = np.zeros((8,), dtype=np.float32)
-            nxt = (int(tok) + 1) % 8
-            row[nxt] = 1.0
-            rows.append(row)
-        return out_ids, rows
-
-    def decode_tokens(self, token_ids):
-        return "".join(chr(ord("a") + int(t)) for t in token_ids)
+class DummyRunner(DummyModelRunner):
+    pass
 
 
 def _make_server() -> OpenAIServer:
-    engine = LLMEngine(model_runner=DummyRunner())
+    engine = LLMEngine(
+        model_runner=DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    )
     async_engine = AsyncLLMEngine(engine=engine)
     return OpenAIServer(async_engine)
 
 
-def test_online_chat_completion_non_stream():
-    server = _make_server()
+@pytest.fixture
+def server() -> OpenAIServer:
+    s = _make_server()
+    try:
+        yield s
+    finally:
+        s._async_engine.close()
+
+
+def test_online_chat_completion_non_stream(server: OpenAIServer):
     req = ChatCompletionRequest(
         model="qwen2",
         messages=[ChatMessage(role="user", content="hello")],
@@ -66,8 +56,7 @@ def test_online_chat_completion_non_stream():
     assert resp["status"].startswith("finished_")
 
 
-def test_online_chat_completion_stream():
-    server = _make_server()
+def test_online_chat_completion_stream(server: OpenAIServer):
     req = ChatCompletionRequest(
         model="qwen2",
         messages=[ChatMessage(role="user", content="hello")],
@@ -83,8 +72,7 @@ def test_online_chat_completion_stream():
     assert chunks[-1]["choices"][0]["finish_reason"] is not None
 
 
-def test_online_chat_completion_stream_token_ids_match_non_stream():
-    server = _make_server()
+def test_online_chat_completion_stream_token_ids_match_non_stream(server: OpenAIServer):
     req = ChatCompletionRequest(
         model="qwen2",
         messages=[ChatMessage(role="user", content="hello")],
@@ -115,8 +103,7 @@ def test_online_chat_completion_stream_token_ids_match_non_stream():
     assert stream_ids == expected
 
 
-def test_async_stream_late_subscribe_replays_prefix_and_tail():
-    server = _make_server()
+def test_async_stream_late_subscribe_replays_prefix_and_tail(server: OpenAIServer):
     params = SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0)
     prompt = [1, 2]
     req_id = server._async_engine.submit(inputs=prompt, sampling_params=params)
@@ -154,8 +141,7 @@ def test_async_stream_late_subscribe_replays_prefix_and_tail():
     assert seen_ids == expected
 
 
-def test_online_cancel_request():
-    server = _make_server()
+def test_online_cancel_request(server: OpenAIServer):
     params = SamplingParams(max_new_tokens=32, top_k=1, top_p=1.0, temperature=1.0)
     req_id = server._async_engine.submit(inputs=[1, 2, 3], sampling_params=params)
     assert server.cancel(req_id) is True
@@ -164,8 +150,7 @@ def test_online_cancel_request():
     assert out.status.value.startswith("finished_")
 
 
-def test_online_concurrent_requests():
-    server = _make_server()
+def test_online_concurrent_requests(server: OpenAIServer):
     params = SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0)
     req_id_a = server._async_engine.submit(inputs=[1, 2], sampling_params=params)
     req_id_b = server._async_engine.submit(inputs=[2, 3], sampling_params=params)

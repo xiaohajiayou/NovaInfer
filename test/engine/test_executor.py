@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import llaisys
+
 from llaisys.engine.executor import Executor
 from llaisys.engine.scheduler import SchedulerOutputs
 from llaisys.engine.sequence import Sequence
@@ -7,23 +9,33 @@ from llaisys.engine.types import SamplingParams
 
 
 class DummyWorker:
-    def execute(self, plan):
-        _ = plan
+    def execute(self, outputs, sampling_params=None, sampling_params_by_req=None):
+        _ = outputs
+        _ = sampling_params
+        _ = sampling_params_by_req
         # Return out order intentionally swapped to validate req-id mapping.
-        output_ids = [1, 0]
-        sampled_ids = [22, 11]
-        return output_ids, sampled_ids
+        output_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        output_ids.copy_from_sequence([1, 0])
+        sampled_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        sampled_ids.copy_from_sequence([22, 11])
+        return output_ids, sampled_ids, {1: "req-2", 0: "req-1"}
 
 
 class CaptureWorker:
     def __init__(self):
-        self.last_plan = None
+        self.last_outputs = None
+        self.last_sampling_params = None
+        self.last_sampling_params_by_req = None
 
-    def execute(self, plan):
-        self.last_plan = plan
-        output_ids = [1]
-        sampled_ids = [7]
-        return output_ids, sampled_ids
+    def execute(self, outputs, sampling_params=None, sampling_params_by_req=None):
+        self.last_outputs = outputs
+        self.last_sampling_params = sampling_params
+        self.last_sampling_params_by_req = sampling_params_by_req
+        output_ids = llaisys.Tensor((1,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        output_ids.copy_from_sequence([1])
+        sampled_ids = llaisys.Tensor((1,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        sampled_ids.copy_from_sequence([7])
+        return output_ids, sampled_ids, {1: "req-1"}
 
 
 def test_executor_uses_per_request_sampling_params_in_output_order():
@@ -46,7 +58,7 @@ def test_executor_uses_per_request_sampling_params_in_output_order():
     )
     outputs = SchedulerOutputs(scheduled_seqs=[seq1, seq2], is_prefill=False)
 
-    sampled, req_ids = ex.execute_scheduler_step(
+    output_ids_t, sampled_t, req_map = ex.execute_scheduler_step(
         outputs,
         sampling_params_by_req={
             "req-1": SamplingParams(top_k=11),
@@ -54,8 +66,9 @@ def test_executor_uses_per_request_sampling_params_in_output_order():
         },
     )
 
-    assert req_ids == ["req-2", "req-1"]
-    assert sampled == [22, 11]
+    assert output_ids_t.tolist() == [1, 0]
+    assert sampled_t.tolist() == [22, 11]
+    assert req_map == {1: "req-2", 0: "req-1"}
 
 
 def test_executor_prefill_flattens_only_uncached_suffix():
@@ -71,16 +84,14 @@ def test_executor_prefill_flattens_only_uncached_suffix():
     seq.num_cached_tokens = 2
     outputs = SchedulerOutputs(scheduled_seqs=[seq], is_prefill=True)
 
-    sampled, req_ids = ex.execute_scheduler_step(
+    output_ids_t, sampled_t, req_map = ex.execute_scheduler_step(
         outputs,
         sampling_params_by_req={"req-1": SamplingParams(top_k=7)},
     )
-    assert req_ids == ["req-1"]
-    assert sampled == [7]
-    assert worker.last_plan is not None
-    assert worker.last_plan.token_ids == [12, 13]
-    assert worker.last_plan.pos_ids == [2, 3]
-    assert worker.last_plan.logits_mask == [0, 1]
-    assert worker.last_plan.temperatures == [1.0, 1.0]
-    assert worker.last_plan.top_ps == [1.0, 1.0]
-    assert worker.last_plan.top_ks == [7, 7]
+    assert output_ids_t.tolist() == [1]
+    assert sampled_t.tolist() == [7]
+    assert req_map == {1: "req-1"}
+    assert worker.last_outputs is outputs
+    assert worker.last_sampling_params is None
+    assert worker.last_sampling_params_by_req is not None
+    assert int(worker.last_sampling_params_by_req["req-1"].top_k) == 7

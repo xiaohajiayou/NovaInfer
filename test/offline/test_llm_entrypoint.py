@@ -1,42 +1,27 @@
-
-import numpy as np
 import pytest
 
 from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
 from llaisys.entrypoints.llm import LLM
+from llaisys.libllaisys.model import KvCacheLayout
+from test.utils.dummy_model_runner import DummyModelRunner
 
 
 
-class DummyRunner:
-    def __init__(self):
-        self.max_seq_len = 32
-        self.end_token_id = 5
-
-    def decode_batch(self, token_ids, pos_ids=None, seq_ids=None, logits_mask=None):
-        _ = (pos_ids, seq_ids)
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if int(logits_mask[i]) == 0:
-                continue
-            out_ids.append(i)
-            row = np.zeros((16,), dtype=np.float32)
-            row[(int(tok) + 1) % 16] = 1.0
-            rows.append(row)
-        return out_ids, rows
-
-    def decode_tokens(self, token_ids):
-        return "".join(chr(ord("a") + int(t)) for t in token_ids)
+class DummyRunner(DummyModelRunner):
+    pass
 
 
 def _build_llm() -> LLM:
     registry = ModelRegistry(_factories={})
-    registry.register("dummy", lambda model_path, device: DummyRunner())
+    registry.register(
+        "dummy",
+        lambda model_path, device: DummyRunner(
+            max_seq_len=32,
+            end_token_id=5,
+            kv_cache_layout=KvCacheLayout.BLOCK,
+        ),
+    )
     llm = LLM(
         model="/tmp/unused",
         model_type="dummy",
@@ -72,7 +57,7 @@ def test_llm_generate_single_prompt_output_shape():
     assert row["finish_reason"] == "eos_token"
     assert row["status"] == "finished_stopped"
     assert row["token_ids"] == [3, 4, 5]
-    assert row["text"] == "def"
+    assert row["text"] is None
     assert row["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
 
 

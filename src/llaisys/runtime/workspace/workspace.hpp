@@ -40,6 +40,10 @@ struct Qwen2WorkspaceView {
     tensor_t down;
     // [ntoken, voc]
     tensor_t logits;
+    // [ntoken] i64 argmax index scratch for sampling/logit gather.
+    tensor_t argmax_idx;
+    // [ntoken] compute-dtype argmax value scratch.
+    tensor_t argmax_val;
     // [ntoken] i64 token ids for embedding input.
     tensor_t input_ids;
     // [ntoken] i64 logical positions.
@@ -116,6 +120,8 @@ private:
         size_t down;
         // Offset of logits buffer in main arena.
         size_t logits;
+        // Offset of argmax_val buffer in main arena.
+        size_t argmax_val;
         // Offset of k_ctx buffer in main arena.
         size_t k_ctx;
         // Offset of v_ctx buffer in main arena.

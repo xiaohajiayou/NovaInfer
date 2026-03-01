@@ -2,42 +2,22 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
-
 from llaisys.engine.llm_engine import LLMEngine
+from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.openai_server import OpenAIServer
 from llaisys.server.schemas import ChatCompletionRequest, ChatMessage
+from test.utils.dummy_model_runner import DummyModelRunner
 
 
-class DummyRunner:
-    def __init__(self):
-        self.max_seq_len = 64
-        self.end_token_id = 7
-
-    def decode_batch(self, token_ids, pos_ids=None, seq_ids=None, logits_mask=None):
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if int(logits_mask[i]) == 0:
-                continue
-            out_ids.append(i)
-            row = np.zeros((16,), dtype=np.float32)
-            nxt = (int(tok) + 1) % 16
-            row[nxt] = 1.0
-            rows.append(row)
-        return out_ids, rows
-
-    def decode_tokens(self, token_ids):
-        return "".join(chr(ord("a") + (int(t) % 26)) for t in token_ids)
+class DummyRunner(DummyModelRunner):
+    pass
 
 
 def _make_server() -> OpenAIServer:
-    engine = LLMEngine(model_runner=DummyRunner())
+    engine = LLMEngine(
+        model_runner=DummyRunner(max_seq_len=64, end_token_id=7, kv_cache_layout=KvCacheLayout.BLOCK)
+    )
     async_engine = AsyncLLMEngine(engine=engine)
     return OpenAIServer(async_engine)
 
@@ -57,22 +37,24 @@ def _run_stream(server: OpenAIServer, content: str) -> list[dict]:
 
 def test_online_stream_request_isolation():
     server = _make_server()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(_run_stream, server, "hello-a")
+            fut_b = pool.submit(_run_stream, server, "hello-b")
+            chunks_a = fut_a.result(timeout=5.0)
+            chunks_b = fut_b.result(timeout=5.0)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_a = pool.submit(_run_stream, server, "hello-a")
-        fut_b = pool.submit(_run_stream, server, "hello-b")
-        chunks_a = fut_a.result(timeout=5.0)
-        chunks_b = fut_b.result(timeout=5.0)
+        assert chunks_a and chunks_b
 
-    assert chunks_a and chunks_b
+        req_ids_a = {c["request_id"] for c in chunks_a if "request_id" in c}
+        req_ids_b = {c["request_id"] for c in chunks_b if "request_id" in c}
+        assert len(req_ids_a) == 1
+        assert len(req_ids_b) == 1
+        assert req_ids_a != req_ids_b
 
-    req_ids_a = {c["request_id"] for c in chunks_a if "request_id" in c}
-    req_ids_b = {c["request_id"] for c in chunks_b if "request_id" in c}
-    assert len(req_ids_a) == 1
-    assert len(req_ids_b) == 1
-    assert req_ids_a != req_ids_b
-
-    assert chunks_a[-1]["is_finished"] is True
-    assert chunks_b[-1]["is_finished"] is True
-    assert chunks_a[-1]["choices"][0]["finish_reason"] is not None
-    assert chunks_b[-1]["choices"][0]["finish_reason"] is not None
+        assert chunks_a[-1]["is_finished"] is True
+        assert chunks_b[-1]["is_finished"] is True
+        assert chunks_a[-1]["choices"][0]["finish_reason"] is not None
+        assert chunks_b[-1]["choices"][0]["finish_reason"] is not None
+    finally:
+        server._async_engine.close()

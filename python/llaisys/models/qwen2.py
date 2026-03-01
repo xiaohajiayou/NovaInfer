@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import json
 import os
 import re
-import threading
 import ctypes
 from ctypes.util import find_library
 
@@ -15,10 +14,17 @@ import numpy as np
 import safetensors
 import torch
 
-from ctypes import POINTER, byref, cast, c_float, c_int, c_int8, c_int32, c_int64, c_void_p
+from ctypes import POINTER, byref, cast, c_int, c_int32, c_void_p
 
 from ..libllaisys import LIB_LLAISYS, DeviceType, DataType
-from ..libllaisys.model import KvCacheLayout, LlaisysBatch, LlaisysKvStats, LlaisysModelCreateParams, ModelType
+from ..libllaisys.model import (
+    KvCacheLayout,
+    LlaisysModelCreateParams,
+    LlaisysRuntimeCreateParams,
+    ModelForwardInput,
+    ModelForwardOutput,
+    ModelType,
+)
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
 from ..tensor import Tensor
 
@@ -336,8 +342,8 @@ class Qwen2:
         self._model_path = Path(model_path)
         self._device = device
         self._kv_cache_layout = kv_cache_layout
-        if self._device == DeviceType.NVIDIA and self._kv_cache_layout == KvCacheLayout.SLOT:
-            raise ValueError("SLOT layout is not supported on NVIDIA yet; use KvCacheLayout.BLOCK")
+        self._model = None
+        self._runtime = None
         self._available_memory_bytes = int(_available_memory_bytes(device))
         if self._available_memory_bytes <= 0:
             raise RuntimeError(
@@ -419,28 +425,37 @@ class Qwen2:
             )
 
         dev_ids, ndev = _device_ids(0)
+        runtime_params = LlaisysRuntimeCreateParams(
+            int(kv_cache_layout),
+            int(kv_cache_block_size),
+            int(self._max_model_len),
+            int(self._kv_cache_capacity_tokens),
+        )
+        self._runtime = LIB_LLAISYS.llaisysRuntimeCreate(byref(runtime_params))
+        if not self._runtime:
+            raise RuntimeError("Failed to create runtime state")
+
         create_params = LlaisysModelCreateParams(
             int(ModelType.QWEN2),
             cast(byref(self._meta_struct), c_void_p),
             device,
             dev_ids,
             ndev,
-            int(kv_cache_layout),
-            int(kv_cache_block_size),
-            int(self._max_model_len),
-            int(self._kv_cache_capacity_tokens),
         )
-        self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params))
+        self._model = LIB_LLAISYS.llaisysModelCreate(byref(create_params), self._runtime)
         if not self._model:
+            LIB_LLAISYS.llaisysRuntimeDestroy(self._runtime)
+            self._runtime = None
             raise RuntimeError("Failed to create Qwen2 model instance")
         weights_ptr = cast(LIB_LLAISYS.llaisysModelWeights(self._model), POINTER(LlaisysQwen2Weights))
         if not weights_ptr:
+            LIB_LLAISYS.llaisysModelDestroy(self._model)
+            LIB_LLAISYS.llaisysRuntimeDestroy(self._runtime)
+            self._model = None
+            self._runtime = None
             raise RuntimeError("Failed to acquire Qwen2 weight slots")
 
         self._np_dtype = _datatype_to_numpy_dtype(meta.dtype)
-        self._offline_engine = None
-        self._tokenizer = None
-        self._tokenizer_lock = threading.Lock()
         self._closed = False
 
         self._load_safetensors()
@@ -451,15 +466,20 @@ class Qwen2:
         self._closed = True
 
         model = getattr(self, "_model", None)
+        runtime = getattr(self, "_runtime", None)
         self._model = None
+        self._runtime = None
         if model:
             LIB_LLAISYS.llaisysModelDestroy(model)
+        if runtime:
+            LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
 
     def __del__(self):
         # Avoid native destroy in __del__. Finalizer timing during GC can race with
         # other Python/C++ objects and cause hard crashes. Use explicit close() chain.
         try:
             self._model = None
+            self._runtime = None
             self._closed = True
         except Exception:
             pass
@@ -549,248 +569,15 @@ class Qwen2:
     def end_token_id(self) -> int:
         return int(self._meta_info.end_token)
 
-    def _get_tokenizer(self):
-        if self._tokenizer is not None:
-            return self._tokenizer
+    @property
+    def kv_cache_layout(self) -> KvCacheLayout:
+        return self._kv_cache_layout
 
-        # Tokenizer lazy init must be thread-safe: online multi-session can call
-        # encode/decode from multiple request threads at once.
-        with self._tokenizer_lock:
-            if self._tokenizer is None:
-                try:
-                    from transformers import AutoTokenizer  # type: ignore
-                except Exception:
-                    from transformers.models.auto.tokenization_auto import AutoTokenizer  # type: ignore
-                self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
-        return self._tokenizer
+    @property
+    def runtime_handle(self):
+        return self._runtime
 
-    def decode_tokens(self, token_ids: Sequence[int]) -> str:
-        tokenizer = self._get_tokenizer()
-        return tokenizer.decode(
-            list(token_ids),
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
-
-    def encode_chat_messages(self, messages: Sequence[dict]) -> list[int]:
-        tokenizer = self._get_tokenizer()
-        text = tokenizer.apply_chat_template(
-            conversation=[{"role": str(m.get("role", "user")), "content": str(m.get("content", ""))} for m in messages],
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        # apply_chat_template() already materializes model-specific control tokens
-        # into text form; avoid duplicating BOS/EOS by re-adding special tokens.
-        return [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
-
-    def decode_batch(
-        self,
-        token_ids: Sequence[int],
-        pos_ids: Optional[Sequence[int]] = None,
-        seq_ids: Optional[Sequence[int]] = None,
-        logits_mask: Optional[Sequence[int]] = None,
-        temperatures: Optional[Sequence[float]] = None,
-        top_ps: Optional[Sequence[float]] = None,
-        top_ks: Optional[Sequence[int]] = None,
-        seeds: Optional[Sequence[int]] = None,
-        has_seeds: Optional[Sequence[int]] = None,
-        slot_mapping: Optional[Sequence[int]] = None,
-        context_lens: Optional[Sequence[int]] = None,
-        batch_seq_ids: Optional[Sequence[int]] = None,
-        block_tables: Optional[Sequence[int]] = None,
-        block_table_width: int = 0,
-    ):
-        if not token_ids:
-            raise ValueError("token_ids must be non-empty")
-        n_tokens = len(token_ids)
-        is_block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-
-        token_buf = (c_int64 * n_tokens)(*[int(t) for t in token_ids])
-        pos_buf = None
-        if pos_ids is not None:
-            if len(pos_ids) != n_tokens:
-                raise ValueError("pos_ids length mismatch")
-            pos_buf = (c_int64 * n_tokens)(*[int(p) for p in pos_ids])
-
-        if logits_mask is None:
-            logits_mask = [0] * n_tokens
-            logits_mask[-1] = 1
-        if len(logits_mask) != n_tokens:
-            raise ValueError("logits_mask length mismatch")
-        logits_buf = (c_int8 * n_tokens)(*[int(x) for x in logits_mask])
-        temperatures_buf = None
-        if temperatures is not None:
-            if len(temperatures) != n_tokens:
-                raise ValueError("temperatures length mismatch")
-            temperatures_buf = (c_float * n_tokens)(*[float(x) for x in temperatures])
-        top_ps_buf = None
-        if top_ps is not None:
-            if len(top_ps) != n_tokens:
-                raise ValueError("top_ps length mismatch")
-            top_ps_buf = (c_float * n_tokens)(*[float(x) for x in top_ps])
-        top_ks_buf = None
-        if top_ks is not None:
-            if len(top_ks) != n_tokens:
-                raise ValueError("top_ks length mismatch")
-            top_ks_buf = (c_int32 * n_tokens)(*[int(x) for x in top_ks])
-        seeds_buf = None
-        if seeds is not None:
-            if len(seeds) != n_tokens:
-                raise ValueError("seeds length mismatch")
-            seeds_buf = (c_int64 * n_tokens)(*[int(x) for x in seeds])
-        has_seeds_buf = None
-        if has_seeds is not None:
-            if len(has_seeds) != n_tokens:
-                raise ValueError("has_seeds length mismatch")
-            has_seeds_buf = (c_int8 * n_tokens)(*[int(x) for x in has_seeds])
-
-        n_seq_buf = None
-        seq_ptr_buf = None
-        seq_rows = None
-        if seq_ids is not None:
-            if len(seq_ids) != n_tokens:
-                raise ValueError("seq_ids length mismatch")
-            if is_block_layout:
-                for sid in seq_ids:
-                    if isinstance(sid, (list, tuple)):
-                        raise ValueError("BLOCK layout requires one seq_id per token")
-            n_seq_buf = (c_int32 * n_tokens)()
-            seq_ptr_buf = (POINTER(c_int64) * n_tokens)()
-            seq_rows = []
-            for i, sid in enumerate(seq_ids):
-                row = (c_int64 * 1)(int(sid))
-                seq_rows.append(row)
-                n_seq_buf[i] = 1
-                seq_ptr_buf[i] = row
-
-        slot_mapping_buf = None
-        if slot_mapping is not None:
-            if len(slot_mapping) != n_tokens:
-                raise ValueError("slot_mapping length mismatch")
-            slot_mapping_buf = (c_int32 * n_tokens)(*[int(x) for x in slot_mapping])
-
-        context_lens_buf = None
-        batch_seq_ids_buf = None
-        block_tables_buf = None
-        n_batch_seq = 0
-        bt_width = int(block_table_width)
-        if context_lens is not None or batch_seq_ids is not None or block_tables is not None:
-            if context_lens is None or batch_seq_ids is None or block_tables is None:
-                raise ValueError("context_lens/batch_seq_ids/block_tables must be provided together")
-            n_batch_seq = len(batch_seq_ids)
-            if len(context_lens) != n_batch_seq:
-                raise ValueError("context_lens length mismatch")
-            if bt_width <= 0:
-                raise ValueError("block_table_width must be > 0 when block_tables is provided")
-            if len(block_tables) != n_batch_seq * bt_width:
-                raise ValueError("block_tables length mismatch")
-            context_lens_buf = (c_int32 * n_batch_seq)(*[int(x) for x in context_lens])
-            batch_seq_ids_buf = (c_int64 * n_batch_seq)(*[int(x) for x in batch_seq_ids])
-            block_tables_buf = (c_int32 * (n_batch_seq * bt_width))(*[int(x) for x in block_tables])
-
-        if is_block_layout:
-            if pos_buf is None:
-                raise ValueError("BLOCK layout requires pos_ids")
-            if seq_ptr_buf is None:
-                raise ValueError("BLOCK layout requires seq_ids")
-            if slot_mapping_buf is None:
-                raise ValueError("BLOCK layout requires slot_mapping")
-            if context_lens_buf is None or batch_seq_ids_buf is None or block_tables_buf is None or n_batch_seq <= 0:
-                raise ValueError("BLOCK layout requires context_lens/batch_seq_ids/block_tables")
-
-        batch = LlaisysBatch()
-        batch.n_tokens = c_int32(n_tokens)
-        batch.token = token_buf
-        batch.embd = None
-        batch.pos = pos_buf
-        batch.n_seq_id = n_seq_buf
-        batch.seq_id = seq_ptr_buf
-        batch.logits = logits_buf
-        batch.temperatures = temperatures_buf
-        batch.top_ps = top_ps_buf
-        batch.top_ks = top_ks_buf
-        batch.seeds = seeds_buf
-        batch.has_seeds = has_seeds_buf
-        batch.slot_mapping = slot_mapping_buf
-        batch.context_lens = context_lens_buf
-        batch.batch_seq_ids = batch_seq_ids_buf
-        batch.block_tables = block_tables_buf
-        batch.n_batch_seq = c_int32(n_batch_seq)
-        batch.block_table_width = c_int32(bt_width if n_batch_seq > 0 else 0)
-
-        status = int(LIB_LLAISYS.llaisysModelDecode(self._model, batch))
-        if status != 0:
-            raise RuntimeError(f"Decode failed with status={status}")
-
-        n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(self._model))
-        if n_outputs < 0:
-            raise RuntimeError("Decode returned invalid output row count")
-        if n_outputs == 0:
-            return [], []
-
-        output_ids_ptr = LIB_LLAISYS.llaisysModelOutputIds(self._model)
-        if not output_ids_ptr:
-            raise RuntimeError("Decode returned outputs without output_ids")
-        output_ids = np.ctypeslib.as_array(output_ids_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
-        sampled_ids_ptr = LIB_LLAISYS.llaisysModelSampledIds(self._model)
-        if not sampled_ids_ptr:
-            raise RuntimeError("Decode returned outputs without sampled_ids")
-        sampled_ids = np.ctypeslib.as_array(sampled_ids_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
-        return output_ids, sampled_ids
-
-    def request_free(self, seq_id: int) -> int:
+    def forward(self, fin: ModelForwardInput, fout: ModelForwardOutput) -> int:
         if not self._model:
-            return 5
-        return int(LIB_LLAISYS.llaisysModelRequestFree(self._model, c_int64(int(seq_id))))
-
-    def kv_stats(self) -> dict[str, int]:
-        if not self._model:
-            return {
-                "capacity_tokens": 0,
-                "used_tokens": 0,
-                "free_tokens": 0,
-                "peak_used_tokens": 0,
-            }
-        out = LlaisysKvStats()
-        rc = int(LIB_LLAISYS.llaisysModelKvStats(self._model, byref(out)))
-        if rc != 0:
-            raise RuntimeError(f"KvStats failed with status={rc}")
-        return {
-            "capacity_tokens": int(out.capacity_tokens),
-            "used_tokens": int(out.used_tokens),
-            "free_tokens": int(out.free_tokens),
-            "peak_used_tokens": int(out.peak_used_tokens),
-        }
-
-    def kv_reset_prefix_cache(self) -> int:
-        if not self._model:
-            return 5
-        return int(LIB_LLAISYS.llaisysModelKvResetPrefixCache(self._model))
-
-    def generate(
-        self,
-        inputs: Sequence[int],
-        max_new_tokens: Optional[int] = None,
-        top_k: int = 1,
-        top_p: float = 0.8,
-        temperature: float = 0.8,
-        stop_token_ids: Optional[Sequence[int]] = None,
-        stop: Optional[Sequence[str]] = None,
-    ) -> Sequence[int]:
-        # Stage-1: route offline generation through LLMEngine chain.
-        from ..engine.llm_engine import LLMEngine
-        from ..engine.types import SamplingParams
-
-        if self._offline_engine is None:
-            self._offline_engine = LLMEngine(model_runner=self)
-
-        sampling_params = SamplingParams(
-            max_new_tokens=max_new_tokens,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            stop_token_ids=tuple(stop_token_ids or ()),
-            stop=tuple(stop or ()),
-        )
-        result = self._offline_engine.generate(inputs=inputs, sampling_params=sampling_params)
-        return result.token_ids
+            return -1
+        return int(LIB_LLAISYS.llaisysModelForward(self._model, byref(fin), byref(fout)))

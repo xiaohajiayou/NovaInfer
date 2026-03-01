@@ -1,36 +1,13 @@
-
-import numpy as np
-
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
-
-
-
-class DummyRunner:
-    def __init__(self):
-        self.max_seq_len = 16
-        self.end_token_id = 5
-
-    def decode_batch(self, token_ids, pos_ids=None, seq_ids=None, logits_mask=None):
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if not logits_mask[i]:
-                continue
-            out_ids.append(i)
-            row = np.zeros((8,), dtype=np.float32)
-            row[(int(tok) + 1) % 8] = 1.0
-            rows.append(row)
-        return out_ids, rows
+from llaisys.libllaisys.model import KvCacheLayout
+from test.utils.dummy_model_runner import DummyModelRunner
 
 
 def _build_dummy_runner(model_path, device):
     _ = (model_path, device)
-    return DummyRunner()
+    return DummyModelRunner(max_seq_len=16, end_token_id=5, kv_cache_layout=KvCacheLayout.BLOCK)
 
 
 def test_engine_uses_model_registry_for_worker_creation():

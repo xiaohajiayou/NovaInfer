@@ -17,8 +17,15 @@ struct LlaisysQwen2ModelImpl {
                                    llaisysDeviceType_t device,
                                    int *device_ids,
                                    int ndevice)
-        : model(std::make_unique<Qwen2Model>(meta, device, device_ids, ndevice,
-                                             llaisys::runtime::kv_cache::KvCacheLayout::BLOCK, 16, meta.maxseq)) {}
+        : model(std::make_unique<Qwen2Model>(meta, device, device_ids, ndevice)) {
+        CHECK_ARGUMENT(model != nullptr, "Qwen2: failed to allocate model");
+        const int rc = model->configure_runtime(
+            llaisys::runtime::kv_cache::KvCacheLayout::BLOCK,
+            16,
+            static_cast<size_t>(meta.maxseq),
+            static_cast<int64_t>(meta.maxseq));
+        CHECK_ARGUMENT(rc == 0, "Qwen2: failed to configure runtime");
+    }
 
     std::unique_ptr<Qwen2Model> model;
 };

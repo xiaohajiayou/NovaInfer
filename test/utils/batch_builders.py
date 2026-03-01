@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from ctypes import POINTER, c_int8, c_int32, c_int64, cast
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysBatch
+from llaisys.libllaisys.model import KvCacheLayout
 
 
 SeqIdLike = int | Sequence[int]
@@ -19,9 +18,19 @@ class BlockBatchState:
 
 @dataclass
 class BatchBuildResult:
-    batch: LlaisysBatch
-    hold: tuple
+    token_ids: list[int]
+    logits_mask: list[int]
+    seq_ids: list[int]
     pos_values: list[int]
+    mode: KvCacheLayout
+    q_seq_rows: list[int] | None = None
+    q_pos: list[int] | None = None
+    slot_mapping: list[int] | None = None
+    context_lens: list[int] | None = None
+    batch_seq_ids: list[int] | None = None
+    block_tables: list[int] | None = None
+    block_table_width: int = 0
+    invalid: bool = False
 
 
 def _normalize_seq_ids(n_tokens: int, seq_ids: Sequence[SeqIdLike] | None, default_seq_id: int) -> list[SeqIdLike]:
@@ -32,17 +41,29 @@ def _normalize_seq_ids(n_tokens: int, seq_ids: Sequence[SeqIdLike] | None, defau
     return list(seq_ids)
 
 
-def _build_seq_ptrs(seq_rows: list[list[int]]) -> tuple[object, object, list[object]]:
-    n = len(seq_rows)
-    n_seq_buf = (c_int32 * n)()
-    seq_ptr_buf = (POINTER(c_int64) * n)()
-    raw_rows: list[object] = []
-    for i, seq_list in enumerate(seq_rows):
-        row = (c_int64 * len(seq_list))(*[int(x) for x in seq_list])
-        raw_rows.append(row)
-        n_seq_buf[i] = len(seq_list)
-        seq_ptr_buf[i] = cast(row, POINTER(c_int64))
-    return n_seq_buf, seq_ptr_buf, raw_rows
+def _resolve_pos_values(
+    seq_single: Sequence[int],
+    pos_ids: Sequence[int] | None,
+    state: BlockBatchState | None,
+) -> list[int]:
+    local_next: dict[int, int] = {}
+    if pos_ids is not None:
+        pos_values = [int(p) for p in pos_ids]
+        if state is not None:
+            for sid, p in zip(seq_single, pos_values):
+                state.next_pos_by_seq[sid] = max(int(state.next_pos_by_seq.get(sid, 0)), int(p) + 1)
+        return pos_values
+
+    pos_values: list[int] = []
+    for sid in seq_single:
+        if state is not None:
+            p = int(state.next_pos_by_seq.get(sid, 0))
+            state.next_pos_by_seq[sid] = p + 1
+        else:
+            p = int(local_next.get(sid, 0))
+            local_next[sid] = p + 1
+        pos_values.append(p)
+    return pos_values
 
 
 def build_decode_batch(
@@ -66,9 +87,9 @@ def build_decode_batch(
         raise ValueError("pos_ids length mismatch")
 
     is_block = int(layout) == int(KvCacheLayout.BLOCK)
-
-    token_buf = (c_int64 * n)(*[int(t) for t in token_ids])
-    logits_buf = None if logits_mask is None else (c_int8 * n)(*[int(x) for x in logits_mask])
+    mode = KvCacheLayout.BLOCK if is_block else KvCacheLayout.SLOT
+    token_values = [int(t) for t in token_ids]
+    logits_values = [int(x) for x in logits_mask] if logits_mask is not None else ([0] * max(0, n - 1) + [1])
 
     seq_norm = _normalize_seq_ids(n, seq_ids, default_seq_id)
     seq_rows: list[list[int]] = []
@@ -77,78 +98,59 @@ def build_decode_batch(
             seq_rows.append([int(x) for x in sid])
         else:
             seq_rows.append([int(sid)])
-    n_seq_buf, seq_ptr_buf, raw_rows = _build_seq_ptrs(seq_rows)
 
-    if not is_block:
-        pos_buf = None if pos_ids is None else (c_int64 * n)(*[int(p) for p in pos_ids])
-        batch = LlaisysBatch(
-            n_tokens=c_int32(n),
-            token=token_buf,
-            embd=None,
-            pos=pos_buf,
-            n_seq_id=n_seq_buf,
-            seq_id=seq_ptr_buf,
-            logits=logits_buf,
-        )
+    # Forward API currently expects one seq id per token.
+    if any(len(row) != 1 for row in seq_rows):
+        seq_single = [int(row[0]) if row else 0 for row in seq_rows]
+        pos_values = _resolve_pos_values(seq_single, pos_ids, block_state if is_block else None)
         return BatchBuildResult(
-            batch=batch,
-            hold=(token_buf, logits_buf, pos_buf, n_seq_buf, seq_ptr_buf, raw_rows),
-            pos_values=[] if pos_ids is None else [int(p) for p in pos_ids],
+            token_ids=token_values,
+            logits_mask=logits_values,
+            seq_ids=seq_single,
+            pos_values=pos_values,
+            mode=mode,
+            invalid=True,
         )
 
-    # BLOCK path requires one seq per token.
-    seq_single: list[int] = []
-    for row in seq_rows:
-        if len(row) != 1:
-            # Keep invalid block metadata absent so runtime path can return proper error.
-            pos_buf = None if pos_ids is None else (c_int64 * n)(*[int(p) for p in pos_ids])
-            batch = LlaisysBatch(
-                n_tokens=c_int32(n),
-                token=token_buf,
-                embd=None,
-                pos=pos_buf,
-                n_seq_id=n_seq_buf,
-                seq_id=seq_ptr_buf,
-                logits=logits_buf,
-            )
-            return BatchBuildResult(
-                batch=batch,
-                hold=(token_buf, logits_buf, pos_buf, n_seq_buf, seq_ptr_buf, raw_rows),
-                pos_values=[] if pos_ids is None else [int(p) for p in pos_ids],
-            )
-        seq_single.append(row[0])
+    seq_single = [row[0] for row in seq_rows]
+    pos_values = _resolve_pos_values(seq_single, pos_ids, block_state if is_block else None)
+    if not is_block:
+        return BatchBuildResult(
+            token_ids=token_values,
+            logits_mask=logits_values,
+            seq_ids=seq_single,
+            pos_values=pos_values,
+            mode=mode,
+        )
 
     st = block_state if block_state is not None else BlockBatchState()
-    if pos_ids is None:
-        pos_values = []
-        for sid in seq_single:
-            p = int(st.next_pos_by_seq.get(sid, 0))
-            pos_values.append(p)
-            st.next_pos_by_seq[sid] = p + 1
-    else:
-        pos_values = [int(p) for p in pos_ids]
-        for sid, p in zip(seq_single, pos_values):
-            st.next_pos_by_seq[sid] = max(int(st.next_pos_by_seq.get(sid, 0)), p + 1)
-
     bs = max(1, int(block_size))
     if shared_block_ids_per_batch:
         seq_blocks = {sid: [] for sid in set(seq_single)}
         for sid, p in zip(seq_single, pos_values):
-            bidx = p // bs
+            bidx = int(p) // bs
             table = seq_blocks[sid]
             while len(table) <= bidx:
                 table.append(len(table))
     else:
         seq_blocks = st.seq_blocks
         for sid, p in zip(seq_single, pos_values):
-            bidx = p // bs
+            bidx = int(p) // bs
             table = seq_blocks.setdefault(sid, [])
             while len(table) <= bidx:
                 table.append(int(st.next_bid))
                 st.next_bid += 1
 
     uniq_seq = sorted(set(seq_single))
-    context_lens = [int(st.next_pos_by_seq[sid]) for sid in uniq_seq]
+    if block_state is not None:
+        context_lens = [int(st.next_pos_by_seq.get(sid, 0)) for sid in uniq_seq]
+    else:
+        max_pos_by_seq: dict[int, int] = {}
+        for sid, p in zip(seq_single, pos_values):
+            prev = max_pos_by_seq.get(int(sid), -1)
+            if int(p) > prev:
+                max_pos_by_seq[int(sid)] = int(p)
+        context_lens = [int(max_pos_by_seq.get(int(sid), -1) + 1) for sid in uniq_seq]
     row_width = max(1, max(len(seq_blocks[sid]) for sid in uniq_seq))
     block_tables: list[int] = []
     for sid in uniq_seq:
@@ -158,56 +160,27 @@ def build_decode_batch(
         block_tables.extend(row)
 
     seq_to_row = {sid: i for i, sid in enumerate(uniq_seq)}
-    slot_mapping = []
+    slot_mapping: list[int] = []
+    q_seq_rows: list[int] = []
     for sid, p in zip(seq_single, pos_values):
         row = seq_to_row[sid]
-        bidx = p // bs
-        boff = p % bs
+        bidx = int(p) // bs
+        boff = int(p) % bs
         bid = block_tables[row * row_width + bidx]
         slot_mapping.append(int(bid * bs + boff))
+        q_seq_rows.append(int(row))
 
-    pos_buf = (c_int64 * n)(*pos_values)
-    n_seq1_buf = (c_int32 * n)(*[1] * n)
-    seq1_ptr_buf = (POINTER(c_int64) * n)()
-    seq1_rows: list[object] = []
-    for i, sid in enumerate(seq_single):
-        row = (c_int64 * 1)(int(sid))
-        seq1_rows.append(row)
-        seq1_ptr_buf[i] = cast(row, POINTER(c_int64))
-
-    slot_mapping_buf = (c_int32 * n)(*slot_mapping)
-    context_lens_buf = (c_int32 * len(context_lens))(*context_lens)
-    batch_seq_ids_buf = (c_int64 * len(uniq_seq))(*uniq_seq)
-    block_tables_buf = (c_int32 * len(block_tables))(*block_tables)
-
-    batch = LlaisysBatch(
-        n_tokens=c_int32(n),
-        token=token_buf,
-        embd=None,
-        pos=pos_buf,
-        n_seq_id=n_seq1_buf,
-        seq_id=seq1_ptr_buf,
-        logits=logits_buf,
-        slot_mapping=slot_mapping_buf,
-        context_lens=context_lens_buf,
-        batch_seq_ids=batch_seq_ids_buf,
-        block_tables=block_tables_buf,
-        n_batch_seq=c_int32(len(uniq_seq)),
-        block_table_width=c_int32(row_width),
-    )
     return BatchBuildResult(
-        batch=batch,
-        hold=(
-            token_buf,
-            logits_buf,
-            pos_buf,
-            n_seq1_buf,
-            seq1_ptr_buf,
-            seq1_rows,
-            slot_mapping_buf,
-            context_lens_buf,
-            batch_seq_ids_buf,
-            block_tables_buf,
-        ),
+        token_ids=token_values,
+        logits_mask=logits_values,
+        seq_ids=seq_single,
         pos_values=pos_values,
+        mode=mode,
+        q_seq_rows=q_seq_rows,
+        q_pos=[int(x) for x in pos_values],
+        slot_mapping=slot_mapping,
+        context_lens=context_lens,
+        batch_seq_ids=[int(x) for x in uniq_seq],
+        block_tables=block_tables,
+        block_table_width=int(row_width),
     )

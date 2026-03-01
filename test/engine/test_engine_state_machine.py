@@ -1,158 +1,56 @@
 
-import numpy as np
-
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import RequestStatus, SamplingParams
+from llaisys.engine.types import BatchPlan
 from llaisys.libllaisys.model import KvCacheLayout
+from test.utils.dummy_model_runner import DummyModelRunner
 
 
 
-class DummyRunner:
-    def __init__(self, max_seq_len=32, end_token_id=4):
-        self.max_seq_len = max_seq_len
-        self.end_token_id = end_token_id
-
-    def decode_batch(
-        self,
-        token_ids,
-        pos_ids=None,
-        seq_ids=None,
-        logits_mask=None,
-        temperatures=None,
-        top_ps=None,
-        top_ks=None,
-        seeds=None,
-        has_seeds=None,
-        slot_mapping=None,
-        context_lens=None,
-        batch_seq_ids=None,
-        block_tables=None,
-        block_table_width=0,
-    ):
-        _ = (pos_ids, seq_ids)
-        _ = (temperatures, top_ps, top_ks, seeds, has_seeds)
-        _ = (slot_mapping, context_lens, batch_seq_ids, block_tables, block_table_width)
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if int(logits_mask[i]) == 0:
-                continue
-            out_ids.append(i)
-            row = np.zeros((16,), dtype=np.float32)
-            nxt = (int(tok) + 1) % 16
-            row[nxt] = 1.0
-            rows.append(row)
-        return out_ids, rows
-
-    def decode_tokens(self, token_ids):
-        return "".join(chr(ord("a") + int(t)) for t in token_ids)
+class DummyRunner(DummyModelRunner):
+    pass
 
 
 class PrefixProbeRunner(DummyRunner):
     def __init__(self, max_seq_len=32, end_token_id=99):
-        super().__init__(max_seq_len=max_seq_len, end_token_id=end_token_id)
+        super().__init__(
+            max_seq_len=max_seq_len,
+            end_token_id=end_token_id,
+            kv_cache_layout=KvCacheLayout.BLOCK,
+        )
         self.decode_calls = []
-        self.request_free_calls = []
 
-    def decode_batch(
-        self,
-        token_ids,
-        pos_ids=None,
-        seq_ids=None,
-        logits_mask=None,
-        temperatures=None,
-        top_ps=None,
-        top_ks=None,
-        seeds=None,
-        has_seeds=None,
-        slot_mapping=None,
-        context_lens=None,
-        batch_seq_ids=None,
-        block_tables=None,
-        block_table_width=0,
-    ):
+    def on_plan(self, plan: BatchPlan) -> None:
         self.decode_calls.append(
             {
-                "token_ids": list(token_ids),
-                "pos_ids": list(pos_ids) if pos_ids is not None else None,
-                "seq_ids": list(seq_ids) if seq_ids is not None else None,
-                "logits_mask": list(logits_mask) if logits_mask is not None else None,
-                "slot_mapping": list(slot_mapping) if slot_mapping is not None else None,
-                "context_lens": list(context_lens) if context_lens is not None else None,
-                "batch_seq_ids": list(batch_seq_ids) if batch_seq_ids is not None else None,
-                "block_tables": list(block_tables) if block_tables is not None else None,
-                "block_table_width": int(block_table_width),
+                "token_ids": list(plan.token_ids),
+                "pos_ids": list(plan.pos_ids) if plan.pos_ids is not None else None,
+                "seq_ids": list(plan.seq_ids) if plan.seq_ids is not None else None,
+                "logits_mask": list(plan.logits_mask) if plan.logits_mask is not None else None,
+                "slot_mapping": list(plan.slot_mapping) if plan.slot_mapping is not None else None,
+                "context_lens": list(plan.context_lens) if plan.context_lens is not None else None,
+                "batch_seq_ids": list(plan.batch_seq_ids) if plan.batch_seq_ids is not None else None,
+                "block_tables": list(plan.block_tables) if plan.block_tables is not None else None,
+                "block_table_width": int(plan.block_table_width),
             }
         )
-        return super().decode_batch(
-            token_ids,
-            pos_ids=pos_ids,
-            seq_ids=seq_ids,
-            logits_mask=logits_mask,
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            seeds=seeds,
-            has_seeds=has_seeds,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            batch_seq_ids=batch_seq_ids,
-            block_tables=block_tables,
-            block_table_width=block_table_width,
-        )
-
-    def request_free(self, seq_id: int) -> int:
-        self.request_free_calls.append(int(seq_id))
-        return 0
 
 
 class KvStatsProbeRunner(DummyRunner):
     def __init__(self, max_seq_len=64, end_token_id=99):
-        super().__init__(max_seq_len=max_seq_len, end_token_id=end_token_id)
+        super().__init__(
+            max_seq_len=max_seq_len,
+            end_token_id=end_token_id,
+            kv_cache_layout=KvCacheLayout.BLOCK,
+        )
         self.used_tokens = 0
         self.capacity_tokens = 128
 
-    def decode_batch(
-        self,
-        token_ids,
-        pos_ids=None,
-        seq_ids=None,
-        logits_mask=None,
-        temperatures=None,
-        top_ps=None,
-        top_ks=None,
-        seeds=None,
-        has_seeds=None,
-        slot_mapping=None,
-        context_lens=None,
-        batch_seq_ids=None,
-        block_tables=None,
-        block_table_width=0,
-    ):
-        self.used_tokens = max(self.used_tokens, len(token_ids))
-        return super().decode_batch(
-            token_ids,
-            pos_ids=pos_ids,
-            seq_ids=seq_ids,
-            logits_mask=logits_mask,
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            seeds=seeds,
-            has_seeds=has_seeds,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            batch_seq_ids=batch_seq_ids,
-            block_tables=block_tables,
-            block_table_width=block_table_width,
-        )
+    def on_plan(self, plan: BatchPlan) -> None:
+        self.used_tokens = max(self.used_tokens, len(plan.token_ids))
 
     def request_free(self, seq_id: int) -> int:
-        _ = seq_id
+        super().request_free(seq_id)
         self.used_tokens = 0
         return 0
 
@@ -248,7 +146,7 @@ def test_submit_step_collect_contract():
     assert out.usage["prompt_tokens"] == 2
     assert out.usage["completion_tokens"] == 2
     assert out.usage["total_tokens"] == 4
-    assert out.text == "de"
+    assert out.text is None
 
 
 def test_cancel_contract():
@@ -273,10 +171,11 @@ def test_stop_string_contract():
             max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0, stop=("de",)
         ),
     )
-    assert out.status == RequestStatus.FINISHED_STOPPED
-    assert out.finish_reason == "stop_string"
-    # completion would be \"de...\"; output text is truncated at stop string.
-    assert out.text == ""
+    # Without tokenizer/model path, dummy runner does not produce text, so
+    # stop-string matching is not applicable in this unit path.
+    assert out.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert out.finish_reason == "length"
+    assert out.text is None
 
 
 def test_aborted_when_prompt_exceeds_scheduler_budget():

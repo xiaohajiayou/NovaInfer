@@ -72,13 +72,15 @@ Qwen2Workspace::Layout Qwen2Workspace::build_layout_(size_t ntoken) const {
     off += ntoken * hs_;
     layout.logits = off;
     off += ntoken * voc_;
+    layout.argmax_val = off;
+    off += ntoken;
     layout.k_ctx = off;
     off += maxseq_ * nkvh_ * dh_;
     layout.v_ctx = off;
     off += maxseq_ * nkvh_ * dh_;
     layout.total_main = off;
-    // i64 arena packs [input_ids, pos_ids].
-    layout.total_i64 = ntoken * 2;
+    // i64 arena packs [input_ids, pos_ids, argmax_idx].
+    layout.total_i64 = ntoken * 3;
     // u8 arena is used by SLOT dense-mask materialization.
     layout.total_u8 = ntoken * maxseq_;
     return layout;
@@ -148,10 +150,12 @@ void Qwen2Workspace::reserve(size_t ntoken) {
     view_.swiglu = slice_main_(layout, layout.swiglu, token_cap_ * di_, {token_cap_, di_});
     view_.down = slice_main_(layout, layout.down, token_cap_ * hs_, {token_cap_, hs_});
     view_.logits = slice_main_(layout, layout.logits, token_cap_ * voc_, {token_cap_, voc_});
+    view_.argmax_val = slice_main_(layout, layout.argmax_val, token_cap_, {token_cap_});
     view_.k_ctx = slice_main_(layout, layout.k_ctx, maxseq_ * nkvh_ * dh_, {maxseq_, nkvh_, dh_});
     view_.v_ctx = slice_main_(layout, layout.v_ctx, maxseq_ * nkvh_ * dh_, {maxseq_, nkvh_, dh_});
     view_.input_ids = slice_i64_(layout, 0, token_cap_, {token_cap_});
     view_.pos_ids = slice_i64_(layout, token_cap_, token_cap_, {token_cap_});
+    view_.argmax_idx = slice_i64_(layout, token_cap_ * 2, token_cap_, {token_cap_});
     view_.attn_mask_flat = slice_u8_(layout, 0, token_cap_ * maxseq_, {token_cap_ * maxseq_});
 }
 

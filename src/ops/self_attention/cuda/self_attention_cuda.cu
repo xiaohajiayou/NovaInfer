@@ -33,41 +33,6 @@ namespace llaisys::ops::cuda {
 
 namespace {
 
-void release_device_i32(int32_t *&ptr) {
-    if (ptr != nullptr) {
-        LLAISYS_CUDA_CHECK(cudaFree(ptr));
-        ptr = nullptr;
-    }
-}
-
-void ensure_device_i32_capacity(int32_t *&ptr, size_t &cap, size_t n) {
-    if (n <= cap) {
-        return;
-    }
-    release_device_i32(ptr);
-    LLAISYS_CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(int32_t)));
-    cap = n;
-}
-
-void upload_device_i32(int32_t *&ptr, size_t &cap, const std::vector<int32_t> &host) {
-    LLAISYS_NVTX_SCOPE("attn/meta_upload_i32");
-    const size_t n = host.size();
-    if (n == 0) {
-        return;
-    }
-    ensure_device_i32_capacity(ptr, cap, n);
-    LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
-}
-
-void upload_device_i32_raw(int32_t *&ptr, size_t &cap, const int32_t *host, size_t n) {
-    LLAISYS_NVTX_SCOPE("attn/meta_upload_i32_raw");
-    if (host == nullptr || n == 0) {
-        return;
-    }
-    ensure_device_i32_capacity(ptr, cap, n);
-    LLAISYS_CUDA_CHECK(cudaMemcpy(ptr, host, n * sizeof(int32_t), cudaMemcpyHostToDevice));
-}
-
 template <typename T>
 __global__ void self_attention_kernel(T *out,
                                       const T *q,
@@ -472,14 +437,10 @@ struct CudnnPagedPlan {
 #ifdef ENABLE_CUDNN_FRONTEND
     std::shared_ptr<cudnn_frontend::graph::Graph> graph{};
     bool graph_ready{false};
-    bool meta_initialized{false};
-    int64_t meta_b{0};
 
     void *workspace{nullptr};
     size_t workspace_cap{0};
 
-    const CommonAttentionMetadata *last_prepared{nullptr};
-    uint64_t last_revision{0};
 #endif
 
     ~CudnnPagedPlan() {
@@ -522,7 +483,6 @@ struct CudnnRuntimeState {
     std::unordered_map<CudnnPlanKey, std::unique_ptr<CudnnPagedPlan>, CudnnPlanKeyHash> plan_cache;
     std::unordered_map<size_t, int64_t> prebuilt_max_bucket;
     CudnnMetaBuffer meta_buf;
-    CudnnPagedPlan *meta_owner_plan{nullptr};
 };
 
 struct CudnnProblemShape {
@@ -781,8 +741,6 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
         return false;
     }
     plan.graph_ready = true;
-    plan.last_prepared = nullptr;
-    plan.last_revision = 0;
     return true;
 }
 
@@ -821,7 +779,7 @@ static bool prebuild_cudnn_buckets(CudnnRuntimeState &state,
     return true;
 }
 
-static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, CudnnPagedPlan &plan, const CudnnProblemShape &shape) {
+static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, const CudnnProblemShape &shape) {
     CudnnMetaPtrs ptrs{};
     ptrs.bsz = static_cast<size_t>(shape.b_exec);
     ptrs.page_n = ptrs.bsz * static_cast<size_t>(shape.table_size);
@@ -833,8 +791,6 @@ static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, CudnnPag
         }
         LLAISYS_CUDA_CHECK(cudaMalloc(&state.meta_buf.d_meta, ptrs.meta_n * sizeof(int32_t)));
         state.meta_buf.cap = ptrs.meta_n;
-        plan.meta_initialized = false;
-        state.meta_owner_plan = nullptr;
     }
     ptrs.d_seq_q = state.meta_buf.d_meta;
     ptrs.d_seq_kv = state.meta_buf.d_meta + static_cast<std::ptrdiff_t>(ptrs.bsz);
@@ -842,18 +798,12 @@ static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, CudnnPag
     return ptrs;
 }
 
-static void refresh_cudnn_meta_if_needed(const CommonAttentionMetadata &prepared,
-                                         CudnnPagedPlan &plan,
-                                         CudnnRuntimeState &state,
-                                         const CudnnProblemShape &shape,
-                                         int32_t block_table_width,
-                                         const CudnnMetaPtrs &ptrs,
-                                         cudaStream_t stream) {
-    const bool meta_changed = (plan.last_prepared != &prepared) || (plan.last_revision != prepared.revision);
-    const bool needs_rebuild = !plan.meta_initialized || plan.meta_b != shape.b_exec || state.meta_owner_plan != &plan || meta_changed;
-    if (!needs_rebuild) {
-        return;
-    }
+static void refresh_cudnn_meta(const CommonAttentionMetadata &prepared,
+                               const CudnnProblemShape &shape,
+                               int32_t block_table_width,
+                               const CudnnMetaPtrs &ptrs,
+                               cudaStream_t stream) {
+    // Step metadata is dynamic and must be rebuilt every step.
 
     const int32_t *q_seq_rows_dev = prepared.q_seq_rows;
     const int32_t *q_pos_dev = prepared.q_pos;
@@ -878,11 +828,6 @@ static void refresh_cudnn_meta_if_needed(const CommonAttentionMetadata &prepared
                                                          ptrs.d_page);
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 
-    plan.last_prepared = &prepared;
-    plan.last_revision = prepared.revision;
-    plan.meta_initialized = true;
-    plan.meta_b = shape.b_exec;
-    state.meta_owner_plan = &plan;
 }
 
 static bool ensure_cudnn_workspace(CudnnPagedPlan &plan) {
@@ -935,8 +880,8 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
     if (!ensure_cudnn_plan_ready(plan, state.handle, q->dtype(), shape, block_size, shape.b_exec, scale)) {
         return false;
     }
-    const CudnnMetaPtrs ptrs = ensure_cudnn_meta_buffer(state, plan, shape);
-    refresh_cudnn_meta_if_needed(prepared, plan, state, shape, block_table_width, ptrs, stream);
+    const CudnnMetaPtrs ptrs = ensure_cudnn_meta_buffer(state, shape);
+    refresh_cudnn_meta(prepared, shape, block_table_width, ptrs, stream);
     if (!ensure_cudnn_workspace(plan)) {
         return false;
     }
@@ -976,140 +921,37 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
 
 } // namespace
 
-CommonAttentionMetadata::~CommonAttentionMetadata() {
-    release_device_i32(q_seq_rows);
-    release_device_i32(q_pos);
-    release_device_i32(block_tables);
-    release_device_i32(seq_lens);
-    release_device_i32(last_page_lens);
-    q_seq_rows_cap = 0;
-    q_pos_cap = 0;
-    block_tables_cap = 0;
-    seq_lens_cap = 0;
-    last_page_lens_cap = 0;
-    nseq = 0;
-}
-
-void build_attn_metadata(CommonAttentionMetadata &prepared,
-                         const std::vector<int32_t> &q_seq_rows,
-                         const std::vector<int32_t> &q_pos,
-                         const std::vector<int32_t> &block_tables,
-                         const std::vector<int32_t> &seq_lens,
-                         int32_t block_size,
-                         bool upload_device_metadata) {
-    build_attn_metadata(prepared,
-                        q_seq_rows,
-                        q_pos,
-                        block_tables.empty() ? nullptr : block_tables.data(),
-                        block_tables.size(),
-                        seq_lens.empty() ? nullptr : seq_lens.data(),
-                        seq_lens.size(),
-                        block_size,
-                        upload_device_metadata);
-}
-
-void build_attn_metadata(CommonAttentionMetadata &prepared,
-                         const std::vector<int32_t> &q_seq_rows,
-                         const std::vector<int32_t> &q_pos,
-                         const int32_t *block_tables,
-                         size_t block_tables_len,
-                         const int32_t *seq_lens,
-                         size_t seq_lens_len,
-                         int32_t block_size,
-                         bool upload_device_metadata) {
-    LLAISYS_NVTX_SCOPE("attn/build_metadata");
-    if (upload_device_metadata) {
-        upload_device_i32(prepared.q_seq_rows, prepared.q_seq_rows_cap, q_seq_rows);
-        upload_device_i32(prepared.q_pos, prepared.q_pos_cap, q_pos);
-        upload_device_i32_raw(prepared.block_tables, prepared.block_tables_cap, block_tables, block_tables_len);
-        upload_device_i32_raw(prepared.seq_lens, prepared.seq_lens_cap, seq_lens, seq_lens_len);
-    }
-    (void)block_size;
-    prepared.revision += 1;
-    prepared.nseq = static_cast<int32_t>(seq_lens_len);
-}
-
-void scatter_kv_cache_by_slots(tensor_t k_cache,
-                               tensor_t v_cache,
-                               tensor_t k_src,
-                               tensor_t v_src,
-                               const std::vector<int32_t> &slot_idxs) {
-    LLAISYS_NVTX_SCOPE("attn/scatter_kv_cache_by_slots");
-    if (slot_idxs.empty()) {
-        return;
-    }
-    CHECK_ARGUMENT(k_cache->deviceType() == LLAISYS_DEVICE_NVIDIA, "scatter_kv_cache_by_slots: k_cache must be CUDA");
-    CHECK_ARGUMENT(v_cache->deviceType() == LLAISYS_DEVICE_NVIDIA, "scatter_kv_cache_by_slots: v_cache must be CUDA");
-    CHECK_ARGUMENT(k_src->deviceType() == LLAISYS_DEVICE_NVIDIA, "scatter_kv_cache_by_slots: k_src must be CUDA");
-    CHECK_ARGUMENT(v_src->deviceType() == LLAISYS_DEVICE_NVIDIA, "scatter_kv_cache_by_slots: v_src must be CUDA");
-    CHECK_ARGUMENT(k_cache->dtype() == k_src->dtype(), "scatter_kv_cache_by_slots: k dtype mismatch");
-    CHECK_ARGUMENT(v_cache->dtype() == v_src->dtype(), "scatter_kv_cache_by_slots: v dtype mismatch");
-    CHECK_ARGUMENT(k_src->shape()[0] == slot_idxs.size(), "scatter_kv_cache_by_slots: k slot size mismatch");
-    CHECK_ARGUMENT(v_src->shape()[0] == slot_idxs.size(), "scatter_kv_cache_by_slots: v slot size mismatch");
-    CHECK_ARGUMENT(k_cache->shape()[1] == k_src->shape()[1] && k_cache->shape()[2] == k_src->shape()[2],
-                   "scatter_kv_cache_by_slots: k shape mismatch");
-    CHECK_ARGUMENT(v_cache->shape()[1] == v_src->shape()[1] && v_cache->shape()[2] == v_src->shape()[2],
-                   "scatter_kv_cache_by_slots: v shape mismatch");
-
-    static thread_local int32_t *d_slot_idxs = nullptr;
-    static thread_local size_t d_slot_cap = 0;
-    ensure_device_i32_capacity(d_slot_idxs, d_slot_cap, slot_idxs.size());
-    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    {
-        LLAISYS_NVTX_SCOPE("memcpy/async/h2d/slot_indices");
-        LLAISYS_CUDA_CHECK(cudaMemcpyAsync(
-            d_slot_idxs, slot_idxs.data(), slot_idxs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    }
-
-    switch (k_src->dtype()) {
-    case LLAISYS_DTYPE_F32:
-        launch_scatter_cache_by_slots<float>(k_cache, k_src, d_slot_idxs);
-        launch_scatter_cache_by_slots<float>(v_cache, v_src, d_slot_idxs);
-        break;
-    case LLAISYS_DTYPE_F16:
-        launch_scatter_cache_by_slots<llaisys::fp16_t>(k_cache, k_src, d_slot_idxs);
-        launch_scatter_cache_by_slots<llaisys::fp16_t>(v_cache, v_src, d_slot_idxs);
-        break;
-    case LLAISYS_DTYPE_BF16:
-        launch_scatter_cache_by_slots<llaisys::bf16_t>(k_cache, k_src, d_slot_idxs);
-        launch_scatter_cache_by_slots<llaisys::bf16_t>(v_cache, v_src, d_slot_idxs);
-        break;
-    default:
-        EXCEPTION_UNSUPPORTED_DATATYPE(k_src->dtype());
-    }
-}
-
-void scatter_kv_cache_by_slots_device_indices(tensor_t k_cache,
-                                              tensor_t v_cache,
-                                              tensor_t k_src,
-                                              tensor_t v_src,
-                                              tensor_t slot_idxs_i32) {
-    LLAISYS_NVTX_SCOPE("attn/scatter_kv_cache_by_device_indices");
+void reshape_and_cache(tensor_t k_cache,
+                       tensor_t v_cache,
+                       tensor_t k_src,
+                       tensor_t v_src,
+                       tensor_t slot_idxs_i32) {
+    LLAISYS_NVTX_SCOPE("attn/reshape_and_cache");
     CHECK_ARGUMENT(k_cache->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "scatter_kv_cache_by_slots_device_indices: k_cache must be CUDA");
+                   "reshape_and_cache: k_cache must be CUDA");
     CHECK_ARGUMENT(v_cache->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "scatter_kv_cache_by_slots_device_indices: v_cache must be CUDA");
+                   "reshape_and_cache: v_cache must be CUDA");
     CHECK_ARGUMENT(k_src->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "scatter_kv_cache_by_slots_device_indices: k_src must be CUDA");
+                   "reshape_and_cache: k_src must be CUDA");
     CHECK_ARGUMENT(v_src->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "scatter_kv_cache_by_slots_device_indices: v_src must be CUDA");
+                   "reshape_and_cache: v_src must be CUDA");
     CHECK_ARGUMENT(k_cache->dtype() == k_src->dtype(),
-                   "scatter_kv_cache_by_slots_device_indices: k dtype mismatch");
+                   "reshape_and_cache: k dtype mismatch");
     CHECK_ARGUMENT(v_cache->dtype() == v_src->dtype(),
-                   "scatter_kv_cache_by_slots_device_indices: v dtype mismatch");
+                   "reshape_and_cache: v dtype mismatch");
     CHECK_ARGUMENT(k_cache->shape()[1] == k_src->shape()[1] && k_cache->shape()[2] == k_src->shape()[2],
-                   "scatter_kv_cache_by_slots_device_indices: k shape mismatch");
+                   "reshape_and_cache: k shape mismatch");
     CHECK_ARGUMENT(v_cache->shape()[1] == v_src->shape()[1] && v_cache->shape()[2] == v_src->shape()[2],
-                   "scatter_kv_cache_by_slots_device_indices: v shape mismatch");
-    CHECK_ARGUMENT(slot_idxs_i32 != nullptr, "scatter_kv_cache_by_slots_device_indices: slot idx tensor is null");
+                   "reshape_and_cache: v shape mismatch");
+    CHECK_ARGUMENT(slot_idxs_i32 != nullptr, "reshape_and_cache: slot idx tensor is null");
     CHECK_ARGUMENT(slot_idxs_i32->dtype() == LLAISYS_DTYPE_I32,
-                   "scatter_kv_cache_by_slots_device_indices: slot idx dtype must be I32");
+                   "reshape_and_cache: slot idx dtype must be I32");
     CHECK_ARGUMENT(slot_idxs_i32->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "scatter_kv_cache_by_slots_device_indices: slot idx must be CUDA");
+                   "reshape_and_cache: slot idx must be CUDA");
     CHECK_ARGUMENT(slot_idxs_i32->shape().size() == 1,
-                   "scatter_kv_cache_by_slots_device_indices: slot idx must be 1D");
+                   "reshape_and_cache: slot idx must be 1D");
     CHECK_ARGUMENT(slot_idxs_i32->shape()[0] == k_src->shape()[0],
-                   "scatter_kv_cache_by_slots_device_indices: slot idx length mismatch");
+                   "reshape_and_cache: slot idx length mismatch");
 
     const int32_t *slot_ptr = reinterpret_cast<const int32_t *>(slot_idxs_i32->data());
     switch (k_src->dtype()) {
@@ -1203,11 +1045,15 @@ void dispatch_attention_with_backend(tensor_t attn_val,
                                      tensor_t q,
                                      tensor_t k_cache,
                                      tensor_t v_cache,
-                                     const CommonAttentionMetadata &prepared,
+                                     const CommonAttentionMetadata &metadata,
                                      PagedAttentionBackend backend,
                                      int32_t block_table_width,
                                      int32_t block_size,
                                      float scale) {
+    CHECK_ARGUMENT(metadata.q_seq_rows != nullptr && metadata.q_pos != nullptr && metadata.block_tables != nullptr &&
+                       metadata.seq_lens != nullptr,
+                   "dispatch_attention_with_backend: metadata tensors must be non-null");
+    const CommonAttentionMetadata &prepared = metadata;
     if (backend == PagedAttentionBackend::FLASHINFER) {
         // Stage-1 FlashInfer migration scaffold: keep behavior stable via native fallback
         // while preserving a dedicated backend switch point for later real integration.
@@ -1236,10 +1082,10 @@ void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
                           tensor_t v_cache,
-                          const std::vector<int32_t> &q_seq_rows,
-                          const std::vector<int32_t> &q_pos,
-                          const std::vector<int32_t> &block_tables,
-                          const std::vector<int32_t> &seq_lens,
+                          tensor_t q_seq_rows,
+                          tensor_t q_pos,
+                          tensor_t block_tables,
+                          tensor_t seq_lens,
                           int32_t block_table_width,
                           int32_t block_size,
                           float scale) {
@@ -1251,15 +1097,20 @@ void self_attention_paged(tensor_t attn_val,
     if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
         return;
     }
-    if (q_seq_rows.empty() || q_pos.empty() || block_tables.empty() || seq_lens.empty()) {
+    if (q_seq_rows == nullptr || q_pos == nullptr || block_tables == nullptr || seq_lens == nullptr) {
         return;
     }
 
-    // Compatibility path: keep one-shot API by preparing metadata internally.
-    static thread_local CommonAttentionMetadata prepared{};
-    build_attn_metadata(prepared, q_seq_rows, q_pos, block_tables, seq_lens, block_size);
-    dispatch_attention_with_backend(
-        attn_val, q, k_cache, v_cache, prepared, PagedAttentionBackend::NATIVE, block_table_width, block_size, scale);
+    CHECK_ARGUMENT(q_seq_rows->deviceType() == LLAISYS_DEVICE_NVIDIA && q_pos->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       block_tables->deviceType() == LLAISYS_DEVICE_NVIDIA && seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA,
+                   "self_attention_paged: metadata tensors must be CUDA");
+    CommonAttentionMetadata prepared{
+        reinterpret_cast<const int32_t *>(q_seq_rows->data()),
+        reinterpret_cast<const int32_t *>(q_pos->data()),
+        reinterpret_cast<const int32_t *>(block_tables->data()),
+        reinterpret_cast<const int32_t *>(seq_lens->data()),
+        static_cast<int32_t>(seq_lens->shape()[0])};
+    self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
 }
 
 } // namespace llaisys::ops::cuda

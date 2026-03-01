@@ -52,7 +52,7 @@ void OutputBuffer::reserve_rows(size_t n_rows) {
     sampled_ids_.reserve(n_rows);
 }
 
-void OutputBuffer::append_row(const std::byte *row, llaisysDataType_t dtype, int32_t output_id) {
+void OutputBuffer::append_row(const std::byte *row, llaisysDataType_t dtype, int64_t output_id) {
     ASSERT(row != nullptr, "output: row must not be null");
     const size_t old = logits_f32_.size();
     logits_f32_.resize(old + voc_);
@@ -60,7 +60,7 @@ void OutputBuffer::append_row(const std::byte *row, llaisysDataType_t dtype, int
     output_ids_.push_back(output_id);
 }
 
-void OutputBuffer::append_output_id(int32_t output_id) {
+void OutputBuffer::append_output_id(int64_t output_id) {
     output_ids_.push_back(output_id);
 }
 
@@ -80,15 +80,15 @@ int32_t OutputBuffer::n_outputs() const noexcept {
     return static_cast<int32_t>(output_ids_.size());
 }
 
-const int32_t *OutputBuffer::output_ids() const noexcept {
+const int64_t *OutputBuffer::output_ids() const noexcept {
     return output_ids_.empty() ? nullptr : output_ids_.data();
 }
 
-void OutputBuffer::append_sampled_id(int32_t sampled_id) {
+void OutputBuffer::append_sampled_id(int64_t sampled_id) {
     sampled_ids_.push_back(sampled_id);
 }
 
-const int32_t *OutputBuffer::sampled_ids() const noexcept {
+const int64_t *OutputBuffer::sampled_ids() const noexcept {
     return sampled_ids_.empty() ? nullptr : sampled_ids_.data();
 }
 

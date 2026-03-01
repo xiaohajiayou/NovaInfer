@@ -37,6 +37,7 @@ jobs:
     
     - name: Xmake Build & Install
       run: | 
+        xmake f --mode=release
         xmake
         xmake install
     
@@ -116,4 +117,4 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       shell: bash
       run: |
-        python -m pytest -q test/online/test_online_real_model_multisession.py --model-path "$CI_MODEL_DIR"
+        python -m pytest -q test/online/test_online_real_model_multisession.py --model-path "$CI_MODEL_DIR" --device cpu --layout block --backend native

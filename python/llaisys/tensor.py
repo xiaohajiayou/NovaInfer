@@ -8,7 +8,19 @@ from .libllaisys import (
     llaisysDataType_t,
     DataType,
 )
-from ctypes import c_size_t, c_int, c_ssize_t, c_void_p
+from ctypes import (
+    POINTER,
+    c_double,
+    c_float,
+    c_int,
+    c_int8,
+    c_int32,
+    c_int64,
+    c_size_t,
+    c_ssize_t,
+    c_void_p,
+    cast,
+)
 
 
 class Tensor:
@@ -75,6 +87,25 @@ class Tensor:
     def load(self, data: c_void_p):
         LIB_LLAISYS.tensorLoad(self._tensor, data)
 
+    def copy_from_sequence(self, values: Sequence[int | float]) -> None:
+        n = len(values)
+        if n <= 0:
+            return
+        dtype = self.dtype()
+        if dtype == DataType.I64:
+            buf = (c_int64 * n)(*[int(x) for x in values])
+        elif dtype == DataType.I32:
+            buf = (c_int32 * n)(*[int(x) for x in values])
+        elif dtype == DataType.I8:
+            buf = (c_int8 * n)(*[int(x) for x in values])
+        elif dtype == DataType.F32:
+            buf = (c_float * n)(*[float(x) for x in values])
+        elif dtype == DataType.F64:
+            buf = (c_double * n)(*[float(x) for x in values])
+        else:
+            raise RuntimeError(f"copy_from_sequence() unsupported dtype: {dtype}")
+        self.load(cast(buf, c_void_p))
+
     def is_contiguous(self) -> bool:
         return bool(LIB_LLAISYS.tensorIsContiguous(self._tensor))
 
@@ -111,3 +142,31 @@ class Tensor:
                 self._tensor, llaisysDeviceType_t(device), c_int(device_id)
             )
         )
+
+    def tolist(self):
+        if self.device_type() != DeviceType.CPU:
+            raise RuntimeError("tolist() requires CPU tensor; call to(DeviceType.CPU) first")
+        shape = self.shape()
+        if len(shape) != 1:
+            raise RuntimeError("tolist() currently supports only 1D tensors")
+        n = int(shape[0])
+        if n <= 0:
+            return []
+
+        dtype = self.dtype()
+        if dtype == DataType.I64:
+            ptr = cast(self.data_ptr(), POINTER(c_int64))
+            return [int(ptr[i]) for i in range(n)]
+        if dtype == DataType.I32:
+            ptr = cast(self.data_ptr(), POINTER(c_int32))
+            return [int(ptr[i]) for i in range(n)]
+        if dtype == DataType.I8:
+            ptr = cast(self.data_ptr(), POINTER(c_int8))
+            return [int(ptr[i]) for i in range(n)]
+        if dtype == DataType.F32:
+            ptr = cast(self.data_ptr(), POINTER(c_float))
+            return [float(ptr[i]) for i in range(n)]
+        if dtype == DataType.F64:
+            ptr = cast(self.data_ptr(), POINTER(c_double))
+            return [float(ptr[i]) for i in range(n)]
+        raise RuntimeError(f"tolist() unsupported dtype: {dtype}")

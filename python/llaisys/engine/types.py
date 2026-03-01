@@ -58,6 +58,8 @@ class BatchPlan:
     has_seeds: Optional[List[int]] = None
     pos_ids: Optional[List[int]] = None
     seq_ids: Optional[List[int]] = None
+    q_seq_rows: Optional[List[int]] = None
+    q_pos: Optional[List[int]] = None
     slot_mapping: Optional[List[int]] = None
     context_lens: Optional[List[int]] = None
     batch_seq_ids: Optional[List[int]] = None

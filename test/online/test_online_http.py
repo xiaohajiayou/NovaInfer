@@ -3,46 +3,27 @@ from __future__ import annotations
 import json
 import urllib.request
 
-import numpy as np
 import pytest
 
 from llaisys.engine.llm_engine import LLMEngine
+from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.http_server import LlaisysHTTPServer
 from llaisys.server.openai_server import OpenAIServer
+from test.utils.dummy_model_runner import DummyModelRunner
 
 # Disable environment proxy for localhost tests; CI/dev shells may inject HTTP_PROXY.
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-class DummyRunner:
-    def __init__(self):
-        self.max_seq_len = 64
-        self.end_token_id = 4
-
-    def decode_batch(self, token_ids, pos_ids=None, seq_ids=None, logits_mask=None):
-        if logits_mask is None:
-            logits_mask = [0] * len(token_ids)
-            logits_mask[-1] = 1
-
-        out_ids = []
-        rows = []
-        for i, tok in enumerate(token_ids):
-            if int(logits_mask[i]) == 0:
-                continue
-            out_ids.append(i)
-            row = np.zeros((8,), dtype=np.float32)
-            nxt = (int(tok) + 1) % 8
-            row[nxt] = 1.0
-            rows.append(row)
-        return out_ids, rows
-
-    def decode_tokens(self, token_ids):
-        return "".join(chr(ord("a") + int(t)) for t in token_ids)
+class DummyRunner(DummyModelRunner):
+    pass
 
 
 def _start_http_server() -> LlaisysHTTPServer:
-    engine = LLMEngine(model_runner=DummyRunner())
+    engine = LLMEngine(
+        model_runner=DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    )
     async_engine = AsyncLLMEngine(engine=engine)
     server = OpenAIServer(async_engine)
     http = LlaisysHTTPServer(server, host="127.0.0.1", port=0)

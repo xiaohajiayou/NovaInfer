@@ -533,14 +533,26 @@ void self_attention_paged(tensor_t attn_val,
         tensor_t q,
         tensor_t k_cache,
         tensor_t v_cache,
-        const std::vector<int32_t>& q_seq_rows,
-        const std::vector<int32_t>& q_pos,
-        const std::vector<int32_t>& block_tables,
-        const std::vector<int32_t>& seq_lens,
+        tensor_t q_seq_rows_t,
+        tensor_t q_pos_t,
+        tensor_t block_tables_t,
+        tensor_t seq_lens_t,
         int32_t block_table_width,
         int32_t block_size,
         float scale) {
     CHECK_SAME_DEVICE(attn_val, q, k_cache, v_cache);
+    ASSERT(q_seq_rows_t != nullptr && q_pos_t != nullptr && block_tables_t != nullptr && seq_lens_t != nullptr,
+           "self_attention_paged: metadata tensors must be non-null");
+    ASSERT(q_seq_rows_t->deviceType() == LLAISYS_DEVICE_CPU && q_pos_t->deviceType() == LLAISYS_DEVICE_CPU &&
+               block_tables_t->deviceType() == LLAISYS_DEVICE_CPU && seq_lens_t->deviceType() == LLAISYS_DEVICE_CPU,
+           "self_attention_paged: metadata tensors must be CPU");
+    ASSERT(q_seq_rows_t->dtype() == LLAISYS_DTYPE_I32 && q_pos_t->dtype() == LLAISYS_DTYPE_I32 &&
+               block_tables_t->dtype() == LLAISYS_DTYPE_I32 && seq_lens_t->dtype() == LLAISYS_DTYPE_I32,
+           "self_attention_paged: metadata dtype must be I32");
+    ASSERT(q_seq_rows_t->ndim() == 1 && q_pos_t->ndim() == 1 && block_tables_t->ndim() == 1 && seq_lens_t->ndim() == 1,
+           "self_attention_paged: metadata tensors must be 1-D");
+    ASSERT(q_seq_rows_t->isContiguous() && q_pos_t->isContiguous() && block_tables_t->isContiguous() && seq_lens_t->isContiguous(),
+           "self_attention_paged: metadata tensors must be contiguous");
 
     ASSERT(attn_val->isContiguous() && q->isContiguous() &&
     k_cache->isContiguous() && v_cache->isContiguous(),
@@ -563,11 +575,17 @@ void self_attention_paged(tensor_t attn_val,
 
     ASSERT(block_table_width > 0, "self_attention_paged: block_table_width must be > 0");
     ASSERT(block_size > 0, "self_attention_paged: block_size must be > 0");
-    ASSERT(q_seq_rows.size() == seqlen, "self_attention_paged: q_seq_rows size mismatch");
-    ASSERT(q_pos.size() == seqlen, "self_attention_paged: q_pos size mismatch");
-    ASSERT(!seq_lens.empty(), "self_attention_paged: seq_lens must be non-empty");
-    ASSERT(block_tables.size() == seq_lens.size() * static_cast<size_t>(block_table_width),
+    ASSERT(q_seq_rows_t->shape()[0] == seqlen, "self_attention_paged: q_seq_rows size mismatch");
+    ASSERT(q_pos_t->shape()[0] == seqlen, "self_attention_paged: q_pos size mismatch");
+    ASSERT(seq_lens_t->shape()[0] > 0, "self_attention_paged: seq_lens must be non-empty");
+    ASSERT(block_tables_t->shape()[0] == seq_lens_t->shape()[0] * static_cast<size_t>(block_table_width),
            "self_attention_paged: block_tables size mismatch");
+
+    const auto *q_seq_rows = reinterpret_cast<const int32_t *>(q_seq_rows_t->data());
+    const auto *q_pos = reinterpret_cast<const int32_t *>(q_pos_t->data());
+    const auto *block_tables = reinterpret_cast<const int32_t *>(block_tables_t->data());
+    const auto *seq_lens = reinterpret_cast<const int32_t *>(seq_lens_t->data());
+    const int32_t nseq = static_cast<int32_t>(seq_lens_t->shape()[0]);
 
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
@@ -576,11 +594,11 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const float*>(q->data()),
             reinterpret_cast<const float*>(k_cache->data()),
             reinterpret_cast<const float*>(v_cache->data()),
-            q_seq_rows.data(),
-            q_pos.data(),
-            block_tables.data(),
-            seq_lens.data(),
-            static_cast<int32_t>(seq_lens.size()),
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            nseq,
             block_table_width,
             block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);
@@ -590,11 +608,11 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::bf16_t*>(q->data()),
             reinterpret_cast<const llaisys::bf16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::bf16_t*>(v_cache->data()),
-            q_seq_rows.data(),
-            q_pos.data(),
-            block_tables.data(),
-            seq_lens.data(),
-            static_cast<int32_t>(seq_lens.size()),
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            nseq,
             block_table_width,
             block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);
@@ -604,11 +622,11 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::fp16_t*>(q->data()),
             reinterpret_cast<const llaisys::fp16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::fp16_t*>(v_cache->data()),
-            q_seq_rows.data(),
-            q_pos.data(),
-            block_tables.data(),
-            seq_lens.data(),
-            static_cast<int32_t>(seq_lens.size()),
+            q_seq_rows,
+            q_pos,
+            block_tables,
+            seq_lens,
+            nseq,
             block_table_width,
             block_size,
             seqlen, nslot, nhead, nkvhead, head_dim, scale);

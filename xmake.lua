@@ -116,6 +116,10 @@ target("llaisys")
     set_warnings("all", "error")
     if not is_plat("windows") then
         add_ldflags("-fopenmp")
+        add_shflags(
+            "-Wl,--export-dynamic-symbol=llaisysModelForward",
+            "-Wl,--export-dynamic-symbol=llaisysSamplerSample"
+        )
         add_syslinks("gomp")
     end
     add_files("src/llaisys/*.cc")

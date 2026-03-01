@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
 from test.parity.backend_matrix import parity_device_backend_layout_cases
-from llaisys.libllaisys import LIB_LLAISYS
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
+from test.utils.forward_api import run_model_forward, sample_from_forward
 
 
 def _has_nvidia_runtime() -> bool:
@@ -48,7 +47,18 @@ def _torch_device(device_name: str):
     raise ValueError(f"Unsupported device: {device_name}")
 
 
-def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask, *, is_block_layout=False, block_state=None, block_size=16):
+def _decode_batch(
+    model_handle,
+    tokens,
+    seq_ids,
+    poss,
+    logits_mask,
+    *,
+    device,
+    is_block_layout=False,
+    block_state=None,
+    block_size=16,
+):
     built = build_decode_batch(
         tokens,
         logits_mask=logits_mask,
@@ -58,23 +68,13 @@ def _decode_batch(model_handle, tokens, seq_ids, poss, logits_mask, *, is_block_
         block_size=block_size,
         block_state=block_state,
     )
-    status = int(LIB_LLAISYS.llaisysModelDecode(model_handle, built.batch))
-    if status != 0:
-        raise RuntimeError(f"llaisysModelDecode failed with status={status}")
-
-    n_outputs = int(LIB_LLAISYS.llaisysModelNOutputs(model_handle))
-    if n_outputs == 0:
+    out = run_model_forward(model_handle, built, device=device)
+    if out.status != 0:
+        raise RuntimeError(f"llaisysModelForward failed with status={out.status}")
+    if out.n_outputs == 0:
         return [], []
-    output_ids = (
-        np.ctypeslib.as_array(LIB_LLAISYS.llaisysModelOutputIds(model_handle), shape=(n_outputs,))
-        .astype(np.int64)
-        .tolist()
-    )
-    sampled_ptr = LIB_LLAISYS.llaisysModelSampledIds(model_handle)
-    if not sampled_ptr:
-        raise RuntimeError("llaisysModelSampledIds returned null pointer")
-    sampled_ids = np.ctypeslib.as_array(sampled_ptr, shape=(n_outputs,)).astype(np.int64).tolist()
-    return output_ids, sampled_ids
+    sampled_ids = sample_from_forward(out, device=device)
+    return [int(x) for x in out.output_ids], [int(x) for x in sampled_ids]
 
 
 def _hf_generate_batch(model, prompt_ids, max_new_tokens):
@@ -112,6 +112,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
     seq_ids = [1000 + i for i in range(len(prompt_ids))]
     generated = [[] for _ in range(len(prompt_ids))]
     handle = llaisys_model._model
+    device = getattr(llaisys_model, "_device", llaisys.DeviceType.CPU)
     is_block_layout = int(llaisys_model._kv_cache_layout) == int(KvCacheLayout.BLOCK)
     block_size = int(getattr(llaisys_model, "_kv_cache_block_size", 16))
     block_state = BlockBatchState()
@@ -136,6 +137,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
             bseq,
             bpos,
             blogits,
+            device=device,
             is_block_layout=is_block_layout,
             block_state=block_state,
             block_size=block_size,
@@ -165,6 +167,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
             bseq,
             bpos,
             blogits,
+            device=device,
             is_block_layout=is_block_layout,
             block_state=block_state,
             block_size=block_size,

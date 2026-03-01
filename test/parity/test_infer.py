@@ -12,6 +12,7 @@ from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
+from test.utils.forward_api import run_model_forward, sample_from_forward
 
 
 def _has_nvidia_runtime() -> bool:
@@ -80,7 +81,7 @@ def hf_infer(
 def llaisys_model_runner_infer(
     prompt,
     tokenizer,
-    model_runner,
+    model_wrapper,
     max_new_tokens=128,
     top_p=0.8,
     top_k=50,
@@ -94,8 +95,10 @@ def llaisys_model_runner_infer(
     )
     input_tokens = tokenizer.encode(input_content)
     output_tokens = [int(t) for t in input_tokens]
-    is_block_layout = int(model_runner._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-    block_size = int(getattr(model_runner, "_kv_cache_block_size", 16))
+    is_block_layout = int(model_wrapper._kv_cache_layout) == int(KvCacheLayout.BLOCK)
+    block_size = int(getattr(model_wrapper, "_kv_cache_block_size", 16))
+    device = getattr(model_wrapper, "_device", llaisys.DeviceType.CPU)
+    model_handle = model_wrapper._model
     block_state = BlockBatchState()
     seq_id = 0
 
@@ -111,27 +114,26 @@ def llaisys_model_runner_infer(
             block_size=block_size,
             block_state=block_state,
         )
-        n_batch_seq = int(built.batch.n_batch_seq)
-        width = int(built.batch.block_table_width)
-        slot_mapping = [int(built.batch.slot_mapping[i]) for i in range(n)]
-        context_lens = [int(built.batch.context_lens[i]) for i in range(n_batch_seq)]
-        batch_seq_ids = [int(built.batch.batch_seq_ids[i]) for i in range(n_batch_seq)]
-        block_tables = [int(built.batch.block_tables[i]) for i in range(n_batch_seq * width)]
-        return model_runner.decode_batch(
-            token_ids=token_batch,
-            pos_ids=pos_ids,
-            seq_ids=[seq_id] * n,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            batch_seq_ids=batch_seq_ids,
-            block_tables=block_tables,
-            block_table_width=width,
-        )
+        out = run_model_forward(model_handle, built, device=device)
+        if out.status != 0:
+            raise RuntimeError(f"modelForward failed with status={out.status}")
+        sampled_ids = sample_from_forward(out, device=device)
+        return out.output_ids, sampled_ids
 
     if is_block_layout:
         _, sampled_ids = _decode_block(input_tokens, pos_start=0)
     else:
-        _, sampled_ids = model_runner.decode_batch(token_ids=input_tokens)
+        built = build_decode_batch(
+            input_tokens,
+            logits_mask=None,
+            seq_ids=[seq_id] * len(input_tokens),
+            pos_ids=[int(i) for i in range(len(input_tokens))],
+            layout=KvCacheLayout.SLOT,
+        )
+        out = run_model_forward(model_handle, built, device=device)
+        if out.status != 0:
+            raise RuntimeError(f"modelForward failed with status={out.status}")
+        sampled_ids = sample_from_forward(out, device=device)
     if not sampled_ids:
         raise RuntimeError("ModelRunner prefill returned no sampled ids")
 
@@ -140,18 +142,28 @@ def llaisys_model_runner_infer(
     decode_pos = len(input_tokens)
 
     for _ in range(max(0, int(max_new_tokens) - 1)):
-        if next_token == int(model_runner.end_token_id):
+        if next_token == int(model_wrapper.end_token_id):
             break
         if is_block_layout:
             _, sampled_ids = _decode_block([next_token], pos_start=decode_pos)
         else:
-            _, sampled_ids = model_runner.decode_batch(token_ids=[next_token])
+            built = build_decode_batch(
+                [next_token],
+                logits_mask=None,
+                seq_ids=[seq_id],
+                pos_ids=[decode_pos],
+                layout=KvCacheLayout.SLOT,
+            )
+            out = run_model_forward(model_handle, built, device=device)
+            if out.status != 0:
+                raise RuntimeError(f"modelForward failed with status={out.status}")
+            sampled_ids = sample_from_forward(out, device=device)
         if not sampled_ids:
             raise RuntimeError("ModelRunner decode returned no sampled ids")
         next_token = int(sampled_ids[-1])
         output_tokens.append(next_token)
         decode_pos += 1
-        if next_token == int(model_runner.end_token_id):
+        if next_token == int(model_wrapper.end_token_id):
             break
     return output_tokens
 
