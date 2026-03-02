@@ -260,7 +260,6 @@ def sample_from_forward(result: ForwardRunResult, *, device: DeviceType = Device
     sampler = Sampler(device)
     sampled = sampler.sample_tokens(
         logits_tensor=result.logits_tensor,
-        output_ids=result.output_ids_tensor,
     )
     if sampled is None:
         return []

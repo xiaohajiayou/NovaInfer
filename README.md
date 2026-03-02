@@ -167,7 +167,7 @@ CPU (Linux):
 
 ```bash
 xmake f --mode=release --nv-gpu=n
-xmake -j
+xmake -j1
 xmake install
 ```
 
@@ -175,7 +175,7 @@ NVIDIA CUDA:
 
 ```bash
 xmake f --mode=release --nv-gpu=y
-xmake -j
+xmake -j1
 xmake install
 ```
 
@@ -184,7 +184,7 @@ NVIDIA CUDA + cuDNN frontend (for `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`):
 ```bash
 git submodule update --init --recursive
 xmake f --mode=release --nv-gpu=y --nv-cudnn=y
-xmake -j
+xmake -j1
 xmake install
 ```
 

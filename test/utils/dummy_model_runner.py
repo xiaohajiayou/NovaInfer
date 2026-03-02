@@ -23,11 +23,6 @@ class DummyModelRunner:
     def request_free_calls(self) -> list[int]:
         return list(self._request_free_calls)
 
-    def _to_i64_tensor(self, values: list[int]) -> llaisys.Tensor:
-        t = llaisys.Tensor((len(values),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-        t.copy_from_sequence(values)
-        return t
-
     def _prepare_model_input(
         self,
         outputs: SchedulerOutputs,
@@ -147,13 +142,17 @@ class DummyModelRunner:
             return None, None, None, {}
         output_ids = [i for i, m in enumerate(plan.logits_mask) if int(m) != 0]
         self.on_plan(plan)
-        return self._to_i64_tensor(output_ids), None, plan, token_idx_to_req_id
+        out = llaisys.Tensor((len(output_ids),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        out.copy_from_sequence(output_ids)
+        return out, None, plan, token_idx_to_req_id
 
-    def sample_tokens(self, output_ids, logits_tensor, plan: BatchPlan):
+    def sample_tokens(self, logits_tensor, plan: BatchPlan):
         _ = logits_tensor
-        out_ids = [int(x) for x in output_ids.tolist()]
-        sampled = [(int(plan.token_ids[i]) + 1) % int(self.vocab_size) for i in out_ids]
-        return self._to_i64_tensor(sampled)
+        output_ids = [i for i, m in enumerate(plan.logits_mask) if int(m) != 0]
+        sampled = [(int(plan.token_ids[i]) + 1) % int(self.vocab_size) for i in output_ids]
+        out = llaisys.Tensor((len(sampled),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+        out.copy_from_sequence(sampled)
+        return out
 
     def execute_step(
         self,
@@ -168,7 +167,7 @@ class DummyModelRunner:
         )
         if output_ids is None or plan is None:
             return None, None, {}
-        sampled = self.sample_tokens(output_ids, logits_tensor, plan)
+        sampled = self.sample_tokens(logits_tensor, plan)
         return output_ids, sampled, token_idx_to_req_id
 
     def decode_tokens(self, token_ids):

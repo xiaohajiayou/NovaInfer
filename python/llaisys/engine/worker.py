@@ -114,8 +114,8 @@ class Worker:
             sampling_params_by_req=sampling_params_by_req,
         )
 
-    def sample_tokens(self, output_ids, logits_handle, plan):
-        return self._model_runner.sample_tokens(output_ids, logits_handle, plan)
+    def sample_tokens(self, logits_handle, plan):
+        return self._model_runner.sample_tokens(logits_handle, plan)
 
     def execute(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
         return self._model_runner.execute_step(

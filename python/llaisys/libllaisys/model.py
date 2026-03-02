@@ -80,7 +80,6 @@ class ModelForwardOutput(Structure):
 class SamplerInput(Structure):
     _fields_ = [
         ("logits", llaisysTensor_t),
-        ("output_ids", llaisysTensor_t),
         ("temperatures", llaisysTensor_t),
         ("top_ps", llaisysTensor_t),
         ("top_ks", llaisysTensor_t),
