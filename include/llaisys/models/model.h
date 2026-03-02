@@ -57,16 +57,14 @@ __C {
     };
 
     struct ModelForwardInput {
-        llaisysTensor_t input_ids;   // [n_tokens], i64
-        llaisysTensor_t pos_ids;     // [n_tokens], i64 (BLOCK required)
-        llaisysTensor_t logits_mask; // [n_tokens], i8
+        llaisysTensor_t input_ids;      // [n_tokens], i64
+        llaisysTensor_t pos_ids;        // [n_tokens], i64 (BLOCK required)
+        llaisysTensor_t logits_indices; // [n_logits], i64; rows selected for logits
         struct AttentionMetadata attention;
     };
 
     struct ModelForwardOutput {
-        llaisysTensor_t output_ids; // [n_outputs], i64
-        llaisysTensor_t logits;     // optional [n_outputs, vocab], f32
-        int32_t n_outputs;          // number of valid rows in output_ids/logits
+        llaisysTensor_t logits; // [n_logits, vocab], f32
     };
 
     struct SamplerInput {
@@ -85,8 +83,7 @@ __C {
     struct LlaisysModel;
     struct LlaisysRuntime;
 
-    __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params,
-                                                     struct LlaisysRuntime *runtime);
+    __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params);
     __export void llaisysModelDestroy(struct LlaisysModel *model);
     __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
     __export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntimeCreateParams *params);
@@ -111,9 +108,11 @@ __C {
     // -1  invalid input
     // < -1 internal error
     __export int32_t llaisysModelForward(struct LlaisysModel *model,
+                                         struct LlaisysRuntime *runtime,
                                          const struct ModelForwardInput *input,
                                          struct ModelForwardOutput *output);
-    __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
+    __export int32_t llaisysSamplerSample(struct LlaisysRuntime *runtime,
+                                          const struct SamplerInput *input,
                                           struct SamplerOutput *output);
 
     // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):

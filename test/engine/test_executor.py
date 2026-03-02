@@ -9,7 +9,10 @@ from llaisys.engine.types import SamplingParams
 
 
 class DummyWorker:
-    def execute(self, outputs, sampling_params=None, sampling_params_by_req=None):
+    def __init__(self):
+        self._result = None
+
+    def execute_model(self, outputs, sampling_params=None, sampling_params_by_req=None):
         _ = outputs
         _ = sampling_params
         _ = sampling_params_by_req
@@ -18,7 +21,12 @@ class DummyWorker:
         output_ids.copy_from_sequence([1, 0])
         sampled_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         sampled_ids.copy_from_sequence([22, 11])
-        return output_ids, sampled_ids, {1: "req-2", 0: "req-1"}
+        self._result = (output_ids, sampled_ids, {1: "req-2", 0: "req-1"})
+        return None
+
+    def sample_tokens(self, grammar_output=None):
+        _ = grammar_output
+        return self._result
 
 
 class CaptureWorker:
@@ -26,8 +34,9 @@ class CaptureWorker:
         self.last_outputs = None
         self.last_sampling_params = None
         self.last_sampling_params_by_req = None
+        self._result = None
 
-    def execute(self, outputs, sampling_params=None, sampling_params_by_req=None):
+    def execute_model(self, outputs, sampling_params=None, sampling_params_by_req=None):
         self.last_outputs = outputs
         self.last_sampling_params = sampling_params
         self.last_sampling_params_by_req = sampling_params_by_req
@@ -35,7 +44,12 @@ class CaptureWorker:
         output_ids.copy_from_sequence([1])
         sampled_ids = llaisys.Tensor((1,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         sampled_ids.copy_from_sequence([7])
-        return output_ids, sampled_ids, {1: "req-1"}
+        self._result = (output_ids, sampled_ids, {1: "req-1"})
+        return None
+
+    def sample_tokens(self, grammar_output=None):
+        _ = grammar_output
+        return self._result
 
 
 def test_executor_uses_per_request_sampling_params_in_output_order():

@@ -19,7 +19,7 @@ def _create_model(meta: TinyMeta = TinyMeta(maxseq=32)):
     )
 
 
-def _forward(model, *, tokens, logits_mask, seq_ids=None, pos=None, block_state: BlockBatchState | None = None):
+def _forward(runtime, model, *, tokens, logits_mask, seq_ids=None, pos=None, block_state: BlockBatchState | None = None):
     built = build_decode_batch(
         tokens,
         logits_mask=logits_mask,
@@ -29,13 +29,13 @@ def _forward(model, *, tokens, logits_mask, seq_ids=None, pos=None, block_state:
         block_size=TEST_KV_BLOCK_SIZE,
         block_state=block_state,
     )
-    return run_model_forward(model, built, device=llaisys.DeviceType.CPU)
+    return run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)
 
 
 def test_single_seq_decode_mask():
     runtime, model, _ = _create_model()
     try:
-        out = _forward(model, tokens=[1, 2, 3], logits_mask=[0, 1, 1])
+        out = _forward(runtime, model, tokens=[1, 2, 3], logits_mask=[0, 1, 1])
         assert out.status == 0
         assert out.n_outputs == 2
         assert out.output_ids == [1, 2]
@@ -48,6 +48,7 @@ def test_multi_seq_interleaved_decode():
     try:
         block_state = BlockBatchState()
         out1 = _forward(
+            runtime,
             model,
             tokens=[10, 11, 12, 13],
             logits_mask=[1, 1, 1, 1],
@@ -65,6 +66,7 @@ def test_multi_seq_interleaved_decode():
         assert out1.output_ids == [0, 1, 2, 3]
 
         out2 = _forward(
+            runtime,
             model,
             tokens=[14, 15],
             logits_mask=[1, 1],
@@ -87,6 +89,7 @@ def test_multi_seq_set_decode():
     runtime, model, _ = _create_model()
     try:
         out = _forward(
+            runtime,
             model,
             tokens=[10, 11, 12],
             logits_mask=[1, 1, 1],

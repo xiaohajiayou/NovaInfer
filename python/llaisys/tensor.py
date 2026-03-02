@@ -5,6 +5,7 @@ from .libllaisys import (
     llaisysTensor_t,
     llaisysDeviceType_t,
     DeviceType,
+    MemcpyKind,
     llaisysDataType_t,
     DataType,
 )
@@ -24,6 +25,8 @@ from ctypes import (
 
 
 class Tensor:
+    _runtime_api_cache = {}
+
     def __init__(
         self,
         shape: Sequence[int] = None,
@@ -136,16 +139,184 @@ class Tensor:
             tensor=LIB_LLAISYS.tensorReshape(self._tensor, _shape, c_size_t(len(shape)))
         )
 
-    def to(self, device: DeviceType, device_id: int = -1):
-        return Tensor(
-            tensor=LIB_LLAISYS.tensorTo(
-                self._tensor, llaisysDeviceType_t(device), c_int(device_id)
-            )
-        )
+    def numel(self) -> int:
+        n = 1
+        for d in self.shape():
+            n *= int(d)
+        return int(n)
+
+    def nbytes(self) -> int:
+        dtype = self.dtype()
+        if dtype in (DataType.BOOL, DataType.BYTE, DataType.I8, DataType.U8):
+            return self.numel()
+        if dtype in (DataType.I16, DataType.U16, DataType.F16, DataType.BF16):
+            return self.numel() * 2
+        if dtype in (DataType.I32, DataType.U32, DataType.F32):
+            return self.numel() * 4
+        if dtype in (DataType.I64, DataType.U64, DataType.F64):
+            return self.numel() * 8
+        raise RuntimeError(f"nbytes() unsupported dtype: {dtype}")
+
+    @classmethod
+    def _runtime_api(cls, device_type: DeviceType):
+        api = cls._runtime_api_cache.get(device_type)
+        if api is not None:
+            return api
+        from .runtime import RuntimeAPI
+
+        api = RuntimeAPI(device_type)
+        cls._runtime_api_cache[device_type] = api
+        return api
+
+    @staticmethod
+    def _normalize_device(device, current_device: DeviceType, current_device_id: int) -> tuple[DeviceType, int]:
+        if device is None:
+            return current_device, current_device_id
+        if isinstance(device, DeviceType):
+            if device == current_device:
+                return device, current_device_id
+            return device, 0
+        if isinstance(device, str):
+            raw = device.strip().lower()
+            if raw.startswith("cuda"):
+                raw = raw.replace("cuda", "nvidia", 1)
+            if ":" in raw:
+                name, idx = raw.split(":", 1)
+                if name not in ("cpu", "nvidia"):
+                    raise RuntimeError(f"unsupported device string: {device}")
+                did = int(idx)
+                return (DeviceType.CPU if name == "cpu" else DeviceType.NVIDIA), did
+            if raw == "cpu":
+                return DeviceType.CPU, 0
+            if raw == "nvidia":
+                if current_device == DeviceType.NVIDIA:
+                    return DeviceType.NVIDIA, current_device_id
+                return DeviceType.NVIDIA, 0
+            raise RuntimeError(f"unsupported device string: {device}")
+        raise RuntimeError(f"unsupported device type: {type(device)}")
+
+    @staticmethod
+    def _normalize_dtype(dtype, current_dtype: DataType) -> DataType:
+        if dtype is None:
+            return current_dtype
+        if isinstance(dtype, DataType):
+            return dtype
+        if isinstance(dtype, str):
+            raw = dtype.strip().lower()
+            mapping = {
+                "float32": DataType.F32,
+                "f32": DataType.F32,
+                "float16": DataType.F16,
+                "f16": DataType.F16,
+                "bfloat16": DataType.BF16,
+                "bf16": DataType.BF16,
+                "int64": DataType.I64,
+                "i64": DataType.I64,
+                "int32": DataType.I32,
+                "i32": DataType.I32,
+                "int8": DataType.I8,
+                "i8": DataType.I8,
+                "float64": DataType.F64,
+                "f64": DataType.F64,
+            }
+            if raw in mapping:
+                return mapping[raw]
+        raise RuntimeError(f"unsupported dtype spec: {dtype}")
+
+    @staticmethod
+    def _looks_like_device_string(raw: str) -> bool:
+        v = raw.strip().lower()
+        if v.startswith("cuda"):
+            v = v.replace("cuda", "nvidia", 1)
+        if v in ("cpu", "nvidia"):
+            return True
+        if ":" in v:
+            head, tail = v.split(":", 1)
+            return head in ("cpu", "nvidia") and tail.isdigit()
+        return False
+
+    @staticmethod
+    def _infer_memcpy_kind(dst: DeviceType, src: DeviceType) -> MemcpyKind:
+        if dst == DeviceType.CPU and src == DeviceType.CPU:
+            return MemcpyKind.H2H
+        if dst == DeviceType.NVIDIA and src == DeviceType.CPU:
+            return MemcpyKind.H2D
+        if dst == DeviceType.CPU and src == DeviceType.NVIDIA:
+            return MemcpyKind.D2H
+        if dst == DeviceType.NVIDIA and src == DeviceType.NVIDIA:
+            return MemcpyKind.D2D
+        raise RuntimeError(f"unsupported memcpy route: {src} -> {dst}")
+
+    @classmethod
+    def _copy_tensor_bytes(cls, dst: "Tensor", src: "Tensor", non_blocking: bool) -> None:
+        del non_blocking
+        kind = cls._infer_memcpy_kind(dst.device_type(), src.device_type())
+        if dst.device_type() == DeviceType.NVIDIA or src.device_type() == DeviceType.NVIDIA:
+            api = cls._runtime_api(DeviceType.NVIDIA)
+            dev_id = dst.device_id() if dst.device_type() == DeviceType.NVIDIA else src.device_id()
+            api.set_device(dev_id)
+        else:
+            api = cls._runtime_api(DeviceType.CPU)
+        api.memcpy_sync(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind)
+
+    def clone(self) -> "Tensor":
+        out = Tensor(self.shape(), self.dtype(), self.device_type(), self.device_id())
+        out.copy_(self)
+        return out
+
+    def copy_(self, src: "Tensor", non_blocking: bool = False) -> "Tensor":
+        if not isinstance(src, Tensor):
+            raise RuntimeError("copy_ expects a Tensor source")
+        if self.shape() != src.shape():
+            raise RuntimeError("copy_ requires same shape")
+        if self.dtype() != src.dtype():
+            raise RuntimeError("copy_ requires same dtype")
+        self._copy_tensor_bytes(self, src, non_blocking)
+        return self
+
+    def to(
+        self,
+        device: DeviceType | DataType | str | None = None,
+        dtype: DataType | str | None = None,
+        non_blocking: bool = False,
+        copy: bool = False,
+    ) -> "Tensor":
+        if isinstance(dtype, int):
+            raise RuntimeError("Tensor.to(device_id) is not supported. Use device='nvidia:<id>' or device=DeviceType.NVIDIA.")
+
+        device_arg = device
+        dtype_arg = dtype
+        if isinstance(device, DataType):
+            if dtype is not None:
+                raise RuntimeError("Tensor.to() got both dtype in first arg and dtype keyword")
+            device_arg = None
+            dtype_arg = device
+        elif isinstance(device, str) and (not self._looks_like_device_string(device)):
+            if dtype is not None:
+                raise RuntimeError("Tensor.to() got ambiguous positional arg and dtype keyword")
+            device_arg = None
+            dtype_arg = device
+
+        cur_dev = self.device_type()
+        cur_dev_id = self.device_id()
+        cur_dtype = self.dtype()
+
+        dst_dev, dst_dev_id = self._normalize_device(device_arg, cur_dev, cur_dev_id)
+        dst_dtype = self._normalize_dtype(dtype_arg, cur_dtype)
+
+        if dst_dtype != cur_dtype:
+            raise RuntimeError("dtype conversion is not implemented yet in llaisys.Tensor.to")
+
+        if dst_dev == cur_dev and dst_dev_id == cur_dev_id:
+            return self.clone() if copy else self
+
+        out = Tensor(self.shape(), dst_dtype, dst_dev, dst_dev_id)
+        self._copy_tensor_bytes(out, self, non_blocking)
+        return out
 
     def tolist(self):
         if self.device_type() != DeviceType.CPU:
-            raise RuntimeError("tolist() requires CPU tensor; call to(DeviceType.CPU) first")
+            raise RuntimeError("tolist() requires CPU tensor; call to(device=DeviceType.CPU) first")
         shape = self.shape()
         if len(shape) != 1:
             raise RuntimeError("tolist() currently supports only 1D tensors")

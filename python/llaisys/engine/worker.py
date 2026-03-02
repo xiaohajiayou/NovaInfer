@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from ..libllaisys import DeviceType
 from ..libllaisys.model import KvCacheLayout
@@ -51,17 +52,38 @@ class Worker:
         self._kv_cache_auto_capacity = bool(cfg.kv_cache_auto_capacity)
         self._kv_cache_memory_utilization = float(cfg.kv_cache_memory_utilization)
         self._model_registry = model_registry if model_registry is not None else create_default_registry()
-        runner_obj = model_runner if model_runner is not None else self._create_model_wrapper()
+        runtime_handle = None
+        runner_obj = model_runner
+        if runner_obj is None:
+            runtime_handle, runtime_info = self._create_runtime()
+            try:
+                runner_obj = self._create_model_wrapper(runtime_info=runtime_info)
+            except Exception:
+                if runtime_handle is not None:
+                    from ..libllaisys import LIB_LLAISYS
+
+                    LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+                raise
+            if runtime_info:
+                self._max_model_len = int(runtime_info.get("max_model_len", self._max_model_len or 0)) or self._max_model_len
+                self._kv_cache_capacity_tokens = int(
+                    runtime_info.get("kv_cache_capacity_tokens", self._kv_cache_capacity_tokens or 0)
+                ) or self._kv_cache_capacity_tokens
         if hasattr(runner_obj, "execute_model") and hasattr(runner_obj, "sample_tokens"):
             self._model_runner = runner_obj
         else:
-            self._model_runner = ModelRunner(runner_obj, self._device, kv_cache_layout=self._kv_cache_layout)
+            self._model_runner = ModelRunner(
+                runner_obj,
+                self._device,
+                kv_cache_layout=self._kv_cache_layout,
+                runtime_handle=runtime_handle,
+            )
         self._input_processor = InputProcessor(self._model_path)
 
-    def _create_model_wrapper(self):
+    def _create_runtime(self) -> tuple[Any | None, dict]:
         if self._model_path is None:
             raise ValueError("model_path is required when model_runner is not provided")
-        return self._model_registry.create(
+        return self._model_registry.create_runtime(
             self._model_type,
             self._model_path,
             self._device,
@@ -72,6 +94,17 @@ class Worker:
             kv_cache_capacity_tokens=self._kv_cache_capacity_tokens,
             kv_cache_auto_capacity=self._kv_cache_auto_capacity,
             kv_cache_memory_utilization=self._kv_cache_memory_utilization,
+        )
+
+    def _create_model_wrapper(self, runtime_info: dict | None = None):
+        if self._model_path is None:
+            raise ValueError("model_path is required when model_runner is not provided")
+        runtime_info = runtime_info or {}
+        return self._model_registry.create(
+            self._model_type,
+            self._model_path,
+            self._device,
+            max_model_len=runtime_info.get("max_model_len", self._max_model_len),
         )
 
     @property
@@ -114,15 +147,19 @@ class Worker:
             sampling_params_by_req=sampling_params_by_req,
         )
 
-    def sample_tokens(self, logits_handle, plan):
-        return self._model_runner.sample_tokens(logits_handle, plan)
+    def sample_tokens(self, grammar_output=None):
+        return self._model_runner.sample_tokens(grammar_output)
 
     def execute(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
-        return self._model_runner.execute_step(
+        self._model_runner.execute_model(
             scheduler_outputs,
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
+        sampled = self._model_runner.sample_tokens(None)
+        if sampled is None:
+            return None, None, {}
+        return sampled
 
     def free_request(self, seq_id: int) -> None:
         fn = getattr(self._model_runner, "request_free", None)

@@ -170,6 +170,7 @@ public:
           kv_capacity_tokens_(kv_capacity_tokens) {}
 
     KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) override {
+        LLAISYS_NVTX_SCOPE("runtime/kv_seq_cp");
         if (kv_cache_ == nullptr) {
             return KvStatus::INTERNAL_ERROR;
         }
@@ -179,6 +180,7 @@ public:
         if (rc != KvStatus::OK) {
             return rc;
         }
+        LLAISYS_NVTX_SCOPE("runtime/kv_seq_cp_memcpy");
         const size_t copy_len = src_slots.size();
         const size_t stride_elems = kv_nkvh_ * kv_dh_;
         const size_t stride_bytes = stride_elems * llaisys::utils::dsize(kv_dtype_);
@@ -303,33 +305,6 @@ struct LlaisysModelImpl {
     std::unique_ptr<Qwen2Model> qwen2{};
     std::unique_ptr<MockModel> mock{};
 
-    int configure_runtime(const LlaisysRuntimeCreateParams &params) {
-        switch (type) {
-        case LLAISYS_MODEL_TYPE_QWEN2: {
-            if (!qwen2) {
-                return -1;
-            }
-            llaisys::runtime::kv_cache::KvCacheLayout kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
-            if (params.kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
-                kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::SLOT;
-            } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
-                return -1;
-            }
-            const size_t kv_block_size =
-                params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
-            const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
-                                                        ? static_cast<size_t>(params.kv_cache_capacity_tokens)
-                                                        : static_cast<size_t>(0);
-            const int64_t max_model_len = params.max_model_len > 0 ? static_cast<int64_t>(params.max_model_len) : int64_t{0};
-            return qwen2->configure_runtime(kv_layout, kv_block_size, kv_cache_capacity_tokens, max_model_len);
-        }
-        case LLAISYS_MODEL_TYPE_MOCK:
-            return 0;
-        default:
-            return -1;
-        }
-    }
-
     int32_t forward(const ModelForwardInput &input, ModelForwardOutput *output) {
         switch (type) {
         case LLAISYS_MODEL_TYPE_QWEN2:
@@ -344,23 +319,81 @@ struct LlaisysModelImpl {
 };
 
 struct LlaisysRuntimeImpl {
-    LlaisysRuntimeCreateParams params{};
-    LlaisysModelType model_type{LLAISYS_MODEL_TYPE_UNKNOWN};
-    std::shared_ptr<LlaisysModelImpl> model_owner{};
-    std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
+    struct SamplerScratchState {
+        llaisys::tensor_t max_val_buf{};
+        size_t max_val_capacity{0};
+        llaisysDataType_t max_val_dtype{LLAISYS_DTYPE_INVALID};
+        llaisysDeviceType_t max_val_device_type{LLAISYS_DEVICE_CPU};
+        int max_val_device_id{0};
 
-    bool bind_model(const std::shared_ptr<LlaisysModelImpl> &impl) {
-        if (!impl || model_type != LLAISYS_MODEL_TYPE_UNKNOWN) {
+        llaisys::tensor_t ensure_max_val(size_t n,
+                                         llaisysDataType_t dtype,
+                                         llaisysDeviceType_t device_type,
+                                         int device_id) {
+            if (n == 0) {
+                return nullptr;
+            }
+            bool recreate = (max_val_buf == nullptr) || (max_val_capacity < n) || (max_val_dtype != dtype) ||
+                            (max_val_device_type != device_type) || (max_val_device_id != device_id);
+            if (recreate) {
+                size_t cap = std::max<size_t>(1, max_val_capacity);
+                while (cap < n) {
+                    cap *= 2;
+                }
+                max_val_buf = llaisys::Tensor::create({cap}, dtype, device_type, device_id);
+                max_val_capacity = cap;
+                max_val_dtype = dtype;
+                max_val_device_type = device_type;
+                max_val_device_id = device_id;
+            }
+            if (max_val_capacity == n) {
+                return max_val_buf;
+            }
+            return max_val_buf->slice(0, 0, n);
+        }
+    };
+
+    LlaisysRuntimeCreateParams params{};
+    std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
+    std::weak_ptr<LlaisysModelImpl> bound_model{};
+    SamplerScratchState sampler_scratch{};
+
+    bool ensure_model_bound(const std::shared_ptr<LlaisysModelImpl> &impl) {
+        if (!impl) {
             return false;
         }
-        model_owner = impl;
-        model_type = impl->type;
-        switch (model_type) {
+
+        if (auto current = bound_model.lock(); current && current.get() == impl.get() && kv_cache_manager != nullptr) {
+            return true;
+        }
+
+        kv_cache_manager.reset();
+        bound_model.reset();
+
+        bool ok = false;
+        switch (impl->type) {
         case LLAISYS_MODEL_TYPE_QWEN2: {
-            if (!impl->qwen2 || impl->qwen2->kv_cache() == nullptr) {
-                unbind_model();
+            if (!impl->qwen2) {
                 return false;
             }
+
+            llaisys::runtime::kv_cache::KvCacheLayout kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
+            if (params.kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
+                kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::SLOT;
+            } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
+                return false;
+            }
+            const size_t kv_block_size =
+                params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
+            const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
+                                                        ? static_cast<size_t>(params.kv_cache_capacity_tokens)
+                                                        : static_cast<size_t>(0);
+            const int64_t max_model_len = params.max_model_len > 0 ? static_cast<int64_t>(params.max_model_len) : int64_t{0};
+            if (impl->qwen2->configure_runtime(kv_layout, kv_block_size, kv_cache_capacity_tokens, max_model_len) != 0 ||
+                impl->qwen2->kv_cache() == nullptr) {
+                return false;
+            }
+
             kv_cache_manager = std::make_unique<ModelKVCacheManager>(impl->qwen2->kv_cache(),
                                                                      impl->qwen2->kv_layout(),
                                                                      impl->qwen2->nlayer(),
@@ -368,57 +401,90 @@ struct LlaisysRuntimeImpl {
                                                                      impl->qwen2->dh(),
                                                                      impl->qwen2->dtype(),
                                                                      impl->qwen2->kv_cache_capacity_tokens());
-            return true;
+            ok = true;
+            break;
         }
         case LLAISYS_MODEL_TYPE_MOCK:
             if (!impl->mock) {
-                unbind_model();
                 return false;
             }
             kv_cache_manager = std::make_unique<MockKVCacheManager>(impl->mock.get());
-            return true;
+            ok = true;
+            break;
         default:
-            unbind_model();
             return false;
         }
+        if (!ok || kv_cache_manager == nullptr) {
+            kv_cache_manager.reset();
+            bound_model.reset();
+            return false;
+        }
+        bound_model = impl;
+        return true;
     }
 
-    void unbind_model() {
-        model_owner.reset();
-        model_type = LLAISYS_MODEL_TYPE_UNKNOWN;
-        kv_cache_manager.reset();
+    bool has_live_model_binding() {
+        if (bound_model.expired()) {
+            kv_cache_manager.reset();
+            return false;
+        }
+        return kv_cache_manager != nullptr;
     }
 
     KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
-        return kv_cache_manager ? kv_cache_manager->kv_seq_cp(dst_seq, src_seq, p0, p1) : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->kv_seq_cp(dst_seq, src_seq, p0, p1);
     }
 
     KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
-        return kv_cache_manager ? kv_cache_manager->kv_seq_rm(seq_id, p0, p1) : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->kv_seq_rm(seq_id, p0, p1);
     }
 
     KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-        return kv_cache_manager ? kv_cache_manager->kv_seq_add(seq_id, p0, p1, delta) : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->kv_seq_add(seq_id, p0, p1, delta);
     }
 
     KvStatus kv_seq_keep(int64_t seq_id) {
-        return kv_cache_manager ? kv_cache_manager->kv_seq_keep(seq_id) : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->kv_seq_keep(seq_id);
     }
 
     int64_t kv_seq_pos_max(int64_t seq_id) const noexcept {
-        return kv_cache_manager ? kv_cache_manager->kv_seq_pos_max(seq_id) : -1;
+        if (bound_model.expired() || kv_cache_manager == nullptr) {
+            return -1;
+        }
+        return kv_cache_manager->kv_seq_pos_max(seq_id);
     }
 
     KvStatus request_free(int64_t seq_id) {
-        return kv_cache_manager ? kv_cache_manager->request_free(seq_id) : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->request_free(seq_id);
     }
 
     int kv_stats(LlaisysKvStats *out_stats) noexcept {
-        return kv_cache_manager ? kv_cache_manager->kv_stats(out_stats) : -1;
+        if (!has_live_model_binding()) {
+            return -1;
+        }
+        return kv_cache_manager->kv_stats(out_stats);
     }
 
     KvStatus kv_reset_prefix_cache() {
-        return kv_cache_manager ? kv_cache_manager->kv_reset_prefix_cache() : KvStatus::INTERNAL_ERROR;
+        if (!has_live_model_binding()) {
+            return KvStatus::INTERNAL_ERROR;
+        }
+        return kv_cache_manager->kv_reset_prefix_cache();
     }
 };
 
@@ -448,12 +514,8 @@ __export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntime
     }
 }
 
-__export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params,
-                                                 struct LlaisysRuntime *runtime) {
-    if (params == nullptr || runtime == nullptr || runtime->impl == nullptr) {
-        return nullptr;
-    }
-    if (runtime->impl->model_type != LLAISYS_MODEL_TYPE_UNKNOWN) {
+__export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params) {
+    if (params == nullptr) {
         return nullptr;
     }
     try {
@@ -480,14 +542,6 @@ __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreate
             return nullptr;
         }
 
-        if (handle->impl->configure_runtime(runtime->impl->params) != 0) {
-            delete handle;
-            return nullptr;
-        }
-        if (!runtime->impl->bind_model(handle->impl)) {
-            delete handle;
-            return nullptr;
-        }
         return handle;
     } catch (...) {
         return nullptr;
@@ -499,9 +553,6 @@ __export void llaisysModelDestroy(struct LlaisysModel *model) {
 }
 
 __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime) {
-    if (runtime != nullptr && runtime->impl != nullptr) {
-        runtime->impl->unbind_model();
-    }
     delete runtime;
 }
 
@@ -606,12 +657,18 @@ __export int llaisysModelReplaceWeight(struct LlaisysModel *model,
 }
 
 __export int32_t llaisysModelForward(struct LlaisysModel *model,
+                                     struct LlaisysRuntime *runtime,
                                      const struct ModelForwardInput *input,
                                      struct ModelForwardOutput *output) {
-    if (model == nullptr || model->impl == nullptr || input == nullptr || input->input_ids == nullptr) {
+    LLAISYS_NVTX_SCOPE("api/model_forward");
+    if (model == nullptr || model->impl == nullptr || runtime == nullptr || runtime->impl == nullptr || input == nullptr ||
+        input->input_ids == nullptr) {
         return -1;
     }
     try {
+        if (!runtime->impl->ensure_model_bound(model->impl)) {
+            return -1;
+        }
         return model->impl->forward(*input, output);
     } catch (const std::invalid_argument &) {
         return -1;
@@ -620,9 +677,12 @@ __export int32_t llaisysModelForward(struct LlaisysModel *model,
     }
 }
 
-__export int32_t llaisysSamplerSample(const struct SamplerInput *input,
+__export int32_t llaisysSamplerSample(struct LlaisysRuntime *runtime,
+                                      const struct SamplerInput *input,
                                       struct SamplerOutput *output) {
-    if (input == nullptr || output == nullptr || input->logits == nullptr || output->sampled_ids == nullptr) {
+    LLAISYS_NVTX_SCOPE("api/sampler_sample");
+    if (runtime == nullptr || runtime->impl == nullptr || input == nullptr || output == nullptr || input->logits == nullptr ||
+        output->sampled_ids == nullptr) {
         return -1;
     }
     try {
@@ -654,9 +714,15 @@ __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
         }
 
         llaisys::tensor_t max_idx = sampled_ids;
-        llaisys::tensor_t max_val = llaisys::Tensor::create(
-            {n_outputs}, logits->dtype(), logits->deviceType(), logits->deviceId());
-        llaisys::ops::argmax_rows(max_idx, max_val, logits);
+        llaisys::tensor_t max_val =
+            runtime->impl->sampler_scratch.ensure_max_val(n_outputs, logits->dtype(), logits->deviceType(), logits->deviceId());
+        if (max_val == nullptr) {
+            return -1;
+        }
+        {
+            LLAISYS_NVTX_SCOPE("sample/argmax_rows");
+            llaisys::ops::argmax_rows(max_idx, max_val, logits);
+        }
         return 0;
     } catch (...) {
         return -2;

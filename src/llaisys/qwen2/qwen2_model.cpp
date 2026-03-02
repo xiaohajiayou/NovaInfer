@@ -415,6 +415,7 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
                                           const tensor_t &attn_normed,
                                           const tensor_t &pos_ids,
                                           const AttentionExecState &attn_state) {
+    LLAISYS_NVTX_SCOPE("forward/attention_layer");
     const auto &ws = workspace_->view();
     const size_t nh = meta_.nh;
     const size_t nkvh = meta_.nkvh;
@@ -424,9 +425,12 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
     tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
     tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
     tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
-    ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
-    ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
-    ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/qkv_proj");
+        ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
+        ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
+        ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+    }
 
     tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
     tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
@@ -434,21 +438,28 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
 
     tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
     tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
-    ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
-    ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/rope");
+        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
+        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+    }
 
     tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
     tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
 #ifdef ENABLE_NVIDIA_API
     if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
         CHECK_ARGUMENT(attn_state.slot_mapping != nullptr, "Qwen2: missing slot_mapping");
-        ops::cuda::reshape_and_cache(
-            layer_k_cache, layer_v_cache, rope_k, v_new_3d, attn_state.slot_mapping);
+        {
+            LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
+            ops::cuda::reshape_and_cache(
+                layer_k_cache, layer_v_cache, rope_k, v_new_3d, attn_state.slot_mapping);
+        }
     } else
 #endif
     {
         const auto *slot_map =
             attn_state.paged_attention ? reinterpret_cast<const int32_t *>(attn_state.slot_mapping->data()) : nullptr;
+        LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
         for (size_t i = 0; i < ntoken; ++i) {
             const int32_t slot = attn_state.paged_attention ? slot_map[i] : attn_state.slot_idxs[i];
             copy_token_into_cache_(layer_k_cache, slot, rope_k, i);
@@ -467,19 +478,23 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
                 reinterpret_cast<const int32_t *>(attn_state.seq_lens->data()),
                 static_cast<int32_t>(attn_state.seq_lens->shape()[0]),
             };
-            ops::cuda::dispatch_attention_with_backend(
-                attn_out,
-                rope_q,
-                layer_k_cache,
-                layer_v_cache,
-                prepared,
-                paged_attn_backend_,
-                attn_state.block_table_width,
-                static_cast<int32_t>(runtime_.kv_block_size),
-                scale);
+            {
+                LLAISYS_NVTX_SCOPE("forward/attn/core");
+                ops::cuda::dispatch_attention_with_backend(
+                    attn_out,
+                    rope_q,
+                    layer_k_cache,
+                    layer_v_cache,
+                    prepared,
+                    paged_attn_backend_,
+                    attn_state.block_table_width,
+                    static_cast<int32_t>(runtime_.kv_block_size),
+                    scale);
+            }
         } else
 #endif
         {
+            LLAISYS_NVTX_SCOPE("forward/attn/core");
             ops::self_attention_paged(
                 attn_out,
                 rope_q,
@@ -497,7 +512,10 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
         const size_t kvlen = attn_state.used_slots.size();
         tensor_t k_full = gather_cache_by_slots_(layer_k_cache, attn_state.used_slots, kvlen, ws.k_ctx);
         tensor_t v_full = gather_cache_by_slots_(layer_v_cache, attn_state.used_slots, kvlen, ws.v_ctx);
-        ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_state.attn_mask, scale);
+        {
+            LLAISYS_NVTX_SCOPE("forward/attn/core");
+            ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_state.attn_mask, scale);
+        }
     }
     return attn_out->view({ntoken, nh * dh});
 }
@@ -506,6 +524,7 @@ int32_t Qwen2Model::prepare_slot_attention_state_(size_t ntoken,
                                                   const tensor_t &seq_ids_t,
                                                   const tensor_t &pos_ids_host_t,
                                                   AttentionExecState *state) {
+    LLAISYS_NVTX_SCOPE("attn_meta/slot/prepare");
     ASSERT(state != nullptr, "Qwen2: attention state is null");
     const auto &ws = workspace_->view();
     const auto *seq_host = reinterpret_cast<const int64_t *>(seq_ids_t->data());
@@ -546,19 +565,25 @@ int32_t Qwen2Model::prepare_slot_attention_state_(size_t ntoken,
         CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
 
         std::vector<uint8_t> host_mask(ntoken * kvlen, static_cast<uint8_t>(0));
-        for (size_t i = 0; i < ntoken; ++i) {
-            bool has_visible = false;
-            for (size_t k = 0; k < kvlen; ++k) {
-                const bool visible = runtime_.kv_cache->slot_visible_for(
-                    state->used_slots[k], seq_sets[i].data(), static_cast<int32_t>(seq_sets[i].size()), pos_values[i]);
-                host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-                has_visible = has_visible || visible;
+        {
+            LLAISYS_NVTX_SCOPE("attn_meta/slot/build_mask");
+            for (size_t i = 0; i < ntoken; ++i) {
+                bool has_visible = false;
+                for (size_t k = 0; k < kvlen; ++k) {
+                    const bool visible = runtime_.kv_cache->slot_visible_for(
+                        state->used_slots[k], seq_sets[i].data(), static_cast<int32_t>(seq_sets[i].size()), pos_values[i]);
+                    host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+                    has_visible = has_visible || visible;
+                }
+                CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
             }
-            CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
         }
 
         tensor_t attn_mask_flat = ws.attn_mask_flat->slice(0, 0, ntoken * kvlen);
-        attn_mask_flat->load(host_mask.data());
+        {
+            LLAISYS_NVTX_SCOPE("attn_meta/slot/upload_mask");
+            attn_mask_flat->load(host_mask.data());
+        }
         state->attn_mask = attn_mask_flat->view({ntoken, kvlen});
         state->paged_attention = false;
         state->block_table_width = 0;
@@ -579,6 +604,7 @@ int32_t Qwen2Model::prepare_slot_attention_state_(size_t ntoken,
 int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMetadata &attn,
                                                              size_t ntoken,
                                                              AttentionExecState *state) {
+    LLAISYS_NVTX_SCOPE("attn_meta/block/validate");
     ASSERT(state != nullptr, "Qwen2: attention state is null");
     auto validate_block_meta_tensor_1d = [this, ntoken](llaisysTensor_t handle, llaisysDataType_t dtype, const char *name) -> tensor_t {
         CHECK_ARGUMENT(handle != nullptr && handle->tensor != nullptr, "Qwen2: missing BLOCK attention metadata tensor");
@@ -693,24 +719,23 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             }
         }
 
-        tensor_t logits_mask_t = nullptr;
-        const int8_t *logits_host = nullptr;
-        if (input.logits_mask == nullptr || input.logits_mask->tensor == nullptr) {
-            return fail("missing logits_mask");
+        if (input.logits_indices == nullptr || input.logits_indices->tensor == nullptr) {
+            return fail("missing logits_indices");
         }
-        logits_mask_t = input.logits_mask->tensor;
-        if (logits_mask_t->deviceType() != LLAISYS_DEVICE_CPU) {
-            return fail("logits_mask device");
+        tensor_t logits_indices = input.logits_indices->tensor;
+        if (logits_indices == nullptr) {
+            return fail("null logits_indices tensor");
         }
-        if (logits_mask_t->ndim() != 1 || logits_mask_t->dtype() != LLAISYS_DTYPE_I8 || !logits_mask_t->isContiguous() ||
-            logits_mask_t->shape()[0] != ntoken) {
-            return fail("invalid logits_mask");
+        if (logits_indices->ndim() != 1 || logits_indices->dtype() != LLAISYS_DTYPE_I64 || !logits_indices->isContiguous()) {
+            return fail("invalid logits_indices");
         }
-        logits_host = reinterpret_cast<const int8_t *>(logits_mask_t->data());
-
-        ASSERT(runtime_.output != nullptr, "Qwen2: output buffer is null");
-        runtime_.output->clear();
-        runtime_.output->reserve_rows(ntoken);
+        if (logits_indices->deviceType() != device_type_ || logits_indices->deviceId() != device_id_) {
+            return fail("logits_indices device mismatch");
+        }
+        const size_t n_outputs = logits_indices->shape()[0];
+        if (n_outputs > ntoken) {
+            return fail("logits_indices length > ntoken");
+        }
         step_logits_ = nullptr;
 
         validate_or_die_();
@@ -724,21 +749,16 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             ops::embedding(hidden, input_ids, weights_.in_embed->tensor);
         }
 
-        std::vector<int32_t> collected_rows{};
-        collected_rows.reserve(ntoken);
-        for (size_t i = 0; i < ntoken; ++i) {
-            if (logits_host[i] != 0) {
-                collected_rows.push_back(static_cast<int32_t>(i));
-            }
-        }
-
         AttentionExecState attn_state{};
         attn_state = AttentionExecState{};
         int32_t attn_rc = 0;
-        if (input.attention.mode == ATTENTION_MODE_SLOT) {
-            attn_rc = prepare_slot_attention_state_(ntoken, seq_ids_t, pos_ids_host_t, &attn_state);
-        } else {
-            attn_rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
+        {
+            LLAISYS_NVTX_SCOPE("forward/prepare_attention_state");
+            if (input.attention.mode == ATTENTION_MODE_SLOT) {
+                attn_rc = prepare_slot_attention_state_(ntoken, seq_ids_t, pos_ids_host_t, &attn_state);
+            } else {
+                attn_rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
+            }
         }
         if (attn_rc != 0) {
             std::cerr << "[Qwen2Model::forward] prepare attention state rc=" << attn_rc << std::endl;
@@ -746,6 +766,7 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         }
 
         for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
+            LLAISYS_NVTX_SCOPE("forward/layer");
             tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
             ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
 
@@ -756,74 +777,55 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
                 pos_ids,
                 attn_state);
             tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
-            ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
-            ops::add(hidden, hidden, attn_proj);
+            {
+                LLAISYS_NVTX_SCOPE("forward/layer/attn_out_proj");
+                ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
+                ops::add(hidden, hidden, attn_proj);
+            }
 
             tensor_t mlp_normed = slice_tokens_(ws.mlp_normed, ntoken);
             ops::rms_norm(mlp_normed, hidden, weights_.mlp_norm_w[layer]->tensor, meta_.epsilon);
 
             tensor_t gate = slice_tokens_(ws.gate, ntoken);
             tensor_t up = slice_tokens_(ws.up, ntoken);
-            ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
-            ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
+            {
+                LLAISYS_NVTX_SCOPE("forward/layer/mlp");
+                ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
+                ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
 
-            tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
-            ops::swiglu(swiglu, gate, up);
+                tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
+                ops::swiglu(swiglu, gate, up);
 
-            tensor_t down = slice_tokens_(ws.down, ntoken);
-            ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
-            ops::add(hidden, hidden, down);
+                tensor_t down = slice_tokens_(ws.down, ntoken);
+                ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
+                ops::add(hidden, hidden, down);
+            }
         }
 
-        if (!collected_rows.empty()) {
-            tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
+        tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
+        {
+            LLAISYS_NVTX_SCOPE("forward/final_norm");
             ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
+        }
 
-            const size_t n_outputs = collected_rows.size();
-            tensor_t logits = slice_tokens_(ws.logits, n_outputs);
-            if (n_outputs == ntoken) {
-                ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
-            } else {
-                std::vector<int64_t> output_rows(n_outputs, 0);
-                for (size_t i = 0; i < n_outputs; ++i) {
-                    output_rows[i] = static_cast<int64_t>(collected_rows[i]);
-                }
-                tensor_t output_rows_t = slice_tokens_(ws.argmax_idx, n_outputs);
-                output_rows_t->load(output_rows.data());
-                tensor_t selected_hidden = slice_tokens_(ws.hidden, n_outputs);
-                ops::embedding(selected_hidden, output_rows_t, final_normed);
+        tensor_t logits = slice_tokens_(ws.logits, n_outputs);
+        if (n_outputs == 0) {
+            step_logits_ = logits;
+        } else {
+            tensor_t selected_hidden = slice_tokens_(ws.hidden, n_outputs);
+            {
+                LLAISYS_NVTX_SCOPE("forward/logits_select");
+                ops::embedding(selected_hidden, logits_indices, final_normed);
+            }
+            {
+                LLAISYS_NVTX_SCOPE("forward/logits_proj");
                 ops::linear(logits, selected_hidden, weights_.out_embed->tensor, zero_bias_logits_);
             }
             step_logits_ = logits;
-
-            for (size_t i = 0; i < n_outputs; ++i) {
-                runtime_.output->append_output_id(static_cast<int64_t>(collected_rows[i]));
-            }
         }
 
         if (output == nullptr) {
             return 0;
-        }
-
-        const int32_t n_outputs = runtime_.output->n_outputs();
-        output->n_outputs = n_outputs;
-        if (output->output_ids != nullptr) {
-            const int64_t *output_ids = runtime_.output->output_ids();
-            if (n_outputs > 0 && output_ids == nullptr) {
-                return -2;
-            }
-            tensor_t out_ids = output->output_ids->tensor;
-            if (out_ids == nullptr || out_ids->dtype() != LLAISYS_DTYPE_I64 || out_ids->ndim() != 1 || !out_ids->isContiguous() ||
-                out_ids->shape()[0] < static_cast<size_t>(n_outputs)) {
-                std::cerr << "[Qwen2Model::forward] invalid output_ids tensor" << std::endl;
-                return -1;
-            }
-            if (n_outputs > 0) {
-                if (out_ids->shape()[0] > static_cast<size_t>(n_outputs)) {
-                    out_ids = out_ids->slice(0, 0, static_cast<size_t>(n_outputs));
-                }
-                out_ids->load(output_ids);
-            }
         }
         if (output->logits == nullptr) {
             std::cerr << "[Qwen2Model::forward] missing output logits handle" << std::endl;

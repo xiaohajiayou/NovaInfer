@@ -11,8 +11,11 @@ from ..tensor import Tensor
 class Sampler:
     """Device-local sampler wrapper over llaisysSamplerSample."""
 
-    def __init__(self, device: DeviceType):
+    def __init__(self, device: DeviceType, runtime_handle):
         self._device = device
+        self._runtime = runtime_handle
+        if self._runtime is None:
+            raise ValueError("runtime_handle is required by Sampler")
         self._sample_capacity = 0
         self._sampled_ids_buf: Optional[Tensor] = None
 
@@ -59,7 +62,7 @@ class Sampler:
         sout = SamplerOutput()
         sout.sampled_ids = sampled_ids.lib_tensor()
 
-        status = int(LIB_LLAISYS.llaisysSamplerSample(byref(sin), byref(sout)))
+        status = int(LIB_LLAISYS.llaisysSamplerSample(self._runtime, byref(sin), byref(sout)))
         if status != 0:
             raise RuntimeError(f"samplerSample failed with status={status}")
         return sampled_ids

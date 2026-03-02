@@ -17,9 +17,13 @@ class Executor:
         sampling_params: SamplingParams | None = None,
         sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ):
-        output_ids_t, sampled_t, token_idx_to_req_id = self._worker.execute(
+        self._worker.execute_model(
             outputs,
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
+        sampled = self._worker.sample_tokens(None)
+        if sampled is None:
+            return None, None, {}
+        output_ids_t, sampled_t, token_idx_to_req_id = sampled
         return output_ids_t, sampled_t, token_idx_to_req_id

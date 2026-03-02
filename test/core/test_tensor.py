@@ -72,7 +72,7 @@ def test_tensor_contiguous_reshape_to_cpu():
     assert check_equal(llaisys_r, torch_r)
 
     # to(cpu) roundtrip
-    llaisys_cpu2 = llaisys_r.to(llaisys.DeviceType.CPU, 0)
+    llaisys_cpu2 = llaisys_r.to(device=llaisys.DeviceType.CPU)
     assert llaisys_cpu2.device_type() == llaisys.DeviceType.CPU
     assert check_equal(llaisys_cpu2, torch_r)
 
@@ -109,7 +109,7 @@ def test_tensor_contiguous_reshape_to_nvidia():
     torch_r = torch_perm.reshape(4, 6)
     assert check_equal(llaisys_r, torch_r)
 
-    llaisys_cpu = llaisys_r.to(llaisys.DeviceType.CPU, 0)
+    llaisys_cpu = llaisys_r.to(device=llaisys.DeviceType.CPU)
     assert llaisys_cpu.device_type() == llaisys.DeviceType.CPU
     assert check_equal(llaisys_cpu, torch_r.cpu())
 

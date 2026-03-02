@@ -44,13 +44,13 @@ def test_model_registry_qwen2_and_mock():
             layout=KvCacheLayout(TEST_KV_LAYOUT),
             block_size=TEST_KV_BLOCK_SIZE,
         )
-        out = run_model_forward(qwen2, built, device=llaisys.DeviceType.CPU)
+        out = run_model_forward(qwen2, qwen2_runtime, built, device=llaisys.DeviceType.CPU)
         assert out.status == 0
         assert out.n_outputs == 2
         assert out.output_ids == [1, 2]
 
         # MOCK does not provide model forward graph.
-        mock_out = run_model_forward(mock, built, device=llaisys.DeviceType.CPU)
+        mock_out = run_model_forward(mock, mock_runtime, built, device=llaisys.DeviceType.CPU)
         assert mock_out.status == -2
 
         assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(mock_runtime, c_int64(5))) == -1

@@ -23,7 +23,7 @@ def _create_model(meta: TinyMeta = TinyMeta(maxseq=64)):
     )
 
 
-def _forward(model, token_ids: list[int], logits_mask: list[int] | None):
+def _forward(runtime, model, token_ids: list[int], logits_mask: list[int] | None):
     built = build_decode_batch(
         token_ids,
         logits_mask=logits_mask,
@@ -32,13 +32,13 @@ def _forward(model, token_ids: list[int], logits_mask: list[int] | None):
         layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
-    return run_model_forward(model, built, device=llaisys.DeviceType.CPU)
+    return run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)
 
 
 def test_output_rows_match_logits_mask_and_sampler():
     runtime, model, _ = _create_model()
     try:
-        out = _forward(model, [2, 4, 6, 8], [1, 0, 1, 0])
+        out = _forward(runtime, model, [2, 4, 6, 8], [1, 0, 1, 0])
         assert out.status == 0
         assert out.n_outputs == 2
         assert out.output_ids == [0, 2]
@@ -55,12 +55,12 @@ def test_output_rows_match_logits_mask_and_sampler():
 def test_default_logits_behavior_returns_last_row_only():
     runtime, model, _ = _create_model()
     try:
-        no_out = _forward(model, [1, 3, 5], [0, 0, 0])
+        no_out = _forward(runtime, model, [1, 3, 5], [0, 0, 0])
         assert no_out.status == 0
         assert no_out.n_outputs == 0
 
         # Null logits mask means "return last token row".
-        out = _forward(model, [1, 3, 5], None)
+        out = _forward(runtime, model, [1, 3, 5], None)
         assert out.status == 0
         assert out.n_outputs == 1
         assert out.output_ids == [2]

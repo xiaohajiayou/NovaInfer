@@ -7,6 +7,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
+from llaisys.engine.runtime_factory import create_runtime, plan_qwen2_runtime
+from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
@@ -39,6 +41,34 @@ def _restore_attn_backend(old: str | None):
         os.environ[key] = old
 
 
+def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
+    plan = plan_qwen2_runtime(
+        model_path=model_path,
+        device=device,
+        kv_cache_block_size=16,
+        max_model_len=None,
+        kv_cache_capacity_tokens=None,
+        kv_cache_auto_capacity=True,
+        kv_cache_memory_utilization=0.9,
+        max_num_seqs=None,
+    )
+    runtime_handle = create_runtime(
+        kv_cache_layout=kv_layout,
+        kv_cache_block_size=16,
+        plan=plan,
+    )
+    try:
+        model = llaisys.models.Qwen2(
+            model_path=model_path,
+            device=device,
+            max_model_len=int(plan.max_model_len),
+        )
+    except Exception:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+        raise
+    return model, runtime_handle
+
+
 def _torch_device(device_name: str):
     if device_name == "cpu":
         return torch.device("cpu")
@@ -49,6 +79,7 @@ def _torch_device(device_name: str):
 
 def _decode_batch(
     model_handle,
+    runtime_handle,
     tokens,
     seq_ids,
     poss,
@@ -68,7 +99,7 @@ def _decode_batch(
         block_size=block_size,
         block_state=block_state,
     )
-    out = run_model_forward(model_handle, built, device=device)
+    out = run_model_forward(model_handle, runtime_handle, built, device=device)
     if out.status != 0:
         raise RuntimeError(f"llaisysModelForward failed with status={out.status}")
     if out.n_outputs == 0:
@@ -108,13 +139,19 @@ def _hf_generate_batch(model, prompt_ids, max_new_tokens):
     return generated
 
 
-def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
+def _llaisys_argmax_batch(
+    llaisys_model,
+    runtime_handle,
+    kv_layout: KvCacheLayout,
+    prompt_ids,
+    max_new_tokens,
+):
     seq_ids = [1000 + i for i in range(len(prompt_ids))]
     generated = [[] for _ in range(len(prompt_ids))]
     handle = llaisys_model._model
     device = getattr(llaisys_model, "_device", llaisys.DeviceType.CPU)
-    is_block_layout = int(llaisys_model._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-    block_size = int(getattr(llaisys_model, "_kv_cache_block_size", 16))
+    is_block_layout = int(kv_layout) == int(KvCacheLayout.BLOCK)
+    block_size = 16
     block_state = BlockBatchState()
 
     max_prompt = max(len(x) for x in prompt_ids)
@@ -133,6 +170,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
                 bidx_to_seq.append(i)
         out_ids, sampled_ids = _decode_batch(
             handle,
+            runtime_handle,
             btok,
             bseq,
             bpos,
@@ -163,6 +201,7 @@ def _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens):
 
         out_ids, sampled_ids = _decode_batch(
             handle,
+            runtime_handle,
             btok,
             bseq,
             bpos,
@@ -222,23 +261,29 @@ def test_core_parity(require_model_path, prompts, ll_device, backend, kv_layout)
 
     old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
     llaisys_model = None
+    runtime_handle = None
     try:
         try:
-            llaisys_model = llaisys.models.Qwen2(
-                require_model_path,
-                llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
-                kv_cache_layout=(
-                    KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT
-                ),
-                kv_cache_auto_capacity=True,
+            llaisys_model, runtime_handle = _create_qwen2_with_runtime(
+                model_path=require_model_path,
+                device=llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
+                kv_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
             )
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
             raise
-        ll_tokens = _llaisys_argmax_batch(llaisys_model, prompt_ids, max_new_tokens=5)
+        ll_tokens = _llaisys_argmax_batch(
+            llaisys_model,
+            runtime_handle,
+            KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
+            prompt_ids,
+            max_new_tokens=5,
+        )
         assert ll_tokens == hf_tokens
     finally:
         if llaisys_model is not None:
             llaisys_model.close()
+        if runtime_handle is not None:
+            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
         _restore_attn_backend(old_backend)

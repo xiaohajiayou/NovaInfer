@@ -346,8 +346,8 @@ class LLMEngine:
         if output_ids_t is None or sampled_t is None:
             return completions
 
-        output_ids_cpu = output_ids_t.to(DeviceType.CPU, 0) if output_ids_t.device_type() != DeviceType.CPU else output_ids_t
-        sampled_cpu = sampled_t.to(DeviceType.CPU, 0) if sampled_t.device_type() != DeviceType.CPU else sampled_t
+        output_ids_cpu = output_ids_t.to(device=DeviceType.CPU) if output_ids_t.device_type() != DeviceType.CPU else output_ids_t
+        sampled_cpu = sampled_t.to(device=DeviceType.CPU) if sampled_t.device_type() != DeviceType.CPU else sampled_t
         output_ids = output_ids_cpu.tolist()
         sampled = sampled_cpu.tolist()
         if len(output_ids) != len(sampled):

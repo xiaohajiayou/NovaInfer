@@ -26,7 +26,7 @@ def _create_model(meta: TinyMeta = TinyMeta(maxseq=64)):
     )
 
 
-def _forward(model, token_ids: list[int], logits_mask: list[int]):
+def _forward(runtime, model, token_ids: list[int], logits_mask: list[int]):
     built = build_decode_batch(
         token_ids,
         logits_mask=logits_mask,
@@ -35,7 +35,7 @@ def _forward(model, token_ids: list[int], logits_mask: list[int]):
         layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
-    return run_model_forward(model, built, device=llaisys.DeviceType.CPU)
+    return run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)
 
 
 def test_model_create_forward_sampler_and_runtime_kv_api():
@@ -43,7 +43,7 @@ def test_model_create_forward_sampler_and_runtime_kv_api():
     try:
         assert int(LIB_LLAISYS.llaisysModelType(model)) == int(ModelType.QWEN2)
 
-        out = _forward(model, [1, 2, 3], [0, 0, 1])
+        out = _forward(runtime, model, [1, 2, 3], [0, 0, 1])
         assert out.status == 0
         assert out.n_outputs == 1
         try:
@@ -97,7 +97,7 @@ def test_model_forward_reports_oom_when_exceeding_maxseq():
     runtime, model, meta = _create_model()
     try:
         token_ids = [1] * (meta.maxseq + 1)
-        out = _forward(model, token_ids, [0] * meta.maxseq + [1])
+        out = _forward(runtime, model, token_ids, [0] * meta.maxseq + [1])
         if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
             assert out.status != 0
         else:

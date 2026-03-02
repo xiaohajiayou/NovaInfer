@@ -18,6 +18,7 @@ class DummyModelRunner:
     def __post_init__(self):
         self._kv_cache_layout = KvCacheLayout(int(self.kv_cache_layout))
         self._request_free_calls: list[int] = []
+        self._execute_state = None
 
     @property
     def request_free_calls(self) -> list[int]:
@@ -138,37 +139,43 @@ class DummyModelRunner:
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
+        self._execute_state = None
         if not plan.token_ids:
-            return None, None, None, {}
+            return None
         output_ids = [i for i, m in enumerate(plan.logits_mask) if int(m) != 0]
         self.on_plan(plan)
         out = llaisys.Tensor((len(output_ids),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         out.copy_from_sequence(output_ids)
-        return out, None, plan, token_idx_to_req_id
+        self._execute_state = (out, plan, token_idx_to_req_id)
+        return None
 
-    def sample_tokens(self, logits_tensor, plan: BatchPlan):
-        _ = logits_tensor
-        output_ids = [i for i, m in enumerate(plan.logits_mask) if int(m) != 0]
-        sampled = [(int(plan.token_ids[i]) + 1) % int(self.vocab_size) for i in output_ids]
+    def sample_tokens(self, grammar_output=None):
+        _ = grammar_output
+        if self._execute_state is None:
+            return None
+        output_ids, plan, token_idx_to_req_id = self._execute_state
+        self._execute_state = None
+        output_indices = [int(x) for x in output_ids.tolist()]
+        sampled = [(int(plan.token_ids[i]) + 1) % int(self.vocab_size) for i in output_indices]
         out = llaisys.Tensor((len(sampled),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         out.copy_from_sequence(sampled)
-        return out
+        return output_ids, out, token_idx_to_req_id
 
-    def execute_step(
+    def execute(
         self,
         scheduler_outputs: SchedulerOutputs,
         sampling_params: SamplingParams | None = None,
         sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ):
-        output_ids, logits_tensor, plan, token_idx_to_req_id = self.execute_model(
+        self.execute_model(
             scheduler_outputs,
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
-        if output_ids is None or plan is None:
+        sampled = self.sample_tokens(None)
+        if sampled is None:
             return None, None, {}
-        sampled = self.sample_tokens(logits_tensor, plan)
-        return output_ids, sampled, token_idx_to_req_id
+        return sampled
 
     def decode_tokens(self, token_ids):
         return "".join(chr(ord("a") + int(t)) for t in token_ids)

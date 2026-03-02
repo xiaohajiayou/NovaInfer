@@ -19,7 +19,7 @@ def _create_model(meta: TinyMeta = TinyMeta(maxseq=8)):
     )
 
 
-def _forward(model, tokens, seq_ids):
+def _forward(runtime, model, tokens, seq_ids):
     built = build_decode_batch(
         tokens,
         logits_mask=[1] * len(tokens),
@@ -28,14 +28,14 @@ def _forward(model, tokens, seq_ids):
         block_size=TEST_KV_BLOCK_SIZE,
         shared_block_ids_per_batch=True,
     )
-    out = run_model_forward(model, built, device=llaisys.DeviceType.CPU)
+    out = run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)
     return int(out.status)
 
 
 def test_kv_seq_basic_ops():
     runtime, model, _ = _create_model()
     try:
-        first_status = _forward(model, [1, 2, 3], [10, 10, 20])
+        first_status = _forward(runtime, model, [1, 2, 3], [10, 10, 20])
         assert first_status == 0
         if IS_BLOCK_LAYOUT:
             assert int(LIB_LLAISYS.llaisysRuntimeKvSeqCp(runtime, c_int64(30), c_int64(10), c_int64(0), c_int64(2))) == 5
@@ -64,12 +64,12 @@ def test_kv_seq_basic_ops():
 def test_kv_slot_exhaustion_returns_forward_oom():
     runtime, model, _ = _create_model(TinyMeta(maxseq=4))
     try:
-        first_status = _forward(model, [1, 2, 3, 4], [1, 2, 3, 4])
+        first_status = _forward(runtime, model, [1, 2, 3, 4], [1, 2, 3, 4])
         assert first_status == 0
         if IS_BLOCK_LAYOUT:
-            assert _forward(model, [5], [9]) == 0
+            assert _forward(runtime, model, [5], [9]) == 0
             return
-        assert _forward(model, [5], [9]) == 1
+        assert _forward(runtime, model, [5], [9]) == 1
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -77,7 +77,7 @@ def test_kv_slot_exhaustion_returns_forward_oom():
 def test_kv_seq_cp_then_rm_does_not_break_src():
     runtime, model, _ = _create_model()
     try:
-        assert _forward(model, [1, 2], [7, 7]) == 0
+        assert _forward(runtime, model, [1, 2], [7, 7]) == 0
         cp_status = int(LIB_LLAISYS.llaisysRuntimeKvSeqCp(runtime, c_int64(8), c_int64(7), c_int64(0), c_int64(2)))
         if IS_BLOCK_LAYOUT:
             assert cp_status == 5
@@ -86,7 +86,7 @@ def test_kv_seq_cp_then_rm_does_not_break_src():
         rm_status = int(LIB_LLAISYS.llaisysRuntimeKvSeqRm(runtime, c_int64(8), c_int64(0), c_int64(1)))
         assert rm_status == 0
         assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(7))) == 1
-        assert _forward(model, [3], [7]) == 0
+        assert _forward(runtime, model, [3], [7]) == 0
         assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(7))) == 2
     finally:
         destroy_model_runtime(model, runtime)

@@ -64,16 +64,14 @@ class ModelForwardInput(Structure):
     _fields_ = [
         ("input_ids", llaisysTensor_t),
         ("pos_ids", llaisysTensor_t),
-        ("logits_mask", llaisysTensor_t),
+        ("logits_indices", llaisysTensor_t),
         ("attention", AttentionMetadata),
     ]
 
 
 class ModelForwardOutput(Structure):
     _fields_ = [
-        ("output_ids", llaisysTensor_t),
         ("logits", llaisysTensor_t),
-        ("n_outputs", c_int32),
     ]
 
 
@@ -101,7 +99,7 @@ def load_model(lib):
     lib.llaisysRuntimeDestroy.argtypes = [llaisysRuntime_t]
     lib.llaisysRuntimeDestroy.restype = None
 
-    lib.llaisysModelCreate.argtypes = [POINTER(LlaisysModelCreateParams), llaisysRuntime_t]
+    lib.llaisysModelCreate.argtypes = [POINTER(LlaisysModelCreateParams)]
     lib.llaisysModelCreate.restype = llaisysModel_t
 
     lib.llaisysModelDestroy.argtypes = [llaisysModel_t]
@@ -116,9 +114,9 @@ def load_model(lib):
     lib.llaisysModelReplaceWeight.argtypes = [llaisysModel_t, c_char_p, c_int32, c_void_p]
     lib.llaisysModelReplaceWeight.restype = c_int
 
-    lib.llaisysModelForward.argtypes = [llaisysModel_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
+    lib.llaisysModelForward.argtypes = [llaisysModel_t, llaisysRuntime_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
     lib.llaisysModelForward.restype = c_int32
-    lib.llaisysSamplerSample.argtypes = [POINTER(SamplerInput), POINTER(SamplerOutput)]
+    lib.llaisysSamplerSample.argtypes = [llaisysRuntime_t, POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
 
     lib.llaisysRuntimeKvSeqCp.argtypes = [llaisysRuntime_t, c_int64, c_int64, c_int64, c_int64]

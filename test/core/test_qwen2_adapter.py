@@ -36,10 +36,11 @@ def test_qwen2_adapter_meta_parse():
 
 def test_qwen2_adapter_uses_generic_model_api_symbols():
     source = Path("python/llaisys/models/qwen2.py").read_text(encoding="utf-8")
-    assert "llaisysRuntimeCreate" in source
+    assert "llaisysRuntimeCreate" not in source
     assert "llaisysModelCreate" in source
     assert "llaisysModelWeights" in source
     assert "llaisysModelForward" in source
+    assert "def forward(self, runtime, fin: ModelForwardInput, fout: ModelForwardOutput)" in source
 
 
 if __name__ == "__main__":

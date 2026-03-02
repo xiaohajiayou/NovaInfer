@@ -45,6 +45,7 @@ class ForwardRunResult:
     output_ids: list[int]
     output_ids_tensor: Tensor
     logits_tensor: Tensor
+    runtime: object
 
 
 def _detach_tensor_handle(tensor: Tensor):
@@ -117,7 +118,7 @@ def create_tiny_qwen2_model(
         dev_ids,
         1,
     )
-    model = LIB_LLAISYS.llaisysModelCreate(byref(params), runtime)
+    model = LIB_LLAISYS.llaisysModelCreate(byref(params))
     if not model:
         LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
         raise RuntimeError("Failed to create tiny Qwen2 model")
@@ -156,7 +157,7 @@ def create_mock_model(*, layout: KvCacheLayout | int = KvCacheLayout.BLOCK, bloc
         None,
         0,
     )
-    model = LIB_LLAISYS.llaisysModelCreate(byref(params), runtime)
+    model = LIB_LLAISYS.llaisysModelCreate(byref(params))
     if not model:
         LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
         raise RuntimeError("Failed to create mock model")
@@ -176,14 +177,15 @@ def _make_tensor_1d(values, dtype: DataType, device: DeviceType) -> Tensor:
     return t
 
 
-def run_model_forward(model, batch: BatchBuildResult, *, device: DeviceType = DeviceType.CPU) -> ForwardRunResult:
+def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: DeviceType = DeviceType.CPU) -> ForwardRunResult:
     ntoken = len(batch.token_ids)
     if ntoken <= 0:
         raise ValueError("empty batch")
 
     input_ids_t = _make_tensor_1d(batch.token_ids, DataType.I64, device)
     pos_ids_t = _make_tensor_1d(batch.pos_values, DataType.I64, device)
-    logits_mask_t = _make_tensor_1d(batch.logits_mask, DataType.I8, DeviceType.CPU)
+    output_ids = [i for i, m in enumerate(batch.logits_mask) if int(m) != 0]
+    output_ids_t = _make_tensor_1d(output_ids, DataType.I64, device)
     seq_ids_t = _make_tensor_1d(batch.seq_ids, DataType.I64, DeviceType.CPU)
     pos_ids_host_t = _make_tensor_1d(batch.pos_values, DataType.I64, DeviceType.CPU)
 
@@ -223,41 +225,34 @@ def run_model_forward(model, batch: BatchBuildResult, *, device: DeviceType = De
         attn.block_tables = block_tables_t.lib_tensor()
         attn.block_table_width = int(batch.block_table_width)
 
-    output_ids_t = Tensor((ntoken,), DataType.I64, device, 0)
     logits_holder_t = Tensor((1,), DataType.F32, device, 0)
 
     fin = ModelForwardInput()
     fin.input_ids = input_ids_t.lib_tensor()
     fin.pos_ids = pos_ids_t.lib_tensor()
-    fin.logits_mask = logits_mask_t.lib_tensor()
+    fin.logits_indices = output_ids_t.lib_tensor()
     fin.attention = attn
 
     fout = ModelForwardOutput()
-    fout.output_ids = output_ids_t.lib_tensor()
     fout.logits = logits_holder_t.lib_tensor()
-    fout.n_outputs = 0
 
-    status = int(LIB_LLAISYS.llaisysModelForward(model, byref(fin), byref(fout)))
-    n_outputs = int(fout.n_outputs) if status == 0 else 0
-    if n_outputs < 0 or n_outputs > ntoken:
-        raise RuntimeError("invalid n_outputs from modelForward")
-
-    out_view = output_ids_t.slice(0, 0, n_outputs)
-    out_cpu = out_view if out_view.device_type() == DeviceType.CPU else out_view.to(DeviceType.CPU)
-    output_ids = [int(x) for x in out_cpu.tolist()]
+    status = int(LIB_LLAISYS.llaisysModelForward(model, runtime, byref(fin), byref(fout)))
+    n_outputs = len(output_ids) if status == 0 else 0
+    out_view = output_ids_t
     return ForwardRunResult(
         status=status,
         n_outputs=n_outputs,
         output_ids=output_ids,
         output_ids_tensor=out_view,
         logits_tensor=logits_holder_t,
+        runtime=runtime,
     )
 
 
 def sample_from_forward(result: ForwardRunResult, *, device: DeviceType = DeviceType.CPU) -> list[int]:
     if result.n_outputs <= 0:
         return []
-    sampler = Sampler(device)
+    sampler = Sampler(device, result.runtime)
     sampled = sampler.sample_tokens(
         logits_tensor=result.logits_tensor,
     )

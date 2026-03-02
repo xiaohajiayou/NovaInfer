@@ -8,6 +8,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
+from llaisys.engine.runtime_factory import create_runtime, plan_qwen2_runtime
+from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
 from llaisys.libllaisys.model import KvCacheLayout
@@ -39,6 +41,34 @@ def _restore_attn_backend(old: str | None):
         os.environ.pop(key, None)
     else:
         os.environ[key] = old
+
+
+def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
+    plan = plan_qwen2_runtime(
+        model_path=model_path,
+        device=device,
+        kv_cache_block_size=16,
+        max_model_len=None,
+        kv_cache_capacity_tokens=None,
+        kv_cache_auto_capacity=True,
+        kv_cache_memory_utilization=0.9,
+        max_num_seqs=None,
+    )
+    runtime_handle = create_runtime(
+        kv_cache_layout=kv_layout,
+        kv_cache_block_size=16,
+        plan=plan,
+    )
+    try:
+        model = llaisys.models.Qwen2(
+            model_path=model_path,
+            device=device,
+            max_model_len=int(plan.max_model_len),
+        )
+    except Exception:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+        raise
+    return model, runtime_handle
 
 
 def load_hf_model(model_path: str, device_name: str = "cpu"):
@@ -82,6 +112,8 @@ def llaisys_model_runner_infer(
     prompt,
     tokenizer,
     model_wrapper,
+    runtime_handle,
+    kv_layout: KvCacheLayout,
     max_new_tokens=128,
     top_p=0.8,
     top_k=50,
@@ -95,8 +127,8 @@ def llaisys_model_runner_infer(
     )
     input_tokens = tokenizer.encode(input_content)
     output_tokens = [int(t) for t in input_tokens]
-    is_block_layout = int(model_wrapper._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-    block_size = int(getattr(model_wrapper, "_kv_cache_block_size", 16))
+    is_block_layout = int(kv_layout) == int(KvCacheLayout.BLOCK)
+    block_size = 16
     device = getattr(model_wrapper, "_device", llaisys.DeviceType.CPU)
     model_handle = model_wrapper._model
     block_state = BlockBatchState()
@@ -114,7 +146,7 @@ def llaisys_model_runner_infer(
             block_size=block_size,
             block_state=block_state,
         )
-        out = run_model_forward(model_handle, built, device=device)
+        out = run_model_forward(model_handle, runtime_handle, built, device=device)
         if out.status != 0:
             raise RuntimeError(f"modelForward failed with status={out.status}")
         sampled_ids = sample_from_forward(out, device=device)
@@ -130,7 +162,7 @@ def llaisys_model_runner_infer(
             pos_ids=[int(i) for i in range(len(input_tokens))],
             layout=KvCacheLayout.SLOT,
         )
-        out = run_model_forward(model_handle, built, device=device)
+        out = run_model_forward(model_handle, runtime_handle, built, device=device)
         if out.status != 0:
             raise RuntimeError(f"modelForward failed with status={out.status}")
         sampled_ids = sample_from_forward(out, device=device)
@@ -154,7 +186,7 @@ def llaisys_model_runner_infer(
                 pos_ids=[decode_pos],
                 layout=KvCacheLayout.SLOT,
             )
-            out = run_model_forward(model_handle, built, device=device)
+            out = run_model_forward(model_handle, runtime_handle, built, device=device)
             if out.status != 0:
                 raise RuntimeError(f"modelForward failed with status={out.status}")
             sampled_ids = sample_from_forward(out, device=device)
@@ -196,13 +228,13 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
 
     old_backend = _set_attn_backend(backend if ll_device == "nvidia" else None)
     model_runner = None
+    runtime_handle = None
     try:
         try:
-            model_runner = llaisys.models.Qwen2(
+            model_runner, runtime_handle = _create_qwen2_with_runtime(
                 model_path=model_path,
                 device=llaisys_device(ll_device),
-                kv_cache_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
-                kv_cache_auto_capacity=True,
+                kv_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
             )
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
@@ -212,6 +244,8 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
             prompt,
             tokenizer,
             model_runner,
+            runtime_handle,
+            KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
             max_new_tokens=max_steps,
             top_p=top_p,
             top_k=top_k,
@@ -221,6 +255,8 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
     finally:
         if model_runner is not None:
             model_runner.close()
+        if runtime_handle is not None:
+            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
         _restore_attn_backend(old_backend)
 
 
@@ -235,16 +271,18 @@ def test_infer_smoke(require_model_path):
     top_p, top_k, temperature = 1.0, 1, 1.0
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model_runner = llaisys.models.Qwen2(
+    model_runner, runtime_handle = _create_qwen2_with_runtime(
         model_path=model_path,
         device=llaisys_device("cpu"),
-        kv_cache_auto_capacity=True,
+        kv_layout=KvCacheLayout.BLOCK,
     )
     try:
         out_tokens = llaisys_model_runner_infer(
             prompt,
             tokenizer,
             model_runner,
+            runtime_handle,
+            KvCacheLayout.BLOCK,
             max_new_tokens=max_steps,
             top_p=top_p,
             top_k=top_k,
@@ -253,6 +291,7 @@ def test_infer_smoke(require_model_path):
         assert len(out_tokens) > 0
     finally:
         model_runner.close()
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
 
 
 @pytest.mark.requires_model
@@ -269,12 +308,13 @@ def test_infer_smoke_nvidia(require_model_path, backend):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     old_backend = _set_attn_backend(backend)
     model_runner = None
+    runtime_handle = None
     try:
         try:
-            model_runner = llaisys.models.Qwen2(
+            model_runner, runtime_handle = _create_qwen2_with_runtime(
                 model_path=model_path,
                 device=llaisys_device("nvidia"),
-                kv_cache_auto_capacity=True,
+                kv_layout=KvCacheLayout.BLOCK,
             )
         except Exception as exc:
             if backend == "cudnn":
@@ -284,6 +324,8 @@ def test_infer_smoke_nvidia(require_model_path, backend):
             prompt,
             tokenizer,
             model_runner,
+            runtime_handle,
+            KvCacheLayout.BLOCK,
             max_new_tokens=max_steps,
             top_p=top_p,
             top_k=top_k,
@@ -293,4 +335,6 @@ def test_infer_smoke_nvidia(require_model_path, backend):
     finally:
         if model_runner is not None:
             model_runner.close()
+        if runtime_handle is not None:
+            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
         _restore_attn_backend(old_backend)
