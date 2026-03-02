@@ -779,25 +779,38 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             tensor_t final_normed = slice_tokens_(ws.normed, ntoken);
             ops::rms_norm(final_normed, hidden, weights_.out_norm_w->tensor, meta_.epsilon);
 
-            tensor_t logits = slice_tokens_(ws.logits, ntoken);
-            ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
+            const size_t n_outputs = collected_rows.size();
+            tensor_t logits = slice_tokens_(ws.logits, n_outputs);
+            if (n_outputs == ntoken) {
+                ops::linear(logits, final_normed, weights_.out_embed->tensor, zero_bias_logits_);
+            } else {
+                std::vector<int64_t> output_rows(n_outputs, 0);
+                for (size_t i = 0; i < n_outputs; ++i) {
+                    output_rows[i] = static_cast<int64_t>(collected_rows[i]);
+                }
+                tensor_t output_rows_t = slice_tokens_(ws.argmax_idx, n_outputs);
+                output_rows_t->load(output_rows.data());
+                tensor_t selected_hidden = slice_tokens_(ws.hidden, n_outputs);
+                ops::embedding(selected_hidden, output_rows_t, final_normed);
+                ops::linear(logits, selected_hidden, weights_.out_embed->tensor, zero_bias_logits_);
+            }
             step_logits_ = logits;
 
-            tensor_t max_idx = slice_tokens_(ws.argmax_idx, ntoken);
-            tensor_t max_val = slice_tokens_(ws.argmax_val, ntoken);
+            tensor_t max_idx = slice_tokens_(ws.argmax_idx, n_outputs);
+            tensor_t max_val = slice_tokens_(ws.argmax_val, n_outputs);
             ops::argmax_rows(max_idx, max_val, logits);
 
-            std::vector<int64_t> sampled_host(ntoken, 0);
+            std::vector<int64_t> sampled_host(n_outputs, 0);
             runtime_copy_bytes(
                 LLAISYS_DEVICE_CPU,
                 reinterpret_cast<std::byte *>(sampled_host.data()),
                 device_type_,
                 max_idx->data(),
-                ntoken * sizeof(int64_t));
+                n_outputs * sizeof(int64_t));
 
-            for (int32_t row_id : collected_rows) {
-                runtime_.output->append_output_id(static_cast<int64_t>(row_id));
-                runtime_.output->append_sampled_id(sampled_host[static_cast<size_t>(row_id)]);
+            for (size_t i = 0; i < n_outputs; ++i) {
+                runtime_.output->append_output_id(static_cast<int64_t>(collected_rows[i]));
+                runtime_.output->append_sampled_id(sampled_host[i]);
             }
         }
 

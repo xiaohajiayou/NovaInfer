@@ -622,35 +622,26 @@ __export int32_t llaisysModelForward(struct LlaisysModel *model,
 
 __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
                                       struct SamplerOutput *output) {
-    if (input == nullptr || output == nullptr || input->logits == nullptr ||
-        input->output_ids == nullptr || output->sampled_ids == nullptr) {
+    if (input == nullptr || output == nullptr || input->logits == nullptr || output->sampled_ids == nullptr) {
         return -1;
     }
     try {
         const llaisys::tensor_t logits = input->logits->tensor;
-        const llaisys::tensor_t output_ids = input->output_ids->tensor;
         llaisys::tensor_t sampled_ids = output->sampled_ids->tensor;
-        if (logits == nullptr || output_ids == nullptr || sampled_ids == nullptr) {
+        if (logits == nullptr || sampled_ids == nullptr) {
             return -1;
         }
         if (logits->ndim() != 2 || !logits->isContiguous()) {
             return -1;
         }
-        if (output_ids->ndim() != 1 || output_ids->dtype() != LLAISYS_DTYPE_I64 || !output_ids->isContiguous()) {
-            return -1;
-        }
         if (sampled_ids->ndim() != 1 || sampled_ids->dtype() != LLAISYS_DTYPE_I64 || !sampled_ids->isContiguous()) {
-            return -1;
-        }
-        if (output_ids->deviceType() != logits->deviceType() || output_ids->deviceId() != logits->deviceId()) {
             return -1;
         }
         if (sampled_ids->deviceType() != logits->deviceType() || sampled_ids->deviceId() != logits->deviceId()) {
             return -1;
         }
 
-        const size_t n_tokens = logits->shape()[0];
-        const size_t n_outputs = output_ids->shape()[0];
+        const size_t n_outputs = logits->shape()[0];
         if (n_outputs == 0) {
             return 0;
         }
@@ -662,15 +653,10 @@ __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
             sampled_ids = sampled_ids->slice(0, 0, n_outputs);
         }
 
-        llaisys::tensor_t max_idx = llaisys::Tensor::create(
-            {n_tokens}, LLAISYS_DTYPE_I64, logits->deviceType(), logits->deviceId());
+        llaisys::tensor_t max_idx = sampled_ids;
         llaisys::tensor_t max_val = llaisys::Tensor::create(
-            {n_tokens}, logits->dtype(), logits->deviceType(), logits->deviceId());
+            {n_outputs}, logits->dtype(), logits->deviceType(), logits->deviceId());
         llaisys::ops::argmax_rows(max_idx, max_val, logits);
-
-        llaisys::tensor_t sampled_ids_2d = sampled_ids->view({n_outputs, static_cast<size_t>(1)});
-        llaisys::tensor_t max_idx_2d = max_idx->view({n_tokens, static_cast<size_t>(1)});
-        llaisys::ops::embedding(sampled_ids_2d, output_ids, max_idx_2d);
         return 0;
     } catch (...) {
         return -2;

@@ -70,8 +70,7 @@ __C {
     };
 
     struct SamplerInput {
-        llaisysTensor_t logits;       // optional [n_outputs, vocab], f32
-        llaisysTensor_t output_ids;   // [n_outputs], i64; selects rows from logits
+        llaisysTensor_t logits;       // [n_outputs, vocab], f32
         llaisysTensor_t temperatures; // [n_outputs], f32
         llaisysTensor_t top_ps;       // [n_outputs], f32
         llaisysTensor_t top_ks;       // [n_outputs], i32

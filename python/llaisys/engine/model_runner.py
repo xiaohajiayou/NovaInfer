@@ -90,10 +90,9 @@ class ModelRunner:
         output_ids, logits_tensor = self._forward_step(plan)
         return output_ids, logits_tensor, plan, token_idx_to_req_id
 
-    def sample_tokens(self, output_ids, logits_tensor, plan: BatchPlan):
+    def sample_tokens(self, logits_tensor, plan: BatchPlan):
         return self.sampler.sample_tokens(
             logits_tensor=logits_tensor,
-            output_ids=output_ids,
             temperatures=plan.temperatures,
             top_ps=plan.top_ps,
             top_ks=plan.top_ks,
@@ -114,7 +113,9 @@ class ModelRunner:
         )
         if output_ids is None or plan is None:
             return None, None, {}
-        sampled = self.sample_tokens(output_ids, logits_tensor, plan)
+        if int(output_ids.shape()[0]) == 0:
+            return output_ids, output_ids, token_idx_to_req_id
+        sampled = self.sample_tokens(logits_tensor, plan)
         return output_ids, sampled, token_idx_to_req_id
 
     @staticmethod

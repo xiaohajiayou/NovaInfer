@@ -26,7 +26,6 @@ class Sampler:
         self,
         *,
         logits_tensor: Optional[Tensor],
-        output_ids: Optional[Tensor],
         temperatures: Optional[Sequence[float]] = None,
         top_ps: Optional[Sequence[float]] = None,
         top_ks: Optional[Sequence[int]] = None,
@@ -37,12 +36,12 @@ class Sampler:
         # consume these controls yet.
         del temperatures, top_ps, top_ks, seeds, has_seeds
 
-        if logits_tensor is None or output_ids is None:
+        if logits_tensor is None:
             return None
 
-        shape = output_ids.shape()
-        if len(shape) != 1:
-            raise RuntimeError("sampler expects output_ids to be 1D")
+        shape = logits_tensor.shape()
+        if len(shape) != 2:
+            raise RuntimeError("sampler expects logits to be 2D")
         n_outputs = int(shape[0])
 
         self._ensure_sampled_buffer(n_outputs)
@@ -51,7 +50,6 @@ class Sampler:
 
         sin = SamplerInput()
         sin.logits = logits_tensor.lib_tensor()
-        sin.output_ids = output_ids.lib_tensor()
         sin.temperatures = None
         sin.top_ps = None
         sin.top_ks = None
