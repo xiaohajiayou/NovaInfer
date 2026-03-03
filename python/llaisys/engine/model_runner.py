@@ -143,7 +143,9 @@ class ModelRunner:
         if self._runtime is None:
             raise RuntimeError("runtime handle is required")
 
-        fin, fout, n_outputs, output_rows, _keepalive = self._build_forward_io(plan)
+        fin, fout, n_outputs, output_rows, keepalive = self._build_forward_io(plan)
+        for t in keepalive:
+            t.wait()
         status = int(forward_fn(self._runtime, fin, fout))
         if status != 0:
             raise RuntimeError(f"modelForward failed with status={status}")
@@ -186,9 +188,11 @@ class ModelRunner:
         n_block_elems = len(plan.block_tables) if plan.block_tables is not None else 0
         self._ensure_token_buffers(ntoken)
         self._ensure_batch_buffers(n_batch_seq, n_block_elems)
-        assert self._input_ids_buf is not None and self._pos_ids_buf is not None
+        assert self._input_ids_buf is not None
+        assert self._pos_ids_buf is not None
         assert self._pos_ids_host_buf is not None
-        assert self._seq_ids_buf is not None and self._output_ids_buf is not None
+        assert self._seq_ids_buf is not None
+        assert self._output_ids_buf is not None
 
         input_ids = self._input_ids_buf.slice(0, 0, ntoken)
         pos_ids = self._pos_ids_buf.slice(0, 0, ntoken)
@@ -202,7 +206,13 @@ class ModelRunner:
         if output_rows:
             logits_indices.copy_from_sequence(output_rows)
 
-        keepalive: list[Tensor] = [input_ids, pos_ids, pos_ids_host, seq_ids, logits_indices]
+        keepalive: list[Tensor] = [
+            input_ids,
+            pos_ids,
+            pos_ids_host,
+            seq_ids,
+            logits_indices,
+        ]
         attn, attn_keepalive = self._build_attention_metadata(
             plan=plan,
             ntoken=ntoken,
@@ -306,7 +316,7 @@ class ModelRunner:
             *plan.block_tables,
         ]
         block_meta_host.copy_from_sequence(packed_i32)
-        block_meta_dev.copy_(block_meta_host)
+        block_meta_dev.copy_(block_meta_host, non_blocking=True)
 
         off = 0
         q_seq_rows = block_meta_dev.slice(0, off, off + ntoken)

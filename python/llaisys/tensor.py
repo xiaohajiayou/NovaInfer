@@ -26,6 +26,7 @@ from ctypes import (
 
 class Tensor:
     _runtime_api_cache = {}
+    _async_stream_cache = {}
 
     def __init__(
         self,
@@ -35,6 +36,10 @@ class Tensor:
         device_id: int = 0,
         tensor: llaisysTensor_t = None,
     ):
+        self._pending_api = None
+        self._pending_stream = None
+        self._pending_device_id = None
+        self._parent = None
         if tensor:
             self._tensor = tensor
         else:
@@ -50,6 +55,10 @@ class Tensor:
 
     def __del__(self):
         if hasattr(self, "_tensor") and self._tensor is not None:
+            try:
+                self.wait()
+            except Exception:
+                pass
             LIB_LLAISYS.tensorDestroy(self._tensor)
             self._tensor = None
 
@@ -88,6 +97,7 @@ class Tensor:
         return f"<Tensor shape={self.shape}, dtype={self.dtype}, device={self.device_type}:{self.device_id}>"
 
     def load(self, data: c_void_p):
+        self.wait()
         LIB_LLAISYS.tensorLoad(self._tensor, data)
 
     def copy_from_sequence(self, values: Sequence[int | float]) -> None:
@@ -114,30 +124,40 @@ class Tensor:
 
     def view(self, *shape: int) -> llaisysTensor_t:
         _shape = (c_size_t * len(shape))(*shape)
-        return Tensor(
+        out = Tensor(
             tensor=LIB_LLAISYS.tensorView(self._tensor, _shape, c_size_t(len(shape)))
         )
+        out._parent = self
+        return out
 
     def permute(self, *perm: int) -> llaisysTensor_t:
         assert len(perm) == self.ndim()
         _perm = (c_size_t * len(perm))(*perm)
-        return Tensor(tensor=LIB_LLAISYS.tensorPermute(self._tensor, _perm))
+        out = Tensor(tensor=LIB_LLAISYS.tensorPermute(self._tensor, _perm))
+        out._parent = self
+        return out
 
     def slice(self, dim: int, start: int, end: int):
-        return Tensor(
+        out = Tensor(
             tensor=LIB_LLAISYS.tensorSlice(
                 self._tensor, c_size_t(dim), c_size_t(start), c_size_t(end)
             )
         )
+        out._parent = self
+        return out
 
     def contiguous(self):
-        return Tensor(tensor=LIB_LLAISYS.tensorContiguous(self._tensor))
+        out = Tensor(tensor=LIB_LLAISYS.tensorContiguous(self._tensor))
+        out._parent = self
+        return out
 
     def reshape(self, *shape: int):
         _shape = (c_size_t * len(shape))(*shape)
-        return Tensor(
+        out = Tensor(
             tensor=LIB_LLAISYS.tensorReshape(self._tensor, _shape, c_size_t(len(shape)))
         )
+        out._parent = self
+        return out
 
     def numel(self) -> int:
         n = 1
@@ -167,6 +187,18 @@ class Tensor:
         api = RuntimeAPI(device_type)
         cls._runtime_api_cache[device_type] = api
         return api
+
+    @classmethod
+    def _async_stream(cls, device_id: int):
+        key = int(device_id)
+        stream = cls._async_stream_cache.get(key)
+        if stream is not None:
+            return stream
+        api = cls._runtime_api(DeviceType.NVIDIA)
+        api.set_device(key)
+        stream = api.create_stream()
+        cls._async_stream_cache[key] = stream
+        return stream
 
     @staticmethod
     def _normalize_device(device, current_device: DeviceType, current_device_id: int) -> tuple[DeviceType, int]:
@@ -249,15 +281,42 @@ class Tensor:
 
     @classmethod
     def _copy_tensor_bytes(cls, dst: "Tensor", src: "Tensor", non_blocking: bool) -> None:
-        del non_blocking
+        dst.wait()
+        src.wait()
         kind = cls._infer_memcpy_kind(dst.device_type(), src.device_type())
         if dst.device_type() == DeviceType.NVIDIA or src.device_type() == DeviceType.NVIDIA:
             api = cls._runtime_api(DeviceType.NVIDIA)
             dev_id = dst.device_id() if dst.device_type() == DeviceType.NVIDIA else src.device_id()
             api.set_device(dev_id)
+            if non_blocking:
+                stream = cls._async_stream(dev_id)
+                api.memcpy_async(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind, stream)
+                dst._set_pending(api, stream, dev_id)
+                src._set_pending(api, stream, dev_id)
+                return
         else:
             api = cls._runtime_api(DeviceType.CPU)
         api.memcpy_sync(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind)
+
+    def _set_pending(self, api, stream, device_id=None) -> None:
+        t = self
+        while t is not None:
+            t._pending_api = api
+            t._pending_stream = stream
+            t._pending_device_id = device_id
+            t = t._parent
+
+    def wait(self) -> "Tensor":
+        if self._parent is not None:
+            self._parent.wait()
+        if self._pending_api is not None and self._pending_stream is not None:
+            if self._pending_device_id is not None:
+                self._pending_api.set_device(int(self._pending_device_id))
+            self._pending_api.stream_synchronize(self._pending_stream)
+            self._pending_api = None
+            self._pending_stream = None
+            self._pending_device_id = None
+        return self
 
     def clone(self) -> "Tensor":
         out = Tensor(self.shape(), self.dtype(), self.device_type(), self.device_id())
@@ -317,6 +376,7 @@ class Tensor:
     def tolist(self):
         if self.device_type() != DeviceType.CPU:
             raise RuntimeError("tolist() requires CPU tensor; call to(device=DeviceType.CPU) first")
+        self.wait()
         shape = self.shape()
         if len(shape) != 1:
             raise RuntimeError("tolist() currently supports only 1D tensors")
