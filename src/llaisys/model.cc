@@ -7,9 +7,11 @@
 #include "runtime/kv_cache/paged_kv.hpp"
 #include "runtime/kv_cache/unified_kv.hpp"
 #include "runtime/weights/weights.hpp"
+#include "../core/context/context.hpp"
 #include "../utils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -319,6 +321,48 @@ struct LlaisysModelImpl {
 };
 
 struct LlaisysRuntimeImpl {
+    struct ForwardInputScratchState {
+        struct DeviceBuffer1D {
+            llaisys::tensor_t storage{};
+            size_t capacity{0};
+            llaisysDataType_t dtype{LLAISYS_DTYPE_INVALID};
+            llaisysDeviceType_t device_type{LLAISYS_DEVICE_CPU};
+            int device_id{0};
+
+            llaisys::tensor_t ensure(size_t n,
+                                     llaisysDataType_t target_dtype,
+                                     llaisysDeviceType_t target_device_type,
+                                     int target_device_id) {
+                const size_t min_cap = std::max<size_t>(size_t{1}, n);
+                const bool recreate =
+                    (storage == nullptr) || (capacity < min_cap) || (dtype != target_dtype) ||
+                    (device_type != target_device_type) || (device_id != target_device_id);
+                if (recreate) {
+                    size_t cap = std::max<size_t>(size_t{1}, capacity);
+                    while (cap < min_cap) {
+                        cap *= 2;
+                    }
+                    storage = llaisys::Tensor::create({cap}, target_dtype, target_device_type, target_device_id);
+                    capacity = cap;
+                    dtype = target_dtype;
+                    device_type = target_device_type;
+                    device_id = target_device_id;
+                }
+                if (n == capacity) {
+                    return storage;
+                }
+                return storage->slice(0, 0, n);
+            }
+        };
+
+        DeviceBuffer1D input_ids{};
+        DeviceBuffer1D pos_ids{};
+        DeviceBuffer1D logits_indices{};
+        LlaisysTensor input_ids_handle{};
+        LlaisysTensor pos_ids_handle{};
+        LlaisysTensor logits_indices_handle{};
+    };
+
     struct SamplerScratchState {
         llaisys::tensor_t max_val_buf{};
         size_t max_val_capacity{0};
@@ -356,7 +400,115 @@ struct LlaisysRuntimeImpl {
     LlaisysRuntimeCreateParams params{};
     std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
     std::weak_ptr<LlaisysModelImpl> bound_model{};
+    ForwardInputScratchState forward_input_scratch{};
     SamplerScratchState sampler_scratch{};
+
+    bool prepare_1d_tensor_on_device(const llaisysTensor_t src_handle,
+                                     size_t expected_len,
+                                     llaisysDataType_t expected_dtype,
+                                     llaisysDeviceType_t target_device_type,
+                                     int target_device_id,
+                                     ForwardInputScratchState::DeviceBuffer1D *buffer,
+                                     LlaisysTensor *prepared_handle,
+                                     llaisysTensor_t *out_handle) {
+        if (src_handle == nullptr || src_handle->tensor == nullptr || buffer == nullptr || prepared_handle == nullptr ||
+            out_handle == nullptr) {
+            return false;
+        }
+        const llaisys::tensor_t src = src_handle->tensor;
+        if (src->ndim() != 1 || src->dtype() != expected_dtype || !src->isContiguous() || src->shape()[0] != expected_len) {
+            return false;
+        }
+        const bool debug_prepare = (std::getenv("LLAISYS_DEBUG_PREPARE_INPUT") != nullptr);
+        if (debug_prepare) {
+            std::cerr << "[prepare] src dtype=" << static_cast<int>(src->dtype())
+                      << " len=" << src->shape()[0]
+                      << " dev=(" << static_cast<int>(src->deviceType()) << "," << src->deviceId() << ")"
+                      << " -> target=(" << static_cast<int>(target_device_type) << "," << target_device_id << ")"
+                      << std::endl;
+        }
+        if (src->deviceType() == target_device_type && src->deviceId() == target_device_id) {
+            *out_handle = src_handle;
+            return true;
+        }
+
+        const llaisys::tensor_t dst = buffer->ensure(expected_len, expected_dtype, target_device_type, target_device_id);
+        if (dst == nullptr) {
+            return false;
+        }
+
+        llaisys::core::context().setDevice(target_device_type, target_device_id);
+        const llaisysMemcpyKind_t kind = llaisys::utils::infer_memcpy_kind(target_device_type, src->deviceType());
+        const size_t bytes = expected_len * llaisys::utils::dsize(expected_dtype);
+        if (debug_prepare) {
+            std::cerr << "[prepare] copy bytes=" << bytes << " kind=" << static_cast<int>(kind) << std::endl;
+        }
+        if (bytes > 0) {
+            auto &rt = llaisys::core::context().runtime();
+            rt.api()->memcpy_async(dst->data(), src->data(), bytes, kind, rt.stream());
+        }
+
+        prepared_handle->tensor = dst;
+        *out_handle = prepared_handle;
+        return true;
+    }
+
+    bool prepare_forward_input(const std::shared_ptr<LlaisysModelImpl> &impl,
+                               const ModelForwardInput &input,
+                               ModelForwardInput *prepared) {
+        if (impl == nullptr || prepared == nullptr) {
+            return false;
+        }
+        *prepared = input;
+        if (impl->type != LLAISYS_MODEL_TYPE_QWEN2 || !impl->qwen2) {
+            return true;
+        }
+
+        const llaisysDeviceType_t target_device_type = impl->qwen2->device_type();
+        const int target_device_id = impl->qwen2->device_id();
+        if (target_device_type != LLAISYS_DEVICE_NVIDIA) {
+            return true;
+        }
+        if (input.input_ids == nullptr || input.input_ids->tensor == nullptr || input.pos_ids == nullptr ||
+            input.pos_ids->tensor == nullptr || input.logits_indices == nullptr || input.logits_indices->tensor == nullptr) {
+            return false;
+        }
+
+        const size_t ntoken = input.input_ids->tensor->shape()[0];
+        const size_t n_logits = input.logits_indices->tensor->shape()[0];
+
+        if (!prepare_1d_tensor_on_device(input.input_ids,
+                                         ntoken,
+                                         LLAISYS_DTYPE_I64,
+                                         target_device_type,
+                                         target_device_id,
+                                         &forward_input_scratch.input_ids,
+                                         &forward_input_scratch.input_ids_handle,
+                                         &prepared->input_ids)) {
+            return false;
+        }
+        if (!prepare_1d_tensor_on_device(input.pos_ids,
+                                         ntoken,
+                                         LLAISYS_DTYPE_I64,
+                                         target_device_type,
+                                         target_device_id,
+                                         &forward_input_scratch.pos_ids,
+                                         &forward_input_scratch.pos_ids_handle,
+                                         &prepared->pos_ids)) {
+            return false;
+        }
+        if (!prepare_1d_tensor_on_device(input.logits_indices,
+                                         n_logits,
+                                         LLAISYS_DTYPE_I64,
+                                         target_device_type,
+                                         target_device_id,
+                                         &forward_input_scratch.logits_indices,
+                                         &forward_input_scratch.logits_indices_handle,
+                                         &prepared->logits_indices)) {
+            return false;
+        }
+        return true;
+    }
 
     bool ensure_model_bound(const std::shared_ptr<LlaisysModelImpl> &impl) {
         if (!impl) {
@@ -556,6 +708,20 @@ __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime) {
     delete runtime;
 }
 
+__export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,
+                                                        llaisysDeviceType_t device_type,
+                                                        int device_id) {
+    if (runtime == nullptr || runtime->impl == nullptr) {
+        return nullptr;
+    }
+    try {
+        llaisys::core::context().setDevice(device_type, device_id);
+        return llaisys::core::context().runtime().stream();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model) {
     if (model == nullptr || model->impl == nullptr) {
         return LLAISYS_MODEL_TYPE_UNKNOWN;
@@ -669,7 +835,11 @@ __export int32_t llaisysModelForward(struct LlaisysModel *model,
         if (!runtime->impl->ensure_model_bound(model->impl)) {
             return -1;
         }
-        return model->impl->forward(*input, output);
+        ModelForwardInput prepared = *input;
+        if (!runtime->impl->prepare_forward_input(model->impl, *input, &prepared)) {
+            return -1;
+        }
+        return model->impl->forward(prepared, output);
     } catch (const std::invalid_argument &) {
         return -1;
     } catch (...) {

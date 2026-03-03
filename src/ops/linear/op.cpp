@@ -6,14 +6,27 @@
 
 namespace llaisys::ops {
 void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
-    CHECK_SAME_DTYPE(out->dtype(), in->dtype(), weight->dtype(), bias->dtype());
-    CHECK_SAME_DEVICE(out, in, weight, bias);
-    ASSERT(out->isContiguous() && in->isContiguous() && weight->isContiguous() && bias->isContiguous(), "Linear: all tensors must be contiguous.");
+    CHECK_ARGUMENT(out != nullptr && in != nullptr && weight != nullptr, "Linear: out/in/weight must be non-null.");
+    CHECK_SAME_DTYPE(out->dtype(), in->dtype(), weight->dtype());
+    if (bias != nullptr) {
+        CHECK_SAME_DTYPE(out->dtype(), bias->dtype());
+    }
+    CHECK_SAME_DEVICE(out, in, weight);
+    if (bias != nullptr) {
+        CHECK_SAME_DEVICE(out, bias);
+    }
+    ASSERT(out->isContiguous() && in->isContiguous() && weight->isContiguous(), "Linear: out/in/weight must be contiguous.");
+    if (bias != nullptr) {
+        ASSERT(bias->isContiguous(), "Linear: bias must be contiguous.");
+    }
     const size_t batch_size = in->shape()[0];
     const size_t input_dim = in->shape()[1];
     const size_t output_dim = weight->shape()[0];
     ASSERT(input_dim == weight->shape()[1], "Linear: input dimension must match weight dimension.");
     ASSERT(out->shape()[0] == batch_size && out->shape()[1] == output_dim, "Linear: output shape must match.");
+    if (bias != nullptr) {
+        ASSERT(bias->ndim() == 1 && bias->shape()[0] == output_dim, "Linear: bias shape must be [output_dim].");
+    }
     switch (out->deviceType()) {
     case LLAISYS_DEVICE_CPU:
         return cpu::linear(out, in, weight, bias);

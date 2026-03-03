@@ -54,6 +54,8 @@ typedef enum {
 // Runtime Types
 // Stream
 typedef void *llaisysStream_t;
+// Event
+typedef void *llaisysEvent_t;
 
 // Memory Copy Directions
 typedef enum {

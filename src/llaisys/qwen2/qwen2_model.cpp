@@ -52,20 +52,6 @@ tensor_t kv_layer_v_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t 
     return impl->layer_v(layer);
 }
 
-llaisysMemcpyKind_t choose_memcpy_kind(llaisysDeviceType_t dst, llaisysDeviceType_t src) {
-    if (dst == LLAISYS_DEVICE_CPU && src == LLAISYS_DEVICE_CPU) {
-        return LLAISYS_MEMCPY_H2H;
-    }
-    if (dst != LLAISYS_DEVICE_CPU && src == LLAISYS_DEVICE_CPU) {
-        return LLAISYS_MEMCPY_H2D;
-    }
-    if (dst == LLAISYS_DEVICE_CPU && src != LLAISYS_DEVICE_CPU) {
-        return LLAISYS_MEMCPY_D2H;
-    }
-    return LLAISYS_MEMCPY_D2D;
-}
-
-
 #ifdef ENABLE_NVIDIA_API
 ops::cuda::PagedAttentionBackend parse_paged_attn_backend_env() {
     const char *raw = std::getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND");
@@ -234,10 +220,11 @@ void Qwen2Model::check_tensor_(const llaisysTensor_t handle,
 }
 
 tensor_t Qwen2Model::bias_or_zero_(llaisysTensor_t handle, const tensor_t &zero_bias) const {
+    (void)zero_bias;
     if (handle) {
         return handle->tensor;
     }
-    return zero_bias;
+    return nullptr;
 }
 
 void Qwen2Model::validate_or_die_() {
@@ -338,7 +325,7 @@ void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const ten
     if (stride_bytes == 0) {
         return;
     }
-    const llaisysMemcpyKind_t kind = choose_memcpy_kind(cache->deviceType(), src->deviceType());
+    const llaisysMemcpyKind_t kind = llaisys::utils::infer_memcpy_kind(cache->deviceType(), src->deviceType());
     utils::NvtxScope nvtx_scope(utils::nvtx_memcpy_tag(kind, false));
     const auto *api = core::context().runtime().api();
     api->memcpy_sync(dst, src_ptr, stride_bytes, kind);
@@ -737,7 +724,7 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
             {
                 LLAISYS_NVTX_SCOPE("forward/layer/attn_out_proj");
-                ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, zero_bias_attn_o_);
+                ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, nullptr);
                 ops::add(hidden, hidden, attn_proj);
             }
 
@@ -748,14 +735,14 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             tensor_t up = slice_tokens_(ws.up, ntoken);
             {
                 LLAISYS_NVTX_SCOPE("forward/layer/mlp");
-                ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, zero_bias_mlp_gate_);
-                ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, zero_bias_mlp_up_);
+                ops::linear(gate, mlp_normed, weights_.mlp_gate_w[layer]->tensor, nullptr);
+                ops::linear(up, mlp_normed, weights_.mlp_up_w[layer]->tensor, nullptr);
 
                 tensor_t swiglu = slice_tokens_(ws.swiglu, ntoken);
                 ops::swiglu(swiglu, gate, up);
 
                 tensor_t down = slice_tokens_(ws.down, ntoken);
-                ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, zero_bias_mlp_down_);
+                ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, nullptr);
                 ops::add(hidden, hidden, down);
             }
         }
@@ -777,7 +764,7 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             }
             {
                 LLAISYS_NVTX_SCOPE("forward/logits_proj");
-                ops::linear(logits, selected_hidden, weights_.out_embed->tensor, zero_bias_logits_);
+                ops::linear(logits, selected_hidden, weights_.out_embed->tensor, nullptr);
             }
             step_logits_ = logits;
         }

@@ -22,6 +22,7 @@ class _ExecuteModelState:
     logits: Tensor
     plan: BatchPlan
     sampled_req_ids: list[str]
+    keepalive: list[Tensor]
 
 
 class ModelRunner:
@@ -49,7 +50,6 @@ class ModelRunner:
         self._step_capacity_block_meta_i32 = 0
         self._input_ids_buf: Tensor | None = None
         self._pos_ids_buf: Tensor | None = None
-        self._pos_ids_host_buf: Tensor | None = None
         self._seq_ids_buf: Tensor | None = None
         self._batch_seq_ids_buf: Tensor | None = None
         self._block_meta_host_buf: Tensor | None = None
@@ -99,7 +99,7 @@ class ModelRunner:
         if not plan.token_ids:
             return None
 
-        output_rows, logits_tensor = self._forward_step(plan)
+        output_rows, logits_tensor, keepalive = self._forward_step(plan)
         sampled_req_ids: list[str] = []
         for out_idx in output_rows:
             rid = token_idx_to_req_id.get(int(out_idx))
@@ -110,6 +110,7 @@ class ModelRunner:
             logits=logits_tensor,
             plan=plan,
             sampled_req_ids=sampled_req_ids,
+            keepalive=keepalive,
         )
         return None
 
@@ -136,7 +137,7 @@ class ModelRunner:
             raise RuntimeError("sampler output size mismatch with sampled request ids")
         return sampled, list(state.sampled_req_ids)
 
-    def _forward_step(self, plan: BatchPlan) -> tuple[list[int], Tensor]:
+    def _forward_step(self, plan: BatchPlan) -> tuple[list[int], Tensor, list[Tensor]]:
         forward_fn = getattr(self.model, "forward", None)
         if not callable(forward_fn):
             raise RuntimeError("model wrapper must implement forward(ModelForwardInput, ModelForwardOutput)")
@@ -154,7 +155,7 @@ class ModelRunner:
             raise RuntimeError("modelForward returned invalid logits shape")
         if int(logits_shape[0]) != int(n_outputs):
             raise RuntimeError("modelForward logits row count mismatch with logits_indices")
-        return output_rows, self._logits_holder
+        return output_rows, self._logits_holder, keepalive
 
     def _normalize_step_inputs(self, plan: BatchPlan, ntoken: int) -> tuple[bool, list[int], list[int], list[int]]:
         is_block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
@@ -190,18 +191,15 @@ class ModelRunner:
         self._ensure_batch_buffers(n_batch_seq, n_block_elems)
         assert self._input_ids_buf is not None
         assert self._pos_ids_buf is not None
-        assert self._pos_ids_host_buf is not None
         assert self._seq_ids_buf is not None
         assert self._output_ids_buf is not None
 
         input_ids = self._input_ids_buf.slice(0, 0, ntoken)
         pos_ids = self._pos_ids_buf.slice(0, 0, ntoken)
-        pos_ids_host = self._pos_ids_host_buf.slice(0, 0, ntoken)
         seq_ids = self._seq_ids_buf.slice(0, 0, ntoken)
         logits_indices = self._output_ids_buf.slice(0, 0, len(output_rows))
         input_ids.copy_from_sequence(plan.token_ids)
         pos_ids.copy_from_sequence(pos)
-        pos_ids_host.copy_from_sequence(pos)
         seq_ids.copy_from_sequence(seq)
         if output_rows:
             logits_indices.copy_from_sequence(output_rows)
@@ -209,7 +207,6 @@ class ModelRunner:
         keepalive: list[Tensor] = [
             input_ids,
             pos_ids,
-            pos_ids_host,
             seq_ids,
             logits_indices,
         ]
@@ -217,7 +214,7 @@ class ModelRunner:
             plan=plan,
             ntoken=ntoken,
             seq_ids=seq_ids,
-            pos_ids_host=pos_ids_host,
+            pos_ids_host=pos_ids,
             is_block_layout=is_block_layout,
         )
         keepalive.extend(attn_keepalive)
@@ -316,7 +313,7 @@ class ModelRunner:
             *plan.block_tables,
         ]
         block_meta_host.copy_from_sequence(packed_i32)
-        block_meta_dev.copy_(block_meta_host, non_blocking=True)
+        block_meta_dev.copy_(block_meta_host)
 
         off = 0
         q_seq_rows = block_meta_dev.slice(0, off, off + ntoken)
@@ -355,11 +352,10 @@ class ModelRunner:
     def _ensure_token_buffers(self, n_tokens: int) -> None:
         if n_tokens <= self._step_capacity_tokens:
             return
-        self._input_ids_buf = Tensor((n_tokens,), DataType.I64, self._device, 0)
-        self._pos_ids_buf = Tensor((n_tokens,), DataType.I64, self._device, 0)
-        self._pos_ids_host_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
+        self._input_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
+        self._pos_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
         self._seq_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
-        self._output_ids_buf = Tensor((n_tokens,), DataType.I64, self._device, 0)
+        self._output_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
         self._step_capacity_tokens = n_tokens
 
     def _ensure_batch_buffers(self, n_batch_seq: int, n_block_elems: int) -> None:

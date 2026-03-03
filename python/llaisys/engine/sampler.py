@@ -71,5 +71,5 @@ class Sampler:
             return sampled_ids_dev
         assert self._sampled_ids_host_buf is not None
         sampled_ids_host = self._sampled_ids_host_buf.slice(0, 0, n_outputs)
-        sampled_ids_host.copy_(sampled_ids_dev, non_blocking=True)
+        sampled_ids_host.copy_(sampled_ids_dev)
         return sampled_ids_host

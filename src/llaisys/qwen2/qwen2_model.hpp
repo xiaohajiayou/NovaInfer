@@ -56,6 +56,8 @@ public:
     LlaisysQwen2Weights *weights() noexcept { return &weights_; }
     size_t nlayer() const noexcept { return meta_.nlayer; }
     size_t vocab_size() const noexcept { return meta_.voc; }
+    llaisysDeviceType_t device_type() const noexcept { return device_type_; }
+    int device_id() const noexcept { return device_id_; }
     int32_t forward(const ::ModelForwardInput &input, ::ModelForwardOutput *output);
     tensor_t step_logits() const noexcept { return step_logits_; }
     runtime::kv_cache::KvCacheBase *kv_cache() noexcept { return runtime_.kv_cache.get(); }

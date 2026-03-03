@@ -88,6 +88,11 @@ __C {
     __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
     __export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntimeCreateParams *params);
     __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime);
+    // Return the runtime compute stream bound to (device_type, device_id) in current thread.
+    // nullptr on invalid input or failure.
+    __export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,
+                                                            llaisysDeviceType_t device_type,
+                                                            int device_id);
 
     __export void *llaisysModelWeights(struct LlaisysModel *model);
     // Safely replace one weight slot:

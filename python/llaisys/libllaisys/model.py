@@ -1,7 +1,7 @@
 from ctypes import POINTER, Structure, c_int, c_int32, c_int64, c_char_p, c_void_p
 from enum import IntEnum
 
-from .llaisys_types import llaisysDeviceType_t
+from .llaisys_types import llaisysDeviceType_t, llaisysStream_t
 from .tensor import llaisysTensor_t
 
 
@@ -98,6 +98,8 @@ def load_model(lib):
 
     lib.llaisysRuntimeDestroy.argtypes = [llaisysRuntime_t]
     lib.llaisysRuntimeDestroy.restype = None
+    lib.llaisysRuntimeGetComputeStream.argtypes = [llaisysRuntime_t, llaisysDeviceType_t, c_int]
+    lib.llaisysRuntimeGetComputeStream.restype = llaisysStream_t
 
     lib.llaisysModelCreate.argtypes = [POINTER(LlaisysModelCreateParams)]
     lib.llaisysModelCreate.restype = llaisysModel_t

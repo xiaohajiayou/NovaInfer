@@ -4,6 +4,8 @@ from .libllaisys import (
     LIB_LLAISYS,
     llaisysTensor_t,
     llaisysDeviceType_t,
+    llaisysEvent_t,
+    llaisysStream_t,
     DeviceType,
     MemcpyKind,
     llaisysDataType_t,
@@ -37,6 +39,7 @@ class Tensor:
         tensor: llaisysTensor_t = None,
     ):
         self._pending_api = None
+        self._pending_event = None
         self._pending_stream = None
         self._pending_device_id = None
         self._parent = None
@@ -280,42 +283,86 @@ class Tensor:
         raise RuntimeError(f"unsupported memcpy route: {src} -> {dst}")
 
     @classmethod
-    def _copy_tensor_bytes(cls, dst: "Tensor", src: "Tensor", non_blocking: bool) -> None:
-        dst.wait()
-        src.wait()
+    def _copy_tensor_bytes(
+        cls,
+        dst: "Tensor",
+        src: "Tensor",
+        non_blocking: bool,
+        stream: llaisysStream_t | None = None,
+    ) -> None:
         kind = cls._infer_memcpy_kind(dst.device_type(), src.device_type())
         if dst.device_type() == DeviceType.NVIDIA or src.device_type() == DeviceType.NVIDIA:
             api = cls._runtime_api(DeviceType.NVIDIA)
             dev_id = dst.device_id() if dst.device_type() == DeviceType.NVIDIA else src.device_id()
             api.set_device(dev_id)
             if non_blocking:
-                stream = cls._async_stream(dev_id)
+                if stream is None:
+                    # Conservative path for generic async copy: synchronize prior work and
+                    # use a dedicated transfer stream.
+                    dst.wait()
+                    src.wait()
+                    stream = cls._async_stream(dev_id)
+                else:
+                    # Explicit stream path: keep dependency on the same stream whenever possible.
+                    if (
+                        dst._pending_api is not None
+                        and dst._pending_stream is not None
+                        and (dst._pending_api is not api or dst._pending_stream != stream)
+                    ):
+                        dst.wait()
+                    if (
+                        src._pending_api is not None
+                        and src._pending_stream is not None
+                        and (src._pending_api is not api or src._pending_stream != stream)
+                    ):
+                        src.wait()
                 api.memcpy_async(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind, stream)
-                dst._set_pending(api, stream, dev_id)
-                src._set_pending(api, stream, dev_id)
+                event = api.create_event()
+                api.event_record(event, stream)
+                dst._set_pending(api, stream, event, dev_id)
                 return
+            dst.wait()
+            src.wait()
         else:
             api = cls._runtime_api(DeviceType.CPU)
+            dst.wait()
+            src.wait()
         api.memcpy_sync(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind)
 
-    def _set_pending(self, api, stream, device_id=None) -> None:
+    def _root(self) -> "Tensor":
         t = self
-        while t is not None:
-            t._pending_api = api
-            t._pending_stream = stream
-            t._pending_device_id = device_id
+        while t._parent is not None:
             t = t._parent
+        return t
 
-    def wait(self) -> "Tensor":
-        if self._parent is not None:
-            self._parent.wait()
+    def _clear_pending(self) -> None:
         if self._pending_api is not None and self._pending_stream is not None:
             if self._pending_device_id is not None:
                 self._pending_api.set_device(int(self._pending_device_id))
-            self._pending_api.stream_synchronize(self._pending_stream)
-            self._pending_api = None
-            self._pending_stream = None
-            self._pending_device_id = None
+            if self._pending_event is not None:
+                self._pending_api.event_synchronize(self._pending_event)
+                self._pending_api.destroy_event(self._pending_event)
+            else:
+                self._pending_api.stream_synchronize(self._pending_stream)
+        self._pending_api = None
+        self._pending_stream = None
+        self._pending_event = None
+        self._pending_device_id = None
+
+    def _set_pending(self, api, stream, event: llaisysEvent_t | None = None, device_id=None) -> None:
+        root = self._root()
+        if root._pending_api is not None and root._pending_stream is not None:
+            if root._pending_device_id is not None:
+                root._pending_api.set_device(int(root._pending_device_id))
+            if root._pending_event is not None:
+                root._pending_api.destroy_event(root._pending_event)
+        root._pending_api = api
+        root._pending_stream = stream
+        root._pending_event = event
+        root._pending_device_id = device_id
+
+    def wait(self) -> "Tensor":
+        self._root()._clear_pending()
         return self
 
     def clone(self) -> "Tensor":
@@ -323,14 +370,19 @@ class Tensor:
         out.copy_(self)
         return out
 
-    def copy_(self, src: "Tensor", non_blocking: bool = False) -> "Tensor":
+    def copy_(
+        self,
+        src: "Tensor",
+        non_blocking: bool = False,
+        stream: llaisysStream_t | None = None,
+    ) -> "Tensor":
         if not isinstance(src, Tensor):
             raise RuntimeError("copy_ expects a Tensor source")
         if self.shape() != src.shape():
             raise RuntimeError("copy_ requires same shape")
         if self.dtype() != src.dtype():
             raise RuntimeError("copy_ requires same dtype")
-        self._copy_tensor_bytes(self, src, non_blocking)
+        self._copy_tensor_bytes(self, src, non_blocking, stream=stream)
         return self
 
     def to(

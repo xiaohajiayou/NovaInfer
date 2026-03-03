@@ -29,6 +29,22 @@ void streamSynchronize(llaisysStream_t stream) {
     // do nothing
 }
 
+llaisysEvent_t createEvent() {
+    return (llaisysEvent_t)0; // null event
+}
+
+void destroyEvent(llaisysEvent_t event) {
+    // do nothing
+}
+
+void eventRecord(llaisysEvent_t event, llaisysStream_t stream) {
+    // do nothing
+}
+
+void eventSynchronize(llaisysEvent_t event) {
+    // do nothing
+}
+
 void *mallocDevice(size_t size) {
     return std::malloc(size);
 }
@@ -62,6 +78,10 @@ static const LlaisysRuntimeAPI RUNTIME_API = {
     &createStream,
     &destroyStream,
     &streamSynchronize,
+    &createEvent,
+    &destroyEvent,
+    &eventRecord,
+    &eventSynchronize,
     &mallocDevice,
     &freeDevice,
     &mallocHost,

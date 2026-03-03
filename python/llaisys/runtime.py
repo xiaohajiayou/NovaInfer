@@ -29,6 +29,23 @@ class RuntimeAPI:
     def stream_synchronize(self, stream: libllaisys.llaisysStream_t) -> None:
         self._api.contents.stream_synchronize(stream)
 
+    def create_event(self) -> libllaisys.llaisysEvent_t:
+        event = self._api.contents.create_event()
+        return event
+
+    def destroy_event(self, event: libllaisys.llaisysEvent_t) -> None:
+        self._api.contents.destroy_event(event)
+
+    def event_record(
+        self,
+        event: libllaisys.llaisysEvent_t,
+        stream: libllaisys.llaisysStream_t,
+    ) -> None:
+        self._api.contents.event_record(event, stream)
+
+    def event_synchronize(self, event: libllaisys.llaisysEvent_t) -> None:
+        self._api.contents.event_synchronize(event)
+
     def malloc_device(self, size: int) -> c_void_p:
         ptr = self._api.contents.malloc_device(size)
         return ptr

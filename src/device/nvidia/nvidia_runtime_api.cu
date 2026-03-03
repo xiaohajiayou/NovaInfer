@@ -60,6 +60,33 @@ void streamSynchronize(llaisysStream_t stream) {
     LLAISYS_CUDA_CHECK(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)));
 }
 
+llaisysEvent_t createEvent() {
+    cudaEvent_t event = nullptr;
+    LLAISYS_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    return reinterpret_cast<llaisysEvent_t>(event);
+}
+
+void destroyEvent(llaisysEvent_t event) {
+    if (event == nullptr) {
+        return;
+    }
+    LLAISYS_CUDA_CHECK(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(event)));
+}
+
+void eventRecord(llaisysEvent_t event, llaisysStream_t stream) {
+    if (event == nullptr) {
+        return;
+    }
+    LLAISYS_CUDA_CHECK(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), reinterpret_cast<cudaStream_t>(stream)));
+}
+
+void eventSynchronize(llaisysEvent_t event) {
+    if (event == nullptr) {
+        return;
+    }
+    LLAISYS_CUDA_CHECK(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(event)));
+}
+
 void *mallocDevice(size_t size) {
     if (size == 0) {
         return nullptr;
@@ -119,6 +146,10 @@ static const LlaisysRuntimeAPI RUNTIME_API = {
     &createStream,
     &destroyStream,
     &streamSynchronize,
+    &createEvent,
+    &destroyEvent,
+    &eventRecord,
+    &eventSynchronize,
     &mallocDevice,
     &freeDevice,
     &mallocHost,

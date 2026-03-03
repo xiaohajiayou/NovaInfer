@@ -26,6 +26,23 @@ void streamSynchronize(llaisysStream_t stream) {
     EXCEPTION_UNSUPPORTED_DEVICE;
 }
 
+llaisysEvent_t createEvent() {
+    EXCEPTION_UNSUPPORTED_DEVICE;
+    return nullptr;
+}
+
+void destroyEvent(llaisysEvent_t event) {
+    EXCEPTION_UNSUPPORTED_DEVICE;
+}
+
+void eventRecord(llaisysEvent_t event, llaisysStream_t stream) {
+    EXCEPTION_UNSUPPORTED_DEVICE;
+}
+
+void eventSynchronize(llaisysEvent_t event) {
+    EXCEPTION_UNSUPPORTED_DEVICE;
+}
+
 void *mallocDevice(size_t size) {
     EXCEPTION_UNSUPPORTED_DEVICE;
     return nullptr;
@@ -59,6 +76,10 @@ static const LlaisysRuntimeAPI NOOP_RUNTIME_API = {
     &createStream,
     &destroyStream,
     &streamSynchronize,
+    &createEvent,
+    &destroyEvent,
+    &eventRecord,
+    &eventSynchronize,
     &mallocDevice,
     &freeDevice,
     &mallocHost,
