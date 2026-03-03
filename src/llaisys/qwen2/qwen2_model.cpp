@@ -65,15 +65,6 @@ llaisysMemcpyKind_t choose_memcpy_kind(llaisysDeviceType_t dst, llaisysDeviceTyp
     return LLAISYS_MEMCPY_D2D;
 }
 
-void runtime_copy_bytes(llaisysDeviceType_t dst_dev, std::byte *dst, llaisysDeviceType_t src_dev, const std::byte *src, size_t nbytes) {
-    if (nbytes == 0) {
-        return;
-    }
-    const llaisysMemcpyKind_t kind = choose_memcpy_kind(dst_dev, src_dev);
-    utils::NvtxScope nvtx_scope(utils::nvtx_memcpy_tag(kind, false));
-    const auto *api = core::context().runtime().api();
-    api->memcpy_sync(dst, src, nbytes, kind);
-}
 
 #ifdef ENABLE_NVIDIA_API
 ops::cuda::PagedAttentionBackend parse_paged_attn_backend_env() {
@@ -329,45 +320,6 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
     workspace_->reserve(ntoken);
 }
 
-void Qwen2Model::fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values) {
-    LLAISYS_NVTX_SCOPE("decode/fill_pos_ids");
-    ASSERT(pos_ids->dtype() == LLAISYS_DTYPE_I64, "Qwen2: pos_ids dtype must be int64");
-    ASSERT(pos_ids->shape()[0] == pos_values.size(), "Qwen2: pos_ids length mismatch");
-    const size_t nbytes = pos_values.size() * sizeof(int64_t);
-    runtime_copy_bytes(pos_ids->deviceType(),
-                       pos_ids->data(),
-                       LLAISYS_DEVICE_CPU,
-                       reinterpret_cast<const std::byte *>(pos_values.data()),
-                       nbytes);
-}
-
-void Qwen2Model::build_hidden_and_pos_(const std::vector<int64_t> &tokens,
-                                       const std::vector<int64_t> &pos_values,
-                                       tensor_t *hidden,
-                                       tensor_t *pos_ids) {
-    CHECK_ARGUMENT(hidden != nullptr, "Qwen2: hidden output pointer is null");
-    CHECK_ARGUMENT(pos_ids != nullptr, "Qwen2: pos_ids output pointer is null");
-    ASSERT(workspace_ != nullptr, "Qwen2: workspace is null");
-    CHECK_ARGUMENT(tokens.size() == pos_values.size(), "Qwen2: tokens/pos_values size mismatch");
-
-    const size_t ntoken = tokens.size();
-    const auto &ws = workspace_->view();
-
-    tensor_t input_ids = slice_tokens_(ws.input_ids, ntoken);
-    {
-        LLAISYS_NVTX_SCOPE("decode/input_ids_load");
-        input_ids->load(tokens.data());
-    }
-
-    *hidden = slice_tokens_(ws.hidden, ntoken);
-    {
-        LLAISYS_NVTX_SCOPE("decode/embedding");
-        ops::embedding(*hidden, input_ids, weights_.in_embed->tensor);
-    }
-
-    *pos_ids = slice_tokens_(ws.pos_ids, ntoken);
-    fill_pos_ids_from_values_(*pos_ids, pos_values);
-}
 
 void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx) {
     LLAISYS_NVTX_SCOPE("decode/copy_token_into_cache");
@@ -383,7 +335,13 @@ void Qwen2Model::copy_token_into_cache_(tensor_t &cache, int32_t slot, const ten
 
     std::byte *dst = cache->data() + static_cast<ptrdiff_t>(slot) * static_cast<ptrdiff_t>(stride_bytes);
     const std::byte *src_ptr = src->data() + static_cast<ptrdiff_t>(token_idx) * static_cast<ptrdiff_t>(stride_bytes);
-    runtime_copy_bytes(cache->deviceType(), dst, src->deviceType(), src_ptr, stride_bytes);
+    if (stride_bytes == 0) {
+        return;
+    }
+    const llaisysMemcpyKind_t kind = choose_memcpy_kind(cache->deviceType(), src->deviceType());
+    utils::NvtxScope nvtx_scope(utils::nvtx_memcpy_tag(kind, false));
+    const auto *api = core::context().runtime().api();
+    api->memcpy_sync(dst, src_ptr, stride_bytes, kind);
 }
 
 tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer) {

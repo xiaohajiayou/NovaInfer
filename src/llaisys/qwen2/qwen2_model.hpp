@@ -126,11 +126,6 @@ private:
     tensor_t slice_tokens_(const tensor_t &t, size_t len) const;
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
-    void fill_pos_ids_from_values_(const tensor_t &pos_ids, const std::vector<int64_t> &pos_values);
-    void build_hidden_and_pos_(const std::vector<int64_t> &tokens,
-                               const std::vector<int64_t> &pos_values,
-                               tensor_t *hidden,
-                               tensor_t *pos_ids);
     int32_t prepare_slot_attention_state_(size_t ntoken,
                                           const tensor_t &seq_ids_t,
                                           const tensor_t &pos_ids_host_t,

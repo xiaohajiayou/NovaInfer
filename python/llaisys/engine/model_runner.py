@@ -111,8 +111,7 @@ class ModelRunner:
         )
         return None
 
-    def sample_tokens(self, grammar_output=None):
-        del grammar_output
+    def sample_tokens(self):
         state = self._execute_model_state
         self._execute_model_state = None
         if state is None:
@@ -129,31 +128,6 @@ class ModelRunner:
         )
         return state.output_ids, sampled, state.token_idx_to_req_id
 
-    @staticmethod
-    def _has_complete_block_metadata(plan: BatchPlan) -> bool:
-        has_any_block_meta = (
-            plan.q_seq_rows is not None
-            or plan.q_pos is not None
-            or plan.slot_mapping is not None
-            or plan.context_lens is not None
-            or plan.batch_seq_ids is not None
-            or plan.block_tables is not None
-            or int(plan.block_table_width) > 0
-        )
-        if not has_any_block_meta:
-            return False
-        if (
-            plan.q_seq_rows is None
-            or plan.q_pos is None
-            or plan.slot_mapping is None
-            or plan.context_lens is None
-            or plan.batch_seq_ids is None
-            or plan.block_tables is None
-        ):
-            raise ValueError(
-                "incomplete BLOCK metadata: q_seq_rows/q_pos/slot_mapping/context_lens/batch_seq_ids/block_tables must all be set"
-            )
-        return True
 
     def _forward_step(self, plan: BatchPlan) -> tuple[Tensor, Tensor]:
         forward_fn = getattr(self.model, "forward", None)
@@ -163,15 +137,18 @@ class ModelRunner:
             raise RuntimeError("runtime handle is required")
 
         fin, fout, output_ids, _keepalive = self._build_forward_io(plan)
+        
+        # run model forward
         status = int(forward_fn(self._runtime, fin, fout))
+        
         if status != 0:
             raise RuntimeError(f"modelForward failed with status={status}")
-        logits_shape = self._logits_holder.shape()
+        logits_shape = fout.logits.shape()
         if len(logits_shape) != 2:
             raise RuntimeError("modelForward returned invalid logits shape")
         if int(logits_shape[0]) != int(output_ids.shape()[0]):
             raise RuntimeError("modelForward logits row count mismatch with logits_indices")
-        return output_ids, self._logits_holder
+        return output_ids, fout.logits
 
     def _normalize_step_inputs(self, plan: BatchPlan, ntoken: int) -> tuple[bool, list[int], list[int], list[int]]:
         is_block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
@@ -238,10 +215,6 @@ class ModelRunner:
         fin.attention = attn
         return fin, logits_indices, keepalive
 
-    def _build_model_forward_output(self) -> tuple[ModelForwardOutput, list[Tensor]]:
-        fout = ModelForwardOutput()
-        fout.logits = self._logits_holder.lib_tensor()
-        return fout, []
 
     def _build_forward_io(
         self,
@@ -261,8 +234,9 @@ class ModelRunner:
             seq=seq,
             output_rows=output_rows,
         )
-        fout, out_keepalive = self._build_model_forward_output()
-        keepalive = in_keepalive + out_keepalive
+        fout = ModelForwardOutput()
+        fout.logits = self._logits_holder.lib_tensor()
+        keepalive = in_keepalive
         return fin, fout, output_ids, keepalive
 
     def _build_attention_metadata(
@@ -288,13 +262,17 @@ class ModelRunner:
         if not is_block_layout:
             return attn, [seq_ids, pos_ids_host]
 
-        self._has_complete_block_metadata(plan)
-        assert plan.q_seq_rows is not None
-        assert plan.q_pos is not None
-        assert plan.slot_mapping is not None
-        assert plan.context_lens is not None
-        assert plan.batch_seq_ids is not None
-        assert plan.block_tables is not None
+        if (
+            plan.q_seq_rows is None
+            or plan.q_pos is None
+            or plan.slot_mapping is None
+            or plan.context_lens is None
+            or plan.batch_seq_ids is None
+            or plan.block_tables is None
+        ):
+            raise ValueError(
+                "incomplete BLOCK metadata: q_seq_rows/q_pos/slot_mapping/context_lens/batch_seq_ids/block_tables must all be set"
+            )
 
         block_table_width = int(plan.block_table_width)
         if (
@@ -313,6 +291,8 @@ class ModelRunner:
         assert self._context_lens_buf is not None
         assert self._batch_seq_ids_buf is not None
         assert self._block_tables_buf is not None
+        
+
         q_seq_rows = self._q_seq_rows_buf.slice(0, 0, ntoken)
         q_pos = self._q_pos_buf.slice(0, 0, ntoken)
         slot_mapping = self._slot_mapping_buf.slice(0, 0, ntoken)
@@ -368,7 +348,7 @@ class ModelRunner:
 
     def _collect_token_inputs(
         self,
-        outputs: SchedulerOutputs,
+        scheduler_outputs: SchedulerOutputs,
         sampling_params: SamplingParams | None,
         sampling_params_by_req: dict[str, SamplingParams] | None,
     ) -> tuple[
@@ -399,9 +379,9 @@ class ModelRunner:
         token_idx_to_req_id: dict[int, str] = {}
 
         base = 0
-        for row_idx, seq in enumerate(outputs.scheduled_seqs):
+        for row_idx, seq in enumerate(scheduler_outputs.scheduled_seqs):
             bs = max(1, int(seq.block_size))
-            if outputs.is_prefill:
+            if scheduler_outputs.is_prefill:
                 start = max(0, int(seq.num_cached_tokens))
                 prompt = seq.prompt_token_ids
                 seq_tokens = [int(t) for t in prompt[start:]]
@@ -415,11 +395,11 @@ class ModelRunner:
                 seq_mask = [1]
 
             rid = str(seq.request_id)
-            params = sampling_params_by_req.get(rid) if sampling_params_by_req is not None else None
+            if sampling_params_by_req is None and sampling_params is None:
+                raise RuntimeError("missing sampling params for request")
+            params = sampling_params
             if params is None:
-                if sampling_params is None:
-                    raise RuntimeError("missing sampling params for request")
-                params = sampling_params
+                params = sampling_params_by_req.get(rid) if sampling_params_by_req is not None else None
 
             token_ids.extend(seq_tokens)
             logits_mask.extend(seq_mask)
@@ -501,7 +481,7 @@ class ModelRunner:
 
     def prepare_model_input(
         self,
-        outputs: SchedulerOutputs,
+        scheduler_outputs: SchedulerOutputs,
         sampling_params: SamplingParams | None = None,
         sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ) -> tuple[BatchPlan, dict[int, str]]:
@@ -519,13 +499,13 @@ class ModelRunner:
             slot_mapping,
             token_idx_to_req_id,
         ) = self._collect_token_inputs(
-            outputs,
+            scheduler_outputs,
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
 
         context_lens, batch_seq_ids, block_tables, block_table_width = self._build_block_metadata_inputs(
-            outputs,
+            scheduler_outputs,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
         )

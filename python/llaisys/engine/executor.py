@@ -13,16 +13,16 @@ class Executor:
 
     def execute_scheduler_step(
         self,
-        outputs: SchedulerOutputs,
+        scheduler_outputs: SchedulerOutputs,
         sampling_params: SamplingParams | None = None,
         sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ):
         self._worker.execute_model(
-            outputs,
+            scheduler_outputs,
             sampling_params=sampling_params,
             sampling_params_by_req=sampling_params_by_req,
         )
-        sampled = self._worker.sample_tokens(None)
+        sampled = self._worker.sample_tokens()
         if sampled is None:
             return None, None, {}
         output_ids_t, sampled_t, token_idx_to_req_id = sampled

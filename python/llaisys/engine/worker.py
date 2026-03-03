@@ -147,8 +147,8 @@ class Worker:
             sampling_params_by_req=sampling_params_by_req,
         )
 
-    def sample_tokens(self, grammar_output=None):
-        return self._model_runner.sample_tokens(grammar_output)
+    def sample_tokens(self):
+        return self._model_runner.sample_tokens()
 
     def execute(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
         self._model_runner.execute_model(
