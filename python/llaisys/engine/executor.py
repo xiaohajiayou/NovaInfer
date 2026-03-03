@@ -24,6 +24,6 @@ class Executor:
         )
         sampled = self._worker.sample_tokens()
         if sampled is None:
-            return None, None, {}
-        output_ids_t, sampled_t, token_idx_to_req_id = sampled
-        return output_ids_t, sampled_t, token_idx_to_req_id
+            return None, []
+        sampled_t, sampled_req_ids = sampled
+        return sampled_t, sampled_req_ids

@@ -144,22 +144,25 @@ class DummyModelRunner:
             return None
         output_ids = [i for i, m in enumerate(plan.logits_mask) if int(m) != 0]
         self.on_plan(plan)
-        out = llaisys.Tensor((len(output_ids),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-        out.copy_from_sequence(output_ids)
-        self._execute_state = (out, plan, token_idx_to_req_id)
+        sampled_req_ids: list[str] = []
+        for out_idx in output_ids:
+            rid = token_idx_to_req_id.get(int(out_idx))
+            if rid is None:
+                raise RuntimeError("dummy runner output id cannot be mapped to request")
+            sampled_req_ids.append(rid)
+        self._execute_state = (output_ids, plan, sampled_req_ids)
         return None
 
     def sample_tokens(self, grammar_output=None):
         _ = grammar_output
         if self._execute_state is None:
             return None
-        output_ids, plan, token_idx_to_req_id = self._execute_state
+        output_indices, plan, sampled_req_ids = self._execute_state
         self._execute_state = None
-        output_indices = [int(x) for x in output_ids.tolist()]
         sampled = [(int(plan.token_ids[i]) + 1) % int(self.vocab_size) for i in output_indices]
         out = llaisys.Tensor((len(sampled),), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         out.copy_from_sequence(sampled)
-        return output_ids, out, token_idx_to_req_id
+        return out, sampled_req_ids
 
     def execute(
         self,
@@ -174,7 +177,7 @@ class DummyModelRunner:
         )
         sampled = self.sample_tokens(None)
         if sampled is None:
-            return None, None, {}
+            return None, []
         return sampled
 
     def decode_tokens(self, token_ids):

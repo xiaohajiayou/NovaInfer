@@ -158,7 +158,7 @@ class Worker:
         )
         sampled = self._model_runner.sample_tokens(None)
         if sampled is None:
-            return None, None, {}
+            return None, []
         return sampled
 
     def free_request(self, seq_id: int) -> None:

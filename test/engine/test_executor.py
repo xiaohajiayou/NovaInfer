@@ -16,12 +16,10 @@ class DummyWorker:
         _ = outputs
         _ = sampling_params
         _ = sampling_params_by_req
-        # Return out order intentionally swapped to validate req-id mapping.
-        output_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-        output_ids.copy_from_sequence([1, 0])
+        # Return request order intentionally swapped to validate downstream mapping.
         sampled_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         sampled_ids.copy_from_sequence([22, 11])
-        self._result = (output_ids, sampled_ids, {1: "req-2", 0: "req-1"})
+        self._result = (sampled_ids, ["req-2", "req-1"])
         return None
 
     def sample_tokens(self, grammar_output=None):
@@ -40,11 +38,9 @@ class CaptureWorker:
         self.last_outputs = outputs
         self.last_sampling_params = sampling_params
         self.last_sampling_params_by_req = sampling_params_by_req
-        output_ids = llaisys.Tensor((1,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-        output_ids.copy_from_sequence([1])
         sampled_ids = llaisys.Tensor((1,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
         sampled_ids.copy_from_sequence([7])
-        self._result = (output_ids, sampled_ids, {1: "req-1"})
+        self._result = (sampled_ids, ["req-1"])
         return None
 
     def sample_tokens(self, grammar_output=None):
@@ -72,7 +68,7 @@ def test_executor_uses_per_request_sampling_params_in_output_order():
     )
     outputs = SchedulerOutputs(scheduled_seqs=[seq1, seq2], is_prefill=False)
 
-    output_ids_t, sampled_t, req_map = ex.execute_scheduler_step(
+    sampled_t, sampled_req_ids = ex.execute_scheduler_step(
         outputs,
         sampling_params_by_req={
             "req-1": SamplingParams(top_k=11),
@@ -80,9 +76,8 @@ def test_executor_uses_per_request_sampling_params_in_output_order():
         },
     )
 
-    assert output_ids_t.tolist() == [1, 0]
     assert sampled_t.tolist() == [22, 11]
-    assert req_map == {1: "req-2", 0: "req-1"}
+    assert sampled_req_ids == ["req-2", "req-1"]
 
 
 def test_executor_prefill_flattens_only_uncached_suffix():
@@ -98,13 +93,12 @@ def test_executor_prefill_flattens_only_uncached_suffix():
     seq.num_cached_tokens = 2
     outputs = SchedulerOutputs(scheduled_seqs=[seq], is_prefill=True)
 
-    output_ids_t, sampled_t, req_map = ex.execute_scheduler_step(
+    sampled_t, sampled_req_ids = ex.execute_scheduler_step(
         outputs,
         sampling_params_by_req={"req-1": SamplingParams(top_k=7)},
     )
-    assert output_ids_t.tolist() == [1]
     assert sampled_t.tolist() == [7]
-    assert req_map == {1: "req-1"}
+    assert sampled_req_ids == ["req-1"]
     assert worker.last_outputs is outputs
     assert worker.last_sampling_params is None
     assert worker.last_sampling_params_by_req is not None

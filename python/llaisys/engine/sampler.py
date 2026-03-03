@@ -17,12 +17,14 @@ class Sampler:
         if self._runtime is None:
             raise ValueError("runtime_handle is required by Sampler")
         self._sample_capacity = 0
-        self._sampled_ids_buf: Optional[Tensor] = None
+        self._sampled_ids_dev_buf: Optional[Tensor] = None
+        self._sampled_ids_host_buf: Optional[Tensor] = None
 
     def _ensure_sampled_buffer(self, n_outputs: int) -> None:
         if n_outputs <= self._sample_capacity:
             return
-        self._sampled_ids_buf = Tensor((n_outputs,), DataType.I64, self._device, 0)
+        self._sampled_ids_dev_buf = Tensor((n_outputs,), DataType.I64, self._device, 0)
+        self._sampled_ids_host_buf = Tensor((n_outputs,), DataType.I64, DeviceType.CPU, 0)
         self._sample_capacity = n_outputs
 
     def sample_tokens(
@@ -48,8 +50,8 @@ class Sampler:
         n_outputs = int(shape[0])
 
         self._ensure_sampled_buffer(n_outputs)
-        assert self._sampled_ids_buf is not None
-        sampled_ids = self._sampled_ids_buf.slice(0, 0, n_outputs)
+        assert self._sampled_ids_dev_buf is not None
+        sampled_ids_dev = self._sampled_ids_dev_buf.slice(0, 0, n_outputs)
 
         sin = SamplerInput()
         sin.logits = logits_tensor.lib_tensor()
@@ -60,9 +62,14 @@ class Sampler:
         sin.has_seeds = None
 
         sout = SamplerOutput()
-        sout.sampled_ids = sampled_ids.lib_tensor()
+        sout.sampled_ids = sampled_ids_dev.lib_tensor()
 
         status = int(LIB_LLAISYS.llaisysSamplerSample(self._runtime, byref(sin), byref(sout)))
         if status != 0:
             raise RuntimeError(f"samplerSample failed with status={status}")
-        return sampled_ids
+        if self._device == DeviceType.CPU:
+            return sampled_ids_dev
+        assert self._sampled_ids_host_buf is not None
+        sampled_ids_host = self._sampled_ids_host_buf.slice(0, 0, n_outputs)
+        sampled_ids_host.copy_(sampled_ids_dev)
+        return sampled_ids_host
