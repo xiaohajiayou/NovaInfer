@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from ctypes import POINTER, c_int64, cast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Iterator, Sequence
 
-from ..libllaisys import DeviceType
+from ..libllaisys import DataType, DeviceType
 from ..libllaisys.model import KvCacheLayout
+from ..tensor import Tensor
 from .config import EngineConfig
 from .executor import Executor
 from .model_registry import ModelRegistry
@@ -346,12 +348,11 @@ class LLMEngine:
         if sampled_t is None:
             return completions
 
-        sampled = sampled_t.tolist()
-        if len(sampled_req_ids) != len(sampled):
+        if len(sampled_req_ids) != int(sampled_t.shape()[0]):
             raise RuntimeError("executor sampled/output mapping size mismatch")
 
         # Apply sampled tokens and finalize requests that hit stop/length.
-        for req_id, token in zip(sampled_req_ids, sampled):
+        for req_id, token in zip(sampled_req_ids, self._iter_sampled_token_ids(sampled_t, len(sampled_req_ids))):
             request_context = self._request_contexts.get(req_id)
             if request_context is None:
                 continue
@@ -577,3 +578,25 @@ class LLMEngine:
                         request_context.matched_stop = stop_str
                         return "stop_string"
         return None
+
+    def _iter_sampled_token_ids(self, sampled_t: Tensor, expected_n: int) -> Iterator[int]:
+        token_tensor = sampled_t
+        if token_tensor.device_type() != DeviceType.CPU:
+            raise RuntimeError("sampled token tensor must be on CPU")
+        token_tensor.wait()
+
+        shape = token_tensor.shape()
+        if len(shape) != 1:
+            raise RuntimeError("sampled token tensor must be 1D")
+        n = int(shape[0])
+        if n != int(expected_n):
+            raise RuntimeError("sampled token tensor length mismatch")
+        if n <= 0:
+            return
+
+        if token_tensor.dtype() != DataType.I64:
+            raise RuntimeError("sampled token tensor dtype must be I64")
+
+        ptr = cast(token_tensor.data_ptr(), POINTER(c_int64))
+        for i in range(n):
+            yield int(ptr[i])

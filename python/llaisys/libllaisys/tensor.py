@@ -12,6 +12,7 @@ def load_tensor(lib):
         llaisysDataType_t,  # dtype
         llaisysDeviceType_t,  # device_type
         c_int,  # device_id
+        c_uint8,  # pin_memory
     ]
     lib.tensorCreate.restype = llaisysTensor_t
 

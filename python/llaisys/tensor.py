@@ -21,6 +21,7 @@ from ctypes import (
     c_int64,
     c_size_t,
     c_ssize_t,
+    c_uint8,
     c_void_p,
     cast,
 )
@@ -36,6 +37,7 @@ class Tensor:
         dtype: DataType = DataType.F32,
         device: DeviceType = DeviceType.CPU,
         device_id: int = 0,
+        pin_memory: bool = False,
         tensor: llaisysTensor_t = None,
     ):
         self._pending_api = None
@@ -46,6 +48,8 @@ class Tensor:
         if tensor:
             self._tensor = tensor
         else:
+            if pin_memory and device != DeviceType.CPU:
+                raise RuntimeError("pin_memory is only supported for CPU tensors")
             _ndim = 0 if shape is None else len(shape)
             _shape = None if shape is None else (c_size_t * len(shape))(*shape)
             self._tensor: llaisysTensor_t = LIB_LLAISYS.tensorCreate(
@@ -54,6 +58,7 @@ class Tensor:
                 llaisysDataType_t(dtype),
                 llaisysDeviceType_t(device),
                 c_int(device_id),
+                c_uint8(1 if pin_memory else 0),
             )
 
     def __del__(self):
@@ -297,25 +302,22 @@ class Tensor:
             api.set_device(dev_id)
             if non_blocking:
                 if stream is None:
-                    # Conservative path for generic async copy: synchronize prior work and
-                    # use a dedicated transfer stream.
-                    dst.wait()
-                    src.wait()
+                    # Route generic async copies through one per-device async stream.
+                    # Dependencies are checked below; avoid unconditional waits here.
                     stream = cls._async_stream(dev_id)
-                else:
-                    # Explicit stream path: keep dependency on the same stream whenever possible.
-                    if (
-                        dst._pending_api is not None
-                        and dst._pending_stream is not None
-                        and (dst._pending_api is not api or dst._pending_stream != stream)
-                    ):
-                        dst.wait()
-                    if (
-                        src._pending_api is not None
-                        and src._pending_stream is not None
-                        and (src._pending_api is not api or src._pending_stream != stream)
-                    ):
-                        src.wait()
+                # Keep dependency on the same stream whenever possible.
+                if (
+                    dst._pending_api is not None
+                    and dst._pending_stream is not None
+                    and (dst._pending_api is not api or dst._pending_stream != stream)
+                ):
+                    dst.wait()
+                if (
+                    src._pending_api is not None
+                    and src._pending_stream is not None
+                    and (src._pending_api is not api or src._pending_stream != stream)
+                ):
+                    src.wait()
                 api.memcpy_async(dst.data_ptr(), src.data_ptr(), src.nbytes(), kind, stream)
                 event = api.create_event()
                 api.event_record(event, stream)

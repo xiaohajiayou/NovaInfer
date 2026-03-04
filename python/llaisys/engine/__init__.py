@@ -9,6 +9,7 @@ from .llm_engine import LLMEngine
 from .engine_client import EngineClient
 from .model_registry import ModelRegistry, create_default_registry
 from .sequence import Sequence, SequenceStatus
+from .buffers import CpuGpuBuffer
 
 __all__ = [
     "SamplingParams",
@@ -22,4 +23,5 @@ __all__ = [
     "EngineClient",
     "ModelRegistry",
     "create_default_registry",
+    "CpuGpuBuffer",
 ]

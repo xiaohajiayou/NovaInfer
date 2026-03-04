@@ -13,6 +13,7 @@ stream_synchronize_api = CFUNCTYPE(None, llaisysStream_t)
 create_event_api = CFUNCTYPE(llaisysEvent_t)
 destroy_event_api = CFUNCTYPE(None, llaisysEvent_t)
 event_record_api = CFUNCTYPE(None, llaisysEvent_t, llaisysStream_t)
+stream_wait_event_api = CFUNCTYPE(None, llaisysStream_t, llaisysEvent_t)
 event_synchronize_api = CFUNCTYPE(None, llaisysEvent_t)
 
 malloc_device_api = CFUNCTYPE(c_void_p, c_size_t)
@@ -36,6 +37,7 @@ class LlaisysRuntimeAPI(Structure):
         ("create_event", create_event_api),
         ("destroy_event", destroy_event_api),
         ("event_record", event_record_api),
+        ("stream_wait_event", stream_wait_event_api),
         ("event_synchronize", event_synchronize_api),
         ("malloc_device", malloc_device_api),
         ("free_device", free_device_api),

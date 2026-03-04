@@ -11,7 +11,8 @@ __C {
         size_t ndim,
         llaisysDataType_t dtype,
         llaisysDeviceType_t device_type,
-        int device_id);
+        int device_id,
+        uint8_t pin_memory);
 
     __export void tensorDestroy(
         llaisysTensor_t tensor);

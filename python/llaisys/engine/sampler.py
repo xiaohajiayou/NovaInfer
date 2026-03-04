@@ -6,31 +6,34 @@ from typing import Optional, Sequence
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType
 from ..libllaisys.model import SamplerInput, SamplerOutput
 from ..tensor import Tensor
+from .config import EngineConfig
 
 
 class Sampler:
     """Device-local sampler wrapper over llaisysSamplerSample."""
 
-    def __init__(self, device: DeviceType, runtime_handle):
-        self._device = device
+    def __init__(
+        self,
+        device: DeviceType,
+        runtime_handle,
+        max_num_seqs: int | None = None,
+        config: EngineConfig | None = None,
+    ):
+        cfg = (config or EngineConfig(
+            device=device,
+            max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
+        )).normalized()
+        self._device = cfg.device
         self._runtime = runtime_handle
         if self._runtime is None:
             raise ValueError("runtime_handle is required by Sampler")
-        self._sample_capacity = 0
-        self._sampled_ids_dev_buf: Optional[Tensor] = None
-        self._sampled_ids_host_buf: Optional[Tensor] = None
-
-    def _ensure_sampled_buffer(self, n_outputs: int) -> None:
-        if n_outputs <= self._sample_capacity:
-            return
-        self._sampled_ids_dev_buf = Tensor((n_outputs,), DataType.I64, self._device, 0)
-        self._sampled_ids_host_buf = Tensor((n_outputs,), DataType.I64, DeviceType.CPU, 0)
-        self._sample_capacity = n_outputs
+        self._max_num_seqs = max(1, int(cfg.max_num_seqs))
 
     def sample_tokens(
         self,
         *,
-        logits_tensor: Optional[Tensor],
+        logits_tensor: Tensor | None,
+        out_ids_dev: Tensor,
         temperatures: Optional[Sequence[float]] = None,
         top_ps: Optional[Sequence[float]] = None,
         top_ks: Optional[Sequence[int]] = None,
@@ -48,10 +51,14 @@ class Sampler:
         if len(shape) != 2:
             raise RuntimeError("sampler expects logits to be 2D")
         n_outputs = int(shape[0])
-
-        self._ensure_sampled_buffer(n_outputs)
-        assert self._sampled_ids_dev_buf is not None
-        sampled_ids_dev = self._sampled_ids_dev_buf.slice(0, 0, n_outputs)
+        if n_outputs > self._max_num_seqs:
+            raise RuntimeError("sampler outputs exceed configured max_num_seqs")
+        if out_ids_dev.device_type() != self._device:
+            raise RuntimeError("sampler out_ids_dev device mismatch")
+        if out_ids_dev.dtype() != DataType.I64:
+            raise RuntimeError("sampler out_ids_dev dtype must be I64")
+        if int(out_ids_dev.shape()[0]) != n_outputs:
+            raise RuntimeError("sampler out_ids_dev shape mismatch")
 
         sin = SamplerInput()
         sin.logits = logits_tensor.lib_tensor()
@@ -62,14 +69,9 @@ class Sampler:
         sin.has_seeds = None
 
         sout = SamplerOutput()
-        sout.sampled_ids = sampled_ids_dev.lib_tensor()
+        sout.sampled_ids = out_ids_dev.lib_tensor()
 
         status = int(LIB_LLAISYS.llaisysSamplerSample(self._runtime, byref(sin), byref(sout)))
         if status != 0:
             raise RuntimeError(f"samplerSample failed with status={status}")
-        if self._device == DeviceType.CPU:
-            return sampled_ids_dev
-        assert self._sampled_ids_host_buf is not None
-        sampled_ids_host = self._sampled_ids_host_buf.slice(0, 0, n_outputs)
-        sampled_ids_host.copy_(sampled_ids_dev)
-        return sampled_ids_host
+        return out_ids_dev

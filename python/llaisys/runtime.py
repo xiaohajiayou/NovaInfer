@@ -43,6 +43,13 @@ class RuntimeAPI:
     ) -> None:
         self._api.contents.event_record(event, stream)
 
+    def stream_wait_event(
+        self,
+        stream: libllaisys.llaisysStream_t,
+        event: libllaisys.llaisysEvent_t,
+    ) -> None:
+        self._api.contents.stream_wait_event(stream, event)
+
     def event_synchronize(self, event: libllaisys.llaisysEvent_t) -> None:
         self._api.contents.event_synchronize(event)
 

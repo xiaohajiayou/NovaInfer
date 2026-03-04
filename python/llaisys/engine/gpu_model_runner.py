@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from ctypes import byref, c_int32, c_int64
 
+from .config import EngineConfig
+from .buffers import CpuGpuBuffer
 from .sampler import Sampler
 from .scheduler import SchedulerOutputs
 from .types import BatchPlan, SamplingParams
-from ..libllaisys import LIB_LLAISYS, DataType, DeviceType
+from ..libllaisys import LIB_LLAISYS, DataType, DeviceType, llaisysDeviceType_t
 from ..libllaisys.model import (
     AttentionMetadata,
     KvCacheLayout,
@@ -14,6 +16,7 @@ from ..libllaisys.model import (
     ModelForwardInput,
     ModelForwardOutput,
 )
+from ..runtime import RuntimeAPI
 from ..tensor import Tensor
 
 
@@ -25,7 +28,10 @@ class _ExecuteModelState:
     keepalive: list[Tensor]
 
 
-class ModelRunner:
+Buffer = Tensor | CpuGpuBuffer
+
+
+class GPUModelRunner:
     """Owns model + sampler and executes one scheduler step."""
 
     def __init__(
@@ -33,28 +39,70 @@ class ModelRunner:
         model,
         device: DeviceType,
         kv_cache_layout: KvCacheLayout,
+        max_num_seqs: int | None = None,
+        config: EngineConfig | None = None,
         runtime_handle=None,
     ):
         self.model = model
-        self.sampler = Sampler(device, runtime_handle)
-        self._device = device
+        cfg = (config or EngineConfig(
+            device=device,
+            kv_cache_layout=kv_cache_layout,
+            max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
+        )).normalized()
+        self._config = cfg
+        self._device = cfg.device
         self._runtime = runtime_handle
         if self._runtime is None:
             raise ValueError("runtime_handle is required by ModelRunner")
+        self.sampler = Sampler(self._device, runtime_handle, config=cfg)
         self._owns_runtime = True
-        self._kv_cache_layout = KvCacheLayout(int(kv_cache_layout))
+        self._compute_streams: dict[int, object] = {}
+        self._h2d_streams: dict[int, object] = {}
+        self._d2h_streams: dict[int, object] = {}
+        self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
+        self._prepare_inputs_events: dict[int, object] = {}
+        self._sampler_done_events: dict[int, object] = {}
+        self.prepare_inputs_event = None
+        self.sampler_done_event = None
+        self._kv_cache_layout = KvCacheLayout(int(cfg.kv_cache_layout))
+        self._max_num_reqs = max(1, int(cfg.max_num_seqs))
+        if cfg.max_num_batched_tokens is not None:
+            max_tokens = int(cfg.max_num_batched_tokens)
+        elif cfg.max_model_len is not None:
+            max_tokens = int(cfg.max_model_len)
+        else:
+            max_tokens = int(self.max_seq_len)
+        self._max_num_tokens = max(1, max_tokens)
+        max_model_len = int(cfg.max_model_len) if cfg.max_model_len is not None else int(self.max_seq_len)
+        block_size = max(1, int(cfg.kv_cache_block_size))
+        self._max_block_table_width = max(1, (max_model_len + block_size - 1) // block_size)
+        self._max_block_elems = self._max_num_reqs * self._max_block_table_width
+        self._max_block_meta_i32 = (3 * self._max_num_tokens) + self._max_num_reqs + self._max_block_elems
 
-        self._step_capacity_tokens = 0
-        self._step_capacity_batch_seq = 0
-        self._step_capacity_block_elems = 0
-        self._step_capacity_block_meta_i32 = 0
-        self._input_ids_buf: Tensor | None = None
-        self._pos_ids_buf: Tensor | None = None
-        self._seq_ids_buf: Tensor | None = None
-        self._batch_seq_ids_buf: Tensor | None = None
-        self._block_meta_host_buf: Tensor | None = None
-        self._block_meta_dev_buf: Tensor | None = None
-        self._output_ids_buf: Tensor | None = None
+        # Persistent metadata buffers (vLLM-like): allocated once at runner init.
+        self._input_ids_buf: Buffer | None = None
+        self._pos_ids_buf: Buffer | None = None
+        self._seq_ids_buf: Buffer | None = None
+        self._batch_seq_ids_buf: Buffer | None = None
+        self._block_meta_buf: Buffer | None = None
+        self._output_ids_buf: Buffer | None = None
+
+        # Persistent sampled-token host buffer (one token per request).
+        self._sampled_ids_buf: Buffer = self._make_buffer((self._max_num_reqs,), DataType.I64, pin_memory=True)
+
+        # Token-level buffers sized by max_num_batched_tokens.
+        token_shape = (self._max_num_tokens,)
+        self._input_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
+        self._pos_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
+        self._seq_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
+        self._output_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
+
+        # Request-level buffers sized by max_num_seqs.
+        self._batch_seq_ids_buf = self._make_buffer((self._max_num_reqs,), DataType.I64, pin_memory=True)
+
+        # BLOCK metadata buffer sized by max token/request capacities.
+        if int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK):
+            self._block_meta_buf = self._make_buffer((self._max_block_meta_i32,), DataType.I32, pin_memory=True)
         self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, 0)
         self._execute_model_state: _ExecuteModelState | None = None
 
@@ -76,6 +124,37 @@ class ModelRunner:
 
     def close(self) -> None:
         self._execute_model_state = None
+        if self._runtime_api is not None:
+            for dev_id, evt in list(self._prepare_inputs_events.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.destroy_event(evt)
+                except Exception:
+                    pass
+            for dev_id, evt in list(self._sampler_done_events.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.destroy_event(evt)
+                except Exception:
+                    pass
+            for dev_id, stream in list(self._h2d_streams.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.destroy_stream(stream)
+                except Exception:
+                    pass
+            for dev_id, stream in list(self._d2h_streams.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.destroy_stream(stream)
+                except Exception:
+                    pass
+        self._prepare_inputs_events.clear()
+        self._sampler_done_events.clear()
+        self._h2d_streams.clear()
+        self._d2h_streams.clear()
+        self.prepare_inputs_event = None
+        self.sampler_done_event = None
         runtime = self._runtime
         self._runtime = None
         close_fn = getattr(self.model, "close", None)
@@ -123,8 +202,13 @@ class ModelRunner:
         if len(state.sampled_req_ids) == 0:
             empty = Tensor((0,), DataType.I64, DeviceType.CPU, 0)
             return empty, []
+        n_outputs = len(state.sampled_req_ids)
+        if not isinstance(self._sampled_ids_buf, CpuGpuBuffer):
+            raise RuntimeError("GPUModelRunner sampled buffer must be CpuGpuBuffer")
+        sampled_ids_dev = self._sampled_ids_buf.gpu.slice(0, 0, n_outputs)
         sampled = self.sampler.sample_tokens(
             logits_tensor=state.logits,
+            out_ids_dev=sampled_ids_dev,
             temperatures=state.plan.temperatures,
             top_ps=state.plan.top_ps,
             top_ks=state.plan.top_ks,
@@ -135,7 +219,102 @@ class ModelRunner:
             raise RuntimeError("sampler returned None for non-empty logits")
         if int(sampled.shape()[0]) != len(state.sampled_req_ids):
             raise RuntimeError("sampler output size mismatch with sampled request ids")
+        n_outputs = int(sampled.shape()[0])
+        if n_outputs > self._max_num_reqs:
+            raise RuntimeError("sampled outputs exceed configured max_num_reqs")
+        sampled_host = self._sampled_ids_buf.cpu.slice(0, 0, n_outputs)
+        # Sampler runs on compute stream. Build explicit compute->d2h dependency so
+        # D2H can run on a dedicated copy stream without host-side synchronize.
+        dev_id = int(sampled.device_id())
+        compute_stream = self._get_runtime_compute_stream(dev_id)
+        sampler_done_event = self._get_sampler_done_event(dev_id)
+        self._runtime_api.set_device(dev_id)
+        self._runtime_api.event_record(sampler_done_event, compute_stream)
+        d2h_stream = self._get_d2h_stream(dev_id)
+        self._runtime_api.stream_wait_event(d2h_stream, sampler_done_event)
+        sampled_host.copy_(sampled, non_blocking=True, stream=d2h_stream)
+        sampled = sampled_host
         return sampled, list(state.sampled_req_ids)
+
+    def _make_buffer(self, shape: tuple[int, ...], dtype: DataType, pin_memory: bool = True) -> Buffer:
+        if self._device == DeviceType.CPU:
+            raise RuntimeError("GPUModelRunner cannot allocate CPU-only buffers; use CPUModelRunner")
+        return CpuGpuBuffer(shape=shape, dtype=dtype, device=self._device, pin_memory=pin_memory)
+
+    def _get_runtime_compute_stream(self, device_id: int):
+        stream = self._compute_streams.get(int(device_id))
+        if stream is not None:
+            return stream
+        stream = LIB_LLAISYS.llaisysRuntimeGetComputeStream(
+            self._runtime,
+            llaisysDeviceType_t(self._device),
+            int(device_id),
+        )
+        if stream is None:
+            raise RuntimeError(f"failed to acquire runtime compute stream for device_id={device_id}")
+        self._compute_streams[int(device_id)] = stream
+        return stream
+
+    def _get_h2d_stream(self, device_id: int):
+        stream = self._h2d_streams.get(int(device_id))
+        if stream is not None:
+            return stream
+        if self._runtime_api is None:
+            raise RuntimeError("runtime api unavailable for H2D stream")
+        self._runtime_api.set_device(int(device_id))
+        stream = self._runtime_api.create_stream()
+        self._h2d_streams[int(device_id)] = stream
+        return stream
+
+    def _get_d2h_stream(self, device_id: int):
+        stream = self._d2h_streams.get(int(device_id))
+        if stream is not None:
+            return stream
+        if self._runtime_api is None:
+            raise RuntimeError("runtime api unavailable for D2H stream")
+        self._runtime_api.set_device(int(device_id))
+        stream = self._runtime_api.create_stream()
+        self._d2h_streams[int(device_id)] = stream
+        return stream
+
+    def _get_prepare_inputs_event(self, device_id: int):
+        event = self._prepare_inputs_events.get(int(device_id))
+        if event is not None:
+            return event
+        if self._runtime_api is None:
+            raise RuntimeError("runtime api unavailable for prepare_inputs_event")
+        self._runtime_api.set_device(int(device_id))
+        event = self._runtime_api.create_event()
+        self._prepare_inputs_events[int(device_id)] = event
+        # Keep compatibility with existing debug hooks that inspect this attr.
+        self.prepare_inputs_event = event
+        return event
+
+    def _get_sampler_done_event(self, device_id: int):
+        event = self._sampler_done_events.get(int(device_id))
+        if event is not None:
+            return event
+        if self._runtime_api is None:
+            raise RuntimeError("runtime api unavailable for sampler_done_event")
+        self._runtime_api.set_device(int(device_id))
+        event = self._runtime_api.create_event()
+        self._sampler_done_events[int(device_id)] = event
+        self.sampler_done_event = event
+        return event
+
+    def _record_prepare_inputs_event(self, stream, device_id: int) -> None:
+        if self._runtime_api is None:
+            return
+        event = self._get_prepare_inputs_event(int(device_id))
+        self._runtime_api.set_device(int(device_id))
+        self._runtime_api.event_record(event, stream)
+
+    def _wait_compute_for_prepare_inputs(self, stream, device_id: int) -> None:
+        if self._runtime_api is None:
+            return
+        event = self._get_prepare_inputs_event(int(device_id))
+        self._runtime_api.set_device(int(device_id))
+        self._runtime_api.stream_wait_event(stream, event)
 
     def _forward_step(self, plan: BatchPlan) -> tuple[list[int], Tensor, list[Tensor]]:
         forward_fn = getattr(self.model, "forward", None)
@@ -145,8 +324,10 @@ class ModelRunner:
             raise RuntimeError("runtime handle is required")
 
         fin, fout, n_outputs, output_rows, keepalive = self._build_forward_io(plan)
-        for t in keepalive:
-            t.wait()
+        if self._device == DeviceType.NVIDIA:
+            dev_id = int(self._logits_holder.device_id())
+            compute_stream = self._get_runtime_compute_stream(dev_id)
+            self._wait_compute_for_prepare_inputs(compute_stream, dev_id)
         status = int(forward_fn(self._runtime, fin, fout))
         if status != 0:
             raise RuntimeError(f"modelForward failed with status={status}")
@@ -187,37 +368,64 @@ class ModelRunner:
     ) -> tuple[ModelForwardInput, int, list[Tensor]]:
         n_batch_seq = len(plan.batch_seq_ids) if plan.batch_seq_ids is not None else 0
         n_block_elems = len(plan.block_tables) if plan.block_tables is not None else 0
-        self._ensure_token_buffers(ntoken)
-        self._ensure_batch_buffers(n_batch_seq, n_block_elems)
+        if ntoken > self._max_num_tokens:
+            raise RuntimeError("ntoken exceeds configured max_num_batched_tokens")
+        if n_batch_seq > self._max_num_reqs:
+            raise RuntimeError("n_batch_seq exceeds configured max_num_seqs")
+        if n_block_elems > self._max_block_elems:
+            raise RuntimeError("n_block_elems exceeds configured BLOCK metadata capacity")
         assert self._input_ids_buf is not None
         assert self._pos_ids_buf is not None
         assert self._seq_ids_buf is not None
         assert self._output_ids_buf is not None
-
-        input_ids = self._input_ids_buf.slice(0, 0, ntoken)
-        pos_ids = self._pos_ids_buf.slice(0, 0, ntoken)
-        seq_ids = self._seq_ids_buf.slice(0, 0, ntoken)
-        logits_indices = self._output_ids_buf.slice(0, 0, len(output_rows))
-        input_ids.copy_from_sequence(plan.token_ids)
-        pos_ids.copy_from_sequence(pos)
-        seq_ids.copy_from_sequence(seq)
+        if (
+            not isinstance(self._input_ids_buf, CpuGpuBuffer)
+            or not isinstance(self._pos_ids_buf, CpuGpuBuffer)
+            or not isinstance(self._seq_ids_buf, CpuGpuBuffer)
+            or not isinstance(self._output_ids_buf, CpuGpuBuffer)
+        ):
+            raise RuntimeError("GPUModelRunner metadata buffers must be CpuGpuBuffer")
+        input_ids_host = self._input_ids_buf.cpu.slice(0, 0, ntoken)
+        input_ids = self._input_ids_buf.gpu.slice(0, 0, ntoken)
+        pos_ids_host = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
+        pos_ids = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
+        seq_ids_host = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
+        seq_ids = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
+        logits_indices_host = self._output_ids_buf.cpu.slice(0, 0, len(output_rows))
+        logits_indices = self._output_ids_buf.gpu.slice(0, 0, len(output_rows))
+        dev_id = int(input_ids.device_id())
+        h2d_stream = self._get_h2d_stream(dev_id)
+        input_ids_host.copy_from_sequence(plan.token_ids)
+        pos_ids_host.copy_from_sequence(pos)
+        seq_ids_host.copy_from_sequence(seq)
         if output_rows:
-            logits_indices.copy_from_sequence(output_rows)
+            logits_indices_host.copy_from_sequence(output_rows)
+        input_ids.copy_(input_ids_host, non_blocking=True, stream=h2d_stream)
+        pos_ids.copy_(pos_ids_host, non_blocking=True, stream=h2d_stream)
+        seq_ids.copy_(seq_ids_host, non_blocking=True, stream=h2d_stream)
+        if output_rows:
+            logits_indices.copy_(logits_indices_host, non_blocking=True, stream=h2d_stream)
 
         keepalive: list[Tensor] = [
             input_ids,
             pos_ids,
             seq_ids,
             logits_indices,
+            input_ids_host,
+            pos_ids_host,
+            seq_ids_host,
+            logits_indices_host,
         ]
         attn, attn_keepalive = self._build_attention_metadata(
             plan=plan,
             ntoken=ntoken,
             seq_ids=seq_ids,
-            pos_ids_host=pos_ids,
+            pos_ids_host=pos_ids_host,
             is_block_layout=is_block_layout,
+            h2d_stream=h2d_stream,
         )
         keepalive.extend(attn_keepalive)
+        self._record_prepare_inputs_event(h2d_stream, dev_id)
 
         fin = ModelForwardInput()
         fin.input_ids = input_ids.lib_tensor()
@@ -256,6 +464,7 @@ class ModelRunner:
         seq_ids: Tensor,
         pos_ids_host: Tensor,
         is_block_layout: bool,
+        h2d_stream=None,
     ) -> tuple[AttentionMetadata, list[Tensor]]:
         attn = AttentionMetadata()
         attn.mode = c_int32(int(KvCacheLayout.BLOCK if is_block_layout else KvCacheLayout.SLOT))
@@ -299,12 +508,13 @@ class ModelRunner:
         n_batch_seq = len(plan.context_lens)
         n_block_elems = len(plan.block_tables)
         n_block_meta_i32 = (3 * ntoken) + n_batch_seq + n_block_elems
-        self._ensure_block_meta_buffers(n_block_meta_i32)
-        assert self._block_meta_host_buf is not None
-        assert self._block_meta_dev_buf is not None
-
-        block_meta_host = self._block_meta_host_buf.slice(0, 0, n_block_meta_i32)
-        block_meta_dev = self._block_meta_dev_buf.slice(0, 0, n_block_meta_i32)
+        if n_block_meta_i32 > self._max_block_meta_i32:
+            raise RuntimeError("BLOCK metadata exceeds configured max_block_meta_i32")
+        assert self._block_meta_buf is not None
+        if not isinstance(self._block_meta_buf, CpuGpuBuffer):
+            raise RuntimeError("GPUModelRunner block metadata buffer must be CpuGpuBuffer")
+        block_meta_host = self._block_meta_buf.cpu.slice(0, 0, n_block_meta_i32)
+        block_meta_dev = self._block_meta_buf.gpu.slice(0, 0, n_block_meta_i32)
         packed_i32 = [
             *plan.q_seq_rows,
             *plan.q_pos,
@@ -313,7 +523,7 @@ class ModelRunner:
             *plan.block_tables,
         ]
         block_meta_host.copy_from_sequence(packed_i32)
-        block_meta_dev.copy_(block_meta_host)
+        block_meta_dev.copy_(block_meta_host, non_blocking=True, stream=h2d_stream)
 
         off = 0
         q_seq_rows = block_meta_dev.slice(0, off, off + ntoken)
@@ -326,8 +536,12 @@ class ModelRunner:
         off += n_batch_seq
         block_tables = block_meta_dev.slice(0, off, off + n_block_elems)
 
-        batch_seq_ids = self._batch_seq_ids_buf.slice(0, 0, len(plan.batch_seq_ids))
-        batch_seq_ids.copy_from_sequence(plan.batch_seq_ids)
+        if not isinstance(self._batch_seq_ids_buf, CpuGpuBuffer):
+            raise RuntimeError("GPUModelRunner batch_seq_ids buffer must be CpuGpuBuffer")
+        batch_seq_ids_host = self._batch_seq_ids_buf.cpu.slice(0, 0, len(plan.batch_seq_ids))
+        batch_seq_ids = self._batch_seq_ids_buf.gpu.slice(0, 0, len(plan.batch_seq_ids))
+        batch_seq_ids_host.copy_from_sequence(plan.batch_seq_ids)
+        batch_seq_ids.copy_(batch_seq_ids_host, non_blocking=True, stream=h2d_stream)
 
         attn.q_seq_rows = q_seq_rows.lib_tensor()
         attn.q_pos = q_pos.lib_tensor()
@@ -347,30 +561,8 @@ class ModelRunner:
             block_tables,
             block_meta_host,
             block_meta_dev,
+            batch_seq_ids_host,
         ]
-
-    def _ensure_token_buffers(self, n_tokens: int) -> None:
-        if n_tokens <= self._step_capacity_tokens:
-            return
-        self._input_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
-        self._pos_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
-        self._seq_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
-        self._output_ids_buf = Tensor((n_tokens,), DataType.I64, DeviceType.CPU, 0)
-        self._step_capacity_tokens = n_tokens
-
-    def _ensure_batch_buffers(self, n_batch_seq: int, n_block_elems: int) -> None:
-        if n_batch_seq > self._step_capacity_batch_seq:
-            self._batch_seq_ids_buf = Tensor((n_batch_seq,), DataType.I64, DeviceType.CPU, 0)
-            self._step_capacity_batch_seq = n_batch_seq
-        if n_block_elems > self._step_capacity_block_elems:
-            self._step_capacity_block_elems = n_block_elems
-
-    def _ensure_block_meta_buffers(self, n_i32: int) -> None:
-        if n_i32 <= self._step_capacity_block_meta_i32:
-            return
-        self._block_meta_host_buf = Tensor((n_i32,), DataType.I32, DeviceType.CPU, 0)
-        self._block_meta_dev_buf = Tensor((n_i32,), DataType.I32, self._device, 0)
-        self._step_capacity_block_meta_i32 = n_i32
 
     def _collect_token_inputs(
         self,

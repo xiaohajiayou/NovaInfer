@@ -27,7 +27,8 @@ Tensor::Tensor(TensorMeta meta, core::storage_t storage, size_t offset)
 tensor_t Tensor::create(const std::vector<size_t> &shape,
                         llaisysDataType_t dtype,
                         llaisysDeviceType_t device_type,
-                        int device) {
+                        int device,
+                        bool pin_memory) {
     size_t ndim_ = shape.size();
     std::vector<ptrdiff_t> strides(ndim_);
     size_t stride = 1;
@@ -38,6 +39,18 @@ tensor_t Tensor::create(const std::vector<size_t> &shape,
     TensorMeta meta{dtype, shape, strides};
     size_t total_elems = stride;
     size_t dtype_size = utils::dsize(dtype);
+
+    if (pin_memory) {
+        CHECK_ARGUMENT(device_type == LLAISYS_DEVICE_CPU, "pin_memory is only supported for CPU tensors");
+        if (core::context().runtime().deviceType() != LLAISYS_DEVICE_NVIDIA) {
+            const LlaisysRuntimeAPI *nvidia_api = llaisysGetRuntimeAPI(LLAISYS_DEVICE_NVIDIA);
+            if (nvidia_api != nullptr && nvidia_api->get_device_count() > 0) {
+                core::context().setDevice(LLAISYS_DEVICE_NVIDIA, 0);
+            }
+        }
+        auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);
+        return std::shared_ptr<Tensor>(new Tensor(meta, storage));
+    }
 
     if (device_type == LLAISYS_DEVICE_CPU && core::context().runtime().deviceType() != LLAISYS_DEVICE_CPU) {
         auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);

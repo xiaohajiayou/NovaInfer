@@ -71,6 +71,7 @@ class AsyncLLMEngine:
         self._cmd_q: Queue = Queue()
         self._stop_event = Event()
         self._engine_closed = False
+        self._loop_exc: BaseException | None = None
         self._loop_thread = Thread(target=self._loop, name="llaisys-async-engine", daemon=True)
         self._loop_thread.start()
 
@@ -95,8 +96,9 @@ class AsyncLLMEngine:
 
     def submit(self, inputs: Sequence[int], sampling_params: SamplingParams) -> str:
         reply_q: Queue = Queue(maxsize=1)
+        self._raise_if_unhealthy()
         self._cmd_q.put(("submit", [int(t) for t in inputs], sampling_params, reply_q))
-        return str(reply_q.get())
+        return str(self._wait_reply(reply_q))
 
     def step(self):
         # Compatibility path for stage-1 tests; async loop drives steps internally.
@@ -104,13 +106,15 @@ class AsyncLLMEngine:
 
     def collect(self, request_id: str) -> GenerationOutput | None:
         reply_q: Queue = Queue(maxsize=1)
+        self._raise_if_unhealthy()
         self._cmd_q.put(("collect", str(request_id), reply_q))
-        return reply_q.get()
+        return self._wait_reply(reply_q)
 
     def cancel(self, request_id: str) -> bool:
         reply_q: Queue = Queue(maxsize=1)
+        self._raise_if_unhealthy()
         self._cmd_q.put(("cancel", str(request_id), reply_q))
-        return bool(reply_q.get())
+        return bool(self._wait_reply(reply_q))
 
     def generate(self, inputs: Sequence[int], sampling_params: SamplingParams) -> GenerationOutput:
         req_id = self.submit(inputs=inputs, sampling_params=sampling_params)
@@ -149,13 +153,15 @@ class AsyncLLMEngine:
 
     def is_finished(self, request_id: str) -> bool:
         reply_q: Queue = Queue(maxsize=1)
+        self._raise_if_unhealthy()
         self._cmd_q.put(("is_finished", str(request_id), reply_q))
-        return bool(reply_q.get())
+        return bool(self._wait_reply(reply_q))
 
     def get_request_status(self, request_id: str):
         reply_q: Queue = Queue(maxsize=1)
+        self._raise_if_unhealthy()
         self._cmd_q.put(("status", str(request_id), reply_q))
-        return reply_q.get()
+        return self._wait_reply(reply_q)
 
     def encode_chat_messages(self, messages: list[dict]) -> list[int]:
         worker = self._engine._worker  # noqa: SLF001
@@ -184,21 +190,41 @@ class AsyncLLMEngine:
     def inner_engine(self) -> LLMEngine:
         return self._engine
 
+    def _raise_if_unhealthy(self) -> None:
+        if self._loop_exc is not None:
+            raise RuntimeError("AsyncLLMEngine loop thread crashed") from self._loop_exc
+        if self._stop_event.is_set():
+            raise RuntimeError("AsyncLLMEngine is closed")
+
+    def _wait_reply(self, reply_q: Queue):
+        while True:
+            self._raise_if_unhealthy()
+            try:
+                return reply_q.get(timeout=0.2)
+            except Empty:
+                continue
+
     def _loop(self):
-        while not self._stop_event.is_set():
-            self._drain_commands()
-            outputs = self._engine.step()
-            if outputs:
-                for out in outputs:
-                    req_id = out.request_id
-                    # Ensure all newly generated tokens are emitted before
-                    # sending terminal chunk for this request.
-                    self._emit_pending_chunks_for_request(req_id)
-                    self._final_outputs[req_id] = out
-                    self._emit_chunk(req_id, token_id=None, text_delta=None, status=out.status, is_finished=True, finish_reason=out.finish_reason)
-                    self._close_stream(req_id)
-            self._emit_inflight_chunks()
-            self._stop_event.wait(0.001)
+        try:
+            while not self._stop_event.is_set():
+                self._drain_commands()
+                outputs = self._engine.step()
+                if outputs:
+                    for out in outputs:
+                        req_id = out.request_id
+                        # Ensure all newly generated tokens are emitted before
+                        # sending terminal chunk for this request.
+                        self._emit_pending_chunks_for_request(req_id)
+                        self._final_outputs[req_id] = out
+                        self._emit_chunk(req_id, token_id=None, text_delta=None, status=out.status, is_finished=True, finish_reason=out.finish_reason)
+                        self._close_stream(req_id)
+                self._emit_inflight_chunks()
+                self._stop_event.wait(0.001)
+        except BaseException as exc:
+            self._loop_exc = exc
+            self._stop_event.set()
+            for req_id in list(self._stream_queues.keys()):
+                self._close_stream(req_id)
 
     def _drain_commands(self):
         while True:

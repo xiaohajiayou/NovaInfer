@@ -7,9 +7,12 @@ from typing import Any
 from ..libllaisys import DeviceType
 from ..libllaisys.model import KvCacheLayout
 from .config import EngineConfig
+from .cpu_model_runner import CPUModelRunner
+from .gpu_model_runner import GPUModelRunner
 from .input_processor import InputProcessor
-from .model_runner import ModelRunner
 from .model_registry import ModelRegistry, create_default_registry
+
+
 class Worker:
     """Executes model forward for a batch plan."""
 
@@ -72,10 +75,12 @@ class Worker:
         if hasattr(runner_obj, "execute_model") and hasattr(runner_obj, "sample_tokens"):
             self._model_runner = runner_obj
         else:
-            self._model_runner = ModelRunner(
+            runner_cls = CPUModelRunner if self._device == DeviceType.CPU else GPUModelRunner
+            self._model_runner = runner_cls(
                 runner_obj,
                 self._device,
                 kv_cache_layout=self._kv_cache_layout,
+                config=self._config,
                 runtime_handle=runtime_handle,
             )
         self._input_processor = InputProcessor(self._model_path)

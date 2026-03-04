@@ -41,6 +41,10 @@ void eventRecord(llaisysEvent_t event, llaisysStream_t stream) {
     // do nothing
 }
 
+void streamWaitEvent(llaisysStream_t stream, llaisysEvent_t event) {
+    // do nothing
+}
+
 void eventSynchronize(llaisysEvent_t event) {
     // do nothing
 }
@@ -81,6 +85,7 @@ static const LlaisysRuntimeAPI RUNTIME_API = {
     &createEvent,
     &destroyEvent,
     &eventRecord,
+    &streamWaitEvent,
     &eventSynchronize,
     &mallocDevice,
     &freeDevice,

@@ -17,6 +17,7 @@ __C {
     typedef llaisysEvent_t (*create_event_api)();
     typedef void (*destroy_event_api)(llaisysEvent_t);
     typedef void (*event_record_api)(llaisysEvent_t, llaisysStream_t);
+    typedef void (*stream_wait_event_api)(llaisysStream_t, llaisysEvent_t);
     typedef void (*event_synchronize_api)(llaisysEvent_t);
     // Memory
     typedef void *(*malloc_device_api)(size_t);
@@ -37,6 +38,7 @@ __C {
         create_event_api create_event;
         destroy_event_api destroy_event;
         event_record_api event_record;
+        stream_wait_event_api stream_wait_event;
         event_synchronize_api event_synchronize;
         malloc_device_api malloc_device;
         free_device_api free_device;

@@ -8,9 +8,10 @@ __C {
         size_t ndim,
         llaisysDataType_t dtype,
         llaisysDeviceType_t device_type,
-        int device_id) {
+        int device_id,
+        uint8_t pin_memory) {
         std::vector<size_t> shape_vec(shape, shape + ndim);
-        return new LlaisysTensor{llaisys::Tensor::create(shape_vec, dtype, device_type, device_id)};
+        return new LlaisysTensor{llaisys::Tensor::create(shape_vec, dtype, device_type, device_id, pin_memory != 0)};
     }
 
     void tensorDestroy(

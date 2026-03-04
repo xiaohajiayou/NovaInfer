@@ -253,8 +253,10 @@ def sample_from_forward(result: ForwardRunResult, *, device: DeviceType = Device
     if result.n_outputs <= 0:
         return []
     sampler = Sampler(device, result.runtime)
+    out_ids_dev = llaisys.Tensor((result.n_outputs,), llaisys.DataType.I64, device, 0)
     sampled = sampler.sample_tokens(
         logits_tensor=result.logits_tensor,
+        out_ids_dev=out_ids_dev,
     )
     if sampled is None:
         return []

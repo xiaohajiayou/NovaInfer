@@ -80,6 +80,15 @@ void eventRecord(llaisysEvent_t event, llaisysStream_t stream) {
     LLAISYS_CUDA_CHECK(cudaEventRecord(reinterpret_cast<cudaEvent_t>(event), reinterpret_cast<cudaStream_t>(stream)));
 }
 
+void streamWaitEvent(llaisysStream_t stream, llaisysEvent_t event) {
+    if (stream == nullptr || event == nullptr) {
+        return;
+    }
+    LLAISYS_CUDA_CHECK(cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream),
+                                           reinterpret_cast<cudaEvent_t>(event),
+                                           0));
+}
+
 void eventSynchronize(llaisysEvent_t event) {
     if (event == nullptr) {
         return;
@@ -149,6 +158,7 @@ static const LlaisysRuntimeAPI RUNTIME_API = {
     &createEvent,
     &destroyEvent,
     &eventRecord,
+    &streamWaitEvent,
     &eventSynchronize,
     &mallocDevice,
     &freeDevice,
