@@ -54,6 +54,11 @@ class Tensor:
                 c_int(device_id),
                 c_uint8(1 if pin_memory else 0),
             )
+            if not self._tensor:
+                raise RuntimeError(
+                    f"tensorCreate failed: shape={tuple(shape) if shape is not None else ()}, "
+                    f"dtype={dtype}, device={device}:{device_id}, pin_memory={pin_memory}"
+                )
 
     def __del__(self):
         if hasattr(self, "_tensor") and self._tensor is not None:
@@ -95,12 +100,16 @@ class Tensor:
         return f"<Tensor shape={self.shape}, dtype={self.dtype}, device={self.device_type}:{self.device_id}>"
 
     def load(self, data: c_void_p):
+        if data is None:
+            raise RuntimeError("tensor.load() got null data pointer")
         LIB_LLAISYS.tensorLoad(self._tensor, data)
 
     def copy_from_sequence(self, values: Sequence[int | float]) -> None:
         n = len(values)
         if n <= 0:
             return
+        if n > self.numel():
+            raise RuntimeError(f"copy_from_sequence() overflow: values={n} > tensor.numel={self.numel()}")
         dtype = self.dtype()
         if dtype == DataType.I64:
             buf = (c_int64 * n)(*[int(x) for x in values])

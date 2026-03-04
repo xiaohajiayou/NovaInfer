@@ -103,6 +103,7 @@ class GPUModelRunner:
             self._block_meta_buf = self._make_buffer((self._max_block_meta_i32,), DataType.I32, pin_memory=True)
         self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, 0)
         self._execute_model_state: _ExecuteModelState | None = None
+        self._closed = False
 
     @property
     def max_seq_len(self) -> int:
@@ -121,8 +122,29 @@ class GPUModelRunner:
         return None
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self._execute_model_state = None
         if self._runtime_api is not None:
+            for dev_id, stream in list(self._compute_streams.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.stream_synchronize(stream)
+                except Exception:
+                    pass
+            for dev_id, stream in list(self._h2d_streams.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.stream_synchronize(stream)
+                except Exception:
+                    pass
+            for dev_id, stream in list(self._d2h_streams.items()):
+                try:
+                    self._runtime_api.set_device(int(dev_id))
+                    self._runtime_api.stream_synchronize(stream)
+                except Exception:
+                    pass
             for dev_id, evt in list(self._prepare_inputs_events.items()):
                 try:
                     self._runtime_api.set_device(int(dev_id))

@@ -28,6 +28,7 @@ target("llaisys-ops-cuda")
         add_cuflags("-Xcompiler=-fPIC")
     end
     add_links("cublas")
+    add_links("cublasLt")
     if has_config("nv-cudnn") then
         add_defines("ENABLE_CUDNN_API")
         add_links("cudnn")

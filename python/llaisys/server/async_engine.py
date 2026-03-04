@@ -78,7 +78,11 @@ class AsyncLLMEngine:
     def close(self):
         if not self._stop_event.is_set():
             self._stop_event.set()
-            self._loop_thread.join(timeout=2.0)
+        # Must wait loop thread to fully exit before tearing down model/runtime.
+        # A short timeout can race with in-flight engine.step() and crash during
+        # CUDA resource destruction.
+        if self._loop_thread.is_alive():
+            self._loop_thread.join()
 
         if not self._engine_closed:
             close_fn = getattr(self._engine, "close", None)
