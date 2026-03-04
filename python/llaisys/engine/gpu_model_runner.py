@@ -62,8 +62,6 @@ class GPUModelRunner:
         self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._prepare_inputs_events: dict[int, object] = {}
         self._sampler_done_events: dict[int, object] = {}
-        self.prepare_inputs_event = None
-        self.sampler_done_event = None
         self._kv_cache_layout = KvCacheLayout(int(cfg.kv_cache_layout))
         self._max_num_reqs = max(1, int(cfg.max_num_seqs))
         if cfg.max_num_batched_tokens is not None:
@@ -153,8 +151,6 @@ class GPUModelRunner:
         self._sampler_done_events.clear()
         self._h2d_streams.clear()
         self._d2h_streams.clear()
-        self.prepare_inputs_event = None
-        self.sampler_done_event = None
         runtime = self._runtime
         self._runtime = None
         close_fn = getattr(self.model, "close", None)
@@ -233,6 +229,9 @@ class GPUModelRunner:
         d2h_stream = self._get_d2h_stream(dev_id)
         self._runtime_api.stream_wait_event(d2h_stream, sampler_done_event)
         sampled_host.copy_(sampled, non_blocking=True, stream=d2h_stream)
+        sync_fn = getattr(self._runtime_api, "stream_synchronize", None)
+        if callable(sync_fn):
+            sync_fn(d2h_stream)
         sampled = sampled_host
         return sampled, list(state.sampled_req_ids)
 
@@ -286,8 +285,6 @@ class GPUModelRunner:
         self._runtime_api.set_device(int(device_id))
         event = self._runtime_api.create_event()
         self._prepare_inputs_events[int(device_id)] = event
-        # Keep compatibility with existing debug hooks that inspect this attr.
-        self.prepare_inputs_event = event
         return event
 
     def _get_sampler_done_event(self, device_id: int):
@@ -299,7 +296,6 @@ class GPUModelRunner:
         self._runtime_api.set_device(int(device_id))
         event = self._runtime_api.create_event()
         self._sampler_done_events[int(device_id)] = event
-        self.sampler_done_event = event
         return event
 
     def _record_prepare_inputs_event(self, stream, device_id: int) -> None:

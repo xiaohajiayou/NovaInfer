@@ -583,7 +583,6 @@ class LLMEngine:
         token_tensor = sampled_t
         if token_tensor.device_type() != DeviceType.CPU:
             raise RuntimeError("sampled token tensor must be on CPU")
-        token_tensor.wait()
 
         shape = token_tensor.shape()
         if len(shape) != 1:
