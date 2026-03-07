@@ -49,11 +49,11 @@ class AttentionMetadata(Structure):
     _fields_ = [
         ("mode", c_int32),
         ("seq_ids", llaisysTensor_t),
-        ("q_seq_rows", llaisysTensor_t),
-        ("q_pos", llaisysTensor_t),
+        ("req_num_scheduled_tokens", llaisysTensor_t),
+        ("req_num_computed_tokens", llaisysTensor_t),
+        ("query_start_loc", llaisysTensor_t),
+        ("seq_lens", llaisysTensor_t),
         ("slot_mapping", llaisysTensor_t),
-        ("context_lens", llaisysTensor_t),
-        ("batch_seq_ids", llaisysTensor_t),
         ("block_tables", llaisysTensor_t),
         ("pos_ids_host", llaisysTensor_t),
         ("block_table_width", c_int32),
@@ -118,6 +118,18 @@ def load_model(lib):
 
     lib.llaisysModelForward.argtypes = [llaisysModel_t, llaisysRuntime_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
     lib.llaisysModelForward.restype = c_int32
+    lib.llaisysRuntimeBuildBlockAttentionMetadata.argtypes = [
+        llaisysRuntime_t,
+        llaisysTensor_t,
+        llaisysTensor_t,
+        llaisysTensor_t,
+        c_int32,
+        c_int32,
+        llaisysTensor_t,
+        llaisysTensor_t,
+        llaisysTensor_t,
+    ]
+    lib.llaisysRuntimeBuildBlockAttentionMetadata.restype = c_int32
     lib.llaisysSamplerSample.argtypes = [llaisysRuntime_t, POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
 

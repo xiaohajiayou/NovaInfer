@@ -73,8 +73,6 @@ def _create_qwen2_runtime(
     kv_cache_block_size: int = 16,
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
-    kv_cache_capacity_tokens: int | None = None,
-    kv_cache_auto_capacity: bool = False,
     kv_cache_memory_utilization: float = 0.9,
 ) -> tuple[object, dict]:
     from .runtime_factory import create_runtime, plan_qwen2_runtime
@@ -85,8 +83,6 @@ def _create_qwen2_runtime(
         kv_cache_block_size=kv_cache_block_size,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
-        kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-        kv_cache_auto_capacity=kv_cache_auto_capacity,
         kv_cache_memory_utilization=kv_cache_memory_utilization,
     )
     runtime_handle = create_runtime(

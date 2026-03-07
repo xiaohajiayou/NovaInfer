@@ -41,8 +41,6 @@ def _run_novainfer(
     max_model_len: int,
     max_num_seqs: int,
     max_num_batched_tokens: int,
-    kv_cache_capacity_mode: str,
-    kv_cache_capacity_tokens: int,
     kv_cache_memory_utilization: float,
 ) -> dict:
     from llaisys.entrypoints.llm import LLM
@@ -75,10 +73,6 @@ def _run_novainfer(
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
-        kv_cache_capacity_tokens=(
-            None if kv_cache_capacity_mode == "auto" else int(kv_cache_capacity_tokens)
-        ),
-        kv_cache_auto_capacity=(kv_cache_capacity_mode == "auto"),
         kv_cache_memory_utilization=float(kv_cache_memory_utilization),
     )
     t_init1 = time.perf_counter()
@@ -177,6 +171,7 @@ def _run_vllm(
         # Fair mode: disable vLLM-only runtime optimizations not present in NovaInfer yet.
         llm_kwargs["enforce_eager"] = True
         llm_kwargs["enable_chunked_prefill"] = False
+        llm_kwargs["async_scheduling"] = False
         # Keep prefix caching ON since NovaInfer BLOCK path supports prefix caching.
         llm_kwargs["enable_prefix_caching"] = True
 
@@ -227,8 +222,6 @@ def main() -> int:
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--max-num-seqs", default=256, type=int)
     parser.add_argument("--max-num-batched-tokens", default=16384, type=int)
-    parser.add_argument("--kv-cache-capacity-mode", default="auto", choices=["explicit", "auto"])
-    parser.add_argument("--kv-cache-capacity-tokens", default=4096, type=int)
     parser.add_argument("--kv-cache-memory-utilization", default=0.9, type=float)
     parser.add_argument("--vllm-fair-mode", action="store_true")
     parser.add_argument("--result-json", default="", type=str)
@@ -294,10 +287,6 @@ def main() -> int:
                 str(args.max_num_seqs),
                 "--max-num-batched-tokens",
                 str(args.max_num_batched_tokens),
-                "--kv-cache-capacity-mode",
-                str(args.kv_cache_capacity_mode),
-                "--kv-cache-capacity-tokens",
-                str(args.kv_cache_capacity_tokens),
                 "--kv-cache-memory-utilization",
                 str(args.kv_cache_memory_utilization),
                 *(["--vllm-fair-mode"] if bool(args.vllm_fair_mode) else []),
@@ -339,8 +328,6 @@ def main() -> int:
             max_model_len=int(args.max_model_len),
             max_num_seqs=int(args.max_num_seqs),
             max_num_batched_tokens=int(args.max_num_batched_tokens),
-            kv_cache_capacity_mode=str(args.kv_cache_capacity_mode),
-            kv_cache_capacity_tokens=int(args.kv_cache_capacity_tokens),
             kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
         )
         results.append(row)

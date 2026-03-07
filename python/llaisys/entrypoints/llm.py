@@ -9,8 +9,6 @@ from ..engine.config import EngineConfig
 from ..engine.llm_engine import LLMEngine
 from ..engine.model_registry import ModelRegistry
 from ..engine.types import SamplingParams
-from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
 
 
 class LLM:
@@ -19,42 +17,38 @@ class LLM:
     def __init__(
         self,
         model: Path | str,
-        model_type: str = "qwen2",
-        device: DeviceType = DeviceType.CPU,
-        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
-        kv_cache_block_size: int = 16,
-        max_model_len: int | None = None,
-        kv_cache_capacity_tokens: int | None = None,
-        max_num_seqs: int | None = None,
-        max_num_batched_tokens: int | None = None,
-        kv_cache_auto_capacity: bool = False,
-        kv_cache_memory_utilization: float = 0.9,
+        config: EngineConfig | None = None,
         model_registry: ModelRegistry | None = None,
+        **kwargs,
     ):
-        self._model_path = Path(model)
+        hint_max_num_seqs = (
+            config.max_num_seqs
+            if config is not None
+            else kwargs.get("max_num_seqs", kwargs.get("max_batch_size"))
+        )
+        hint_max_model_len = config.max_model_len if config is not None else kwargs.get("max_model_len")
+        hint_kv_block_size = (
+            config.kv_cache_block_size
+            if config is not None
+            else kwargs.get("kv_cache_block_size", 16)
+        )
         self._tokenizer = None
         self._configure_cudnn_prebuild_hint_(
-            max_num_seqs=max_num_seqs,
-            max_model_len=max_model_len,
-            kv_cache_block_size=kv_cache_block_size,
+            max_num_seqs=hint_max_num_seqs,
+            max_model_len=hint_max_model_len,
+            kv_cache_block_size=hint_kv_block_size,
         )
-        cfg = EngineConfig(
-            model_type=model_type,
-            model_path=model,
-            device=device,
-            kv_cache_layout=kv_cache_layout,
-            kv_cache_block_size=kv_cache_block_size,
-            max_model_len=max_model_len,
-            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-            max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
-            max_num_batched_tokens=max_num_batched_tokens,
-            kv_cache_auto_capacity=kv_cache_auto_capacity,
-            kv_cache_memory_utilization=kv_cache_memory_utilization,
-        ).normalized()
+        kwargs.setdefault("model_path", model)
         engine = LLMEngine(
-            config=cfg,
+            config=config,
             model_registry=model_registry,
+            **kwargs,
         )
+        cfg = getattr(engine, "_config", None)
+        resolved_model_path = model
+        if cfg is not None and getattr(cfg, "model_path", None) is not None:
+            resolved_model_path = cfg.model_path
+        self._model_path = Path(resolved_model_path)
         self._engine_client = EngineClient(engine)
 
     def _configure_cudnn_prebuild_hint_(

@@ -5,9 +5,8 @@ from llaisys.engine.sequence import Sequence
 from llaisys.engine.types import SamplingParams
 
 
-def _seq(req_id: str, sid: int, toks: list[int], block_size: int = 4) -> Sequence:
+def _seq(_req_id: str, sid: int, toks: list[int], block_size: int = 4) -> Sequence:
     return Sequence(
-        request_id=req_id,
         seq_id=sid,
         token_ids=toks,
         sampling_params=SamplingParams(max_new_tokens=8),

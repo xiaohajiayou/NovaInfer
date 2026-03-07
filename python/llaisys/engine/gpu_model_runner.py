@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ctypes import byref, c_int32, c_int64
+from ctypes import byref, c_int32, c_int64, c_void_p, cast
+from pathlib import Path
+import numpy as np
 
 from .config import EngineConfig
 from .buffers import CpuGpuBuffer
+from .gpu_input_batch import InputBatch
+from .model_registry import ModelRegistry, create_default_registry
 from .sampler import Sampler
 from .scheduler import SchedulerOutputs
-from .types import BatchPlan, SamplingParams
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType, llaisysDeviceType_t
 from ..libllaisys.model import (
     AttentionMetadata,
@@ -23,9 +26,13 @@ from ..tensor import Tensor
 @dataclass
 class _ExecuteModelState:
     logits: Tensor
-    plan: BatchPlan
-    sampled_req_ids: list[str]
+    sampled_seq_ids: list[int]
     keepalive: list[Tensor]
+    temperatures: list[float]
+    top_ps: list[float]
+    top_ks: list[int]
+    seeds: list[int]
+    has_seeds: list[int]
 
 
 Buffer = Tensor | CpuGpuBuffer
@@ -37,52 +44,48 @@ class GPUModelRunner:
     def __init__(
         self,
         model,
-        device: DeviceType,
-        kv_cache_layout: KvCacheLayout,
-        max_num_seqs: int | None = None,
         config: EngineConfig | None = None,
-        runtime_handle=None,
+        model_registry: ModelRegistry | None = None,
     ):
+        if config is None:
+            raise ValueError("config is required")
         self.model = model
-        cfg = (config or EngineConfig(
-            device=device,
-            kv_cache_layout=kv_cache_layout,
-            max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
-        )).normalized()
-        self._config = cfg
-        self._device = cfg.device
-        self._runtime = runtime_handle
-        if self._runtime is None:
-            raise ValueError("runtime_handle is required by ModelRunner")
-        self.sampler = Sampler(self._device, runtime_handle, config=cfg)
-        self._owns_runtime = True
+        self._config = config
+        self._device = self._config.device
+        self._model_registry = model_registry if model_registry is not None else create_default_registry()
+        self._model_type = str(self._config.model_type or "qwen2").strip().lower()
+        self._model_path = Path(self._config.model_path) if self._config.model_path is not None else None
+        self._config.max_model_len = int(self.model.max_seq_len)
+        self._config.end_token_id = int(self.model.end_token_id)
+        self._runtime = None
+        self.allocate_kv_cache()
+        self.sampler = Sampler(self._device, self._runtime, config=self._config)
+
+        self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
+        
         self._compute_streams: dict[int, object] = {}
         self._h2d_streams: dict[int, object] = {}
         self._d2h_streams: dict[int, object] = {}
-        self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._prepare_inputs_events: dict[int, object] = {}
         self._sampler_done_events: dict[int, object] = {}
-        self._kv_cache_layout = KvCacheLayout(int(cfg.kv_cache_layout))
-        self._max_num_reqs = max(1, int(cfg.max_num_seqs))
-        if cfg.max_num_batched_tokens is not None:
-            max_tokens = int(cfg.max_num_batched_tokens)
-        elif cfg.max_model_len is not None:
-            max_tokens = int(cfg.max_model_len)
-        else:
-            max_tokens = int(self.max_seq_len)
-        self._max_num_tokens = max(1, max_tokens)
-        max_model_len = int(cfg.max_model_len) if cfg.max_model_len is not None else int(self.max_seq_len)
-        block_size = max(1, int(cfg.kv_cache_block_size))
+        
+        self._max_num_reqs = self._config.max_num_seqs
+        self._max_num_tokens = self._config.max_num_batched_tokens
+        max_model_len = int(self._config.max_model_len)
+        block_size = max(1, int(self._config.kv_cache_block_size))
         self._max_block_table_width = max(1, (max_model_len + block_size - 1) // block_size)
-        self._max_block_elems = self._max_num_reqs * self._max_block_table_width
-        self._max_block_meta_i32 = (3 * self._max_num_tokens) + self._max_num_reqs + self._max_block_elems
+        self.input_batch = InputBatch(self._max_num_reqs, self._max_num_tokens, self._max_block_table_width)
 
         # Persistent metadata buffers (vLLM-like): allocated once at runner init.
         self._input_ids_buf: Buffer | None = None
         self._pos_ids_buf: Buffer | None = None
         self._seq_ids_buf: Buffer | None = None
-        self._batch_seq_ids_buf: Buffer | None = None
-        self._block_meta_buf: Buffer | None = None
+        self._req_sched_buf: Buffer | None = None
+        self._req_comp_buf: Buffer | None = None
+        self._query_start_loc_buf: Buffer | None = None
+        self._seq_lens_buf: Buffer | None = None
+        self._slot_mapping_buf: Buffer | None = None
+        self._block_tables_buf: Buffer | None = None
         self._output_ids_buf: Buffer | None = None
 
         # Persistent sampled-token host buffer (one token per request).
@@ -95,31 +98,49 @@ class GPUModelRunner:
         self._seq_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
         self._output_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
 
-        # Request-level buffers sized by max_num_seqs.
-        self._batch_seq_ids_buf = self._make_buffer((self._max_num_reqs,), DataType.I64, pin_memory=True)
-
-        # BLOCK metadata buffer sized by max token/request capacities.
-        if int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK):
-            self._block_meta_buf = self._make_buffer((self._max_block_meta_i32,), DataType.I32, pin_memory=True)
+        # BLOCK descriptor buffers sized by request capacities.
+        if int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK):
+            self._req_sched_buf = self._make_buffer((self._max_num_reqs,), DataType.I32, pin_memory=True)
+            self._req_comp_buf = self._make_buffer((self._max_num_reqs,), DataType.I32, pin_memory=True)
+            self._query_start_loc_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
+            self._seq_lens_buf = self._make_buffer((self._max_num_reqs,), DataType.I32, pin_memory=True)
+            self._slot_mapping_buf = self._make_buffer((self._max_num_tokens,), DataType.I32, pin_memory=True)
+            self._block_tables_buf = self._make_buffer(
+                (self._max_num_reqs * self._max_block_table_width,),
+                DataType.I32,
+                pin_memory=True,
+            )
         self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, 0)
         self._execute_model_state: _ExecuteModelState | None = None
         self._closed = False
 
-    @property
-    def max_seq_len(self) -> int:
-        if hasattr(self.model, "max_seq_len"):
-            return int(self.model.max_seq_len)
-        return int(self.model._meta_info.maxseq)
-
-    @property
-    def end_token_id(self) -> int:
-        if hasattr(self.model, "end_token_id"):
-            return int(self.model.end_token_id)
-        return int(self.model._meta_info.end_token)
-
-    @property
-    def kv_cache_capacity_tokens(self) -> int | None:
-        return None
+    def allocate_kv_cache(self) -> None:
+        if self._runtime is not None:
+            return
+        if self._model_path is None:
+            raise ValueError("model_path is required for runtime allocation")
+        runtime_handle, runtime_info = self._model_registry.create_runtime(
+            self._model_type,
+            self._model_path,
+            self._device,
+            kv_cache_layout=self._config.kv_cache_layout,
+            kv_cache_block_size=self._config.kv_cache_block_size,
+            max_model_len=self._config.max_model_len,
+            max_num_seqs=int(self._config.max_num_seqs),
+            kv_cache_memory_utilization=self._config.kv_cache_memory_utilization,
+        )
+        if runtime_handle is None:
+            raise RuntimeError("runtime allocation failed")
+        self._runtime = runtime_handle
+        if runtime_info:
+            kv_capacity = runtime_info.get("kv_cache_capacity_tokens")
+            if (
+                self._config.kv_cache_layout == KvCacheLayout.BLOCK
+                and kv_capacity is not None
+            ):
+                self._config.num_kvcache_blocks = (
+                    int(kv_capacity) + int(self._config.kv_cache_block_size) - 1
+                ) // int(self._config.kv_cache_block_size)
 
     def close(self) -> None:
         if self._closed:
@@ -178,36 +199,52 @@ class GPUModelRunner:
         close_fn = getattr(self.model, "close", None)
         if callable(close_fn):
             close_fn()
-        if runtime is not None and self._owns_runtime:
+        if runtime is not None:
             LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
 
     def execute_model(
         self,
         scheduler_outputs: SchedulerOutputs,
-        sampling_params: SamplingParams | None = None,
-        sampling_params_by_req: dict[str, SamplingParams] | None = None,
     ):
-        plan, token_idx_to_req_id = self.prepare_model_input(
-            scheduler_outputs,
-            sampling_params=sampling_params,
-            sampling_params_by_req=sampling_params_by_req,
-        )
+        block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
+        self._update_states(scheduler_outputs)
+        self._prepare_inputs(is_block_layout=block_layout)
         self._execute_model_state = None
-        if not plan.token_ids:
+        if int(self.input_batch.n_tokens) <= 0:
             return None
 
-        output_rows, logits_tensor, keepalive = self._forward_step(plan)
-        sampled_req_ids: list[str] = []
-        for out_idx in output_rows:
-            rid = token_idx_to_req_id.get(int(out_idx))
-            if rid is None:
-                raise RuntimeError("executor output id cannot be mapped to request")
-            sampled_req_ids.append(rid)
+        output_rows, logits_tensor, keepalive = self._forward_step()
+        sampled_seq_ids = list(self.input_batch.seq_ids)
+        if len(sampled_seq_ids) != len(output_rows):
+            raise RuntimeError("sampled seq_ids count mismatch with output rows")
+        temperatures: list[float] = []
+        top_ps: list[float] = []
+        top_ks: list[int] = []
+        seeds: list[int] = []
+        has_seeds: list[int] = []
+        for sid in sampled_seq_ids:
+            seq_obj = self.input_batch.requests.get(int(sid))
+            if seq_obj is None:
+                raise RuntimeError(f"missing sequence for seq_id={sid}")
+            params = seq_obj.sampling_params
+            temperatures.append(float(params.temperature))
+            top_ps.append(float(params.top_p))
+            top_ks.append(int(params.top_k))
+            if params.seed is None:
+                has_seeds.append(0)
+                seeds.append(0)
+            else:
+                has_seeds.append(1)
+                seeds.append(int(params.seed))
         self._execute_model_state = _ExecuteModelState(
             logits=logits_tensor,
-            plan=plan,
-            sampled_req_ids=sampled_req_ids,
+            sampled_seq_ids=sampled_seq_ids,
             keepalive=keepalive,
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            seeds=seeds,
+            has_seeds=has_seeds,
         )
         return None
 
@@ -217,26 +254,25 @@ class GPUModelRunner:
         self._execute_model_state = None
         if state is None:
             return None
-        if len(state.sampled_req_ids) == 0:
-            empty = Tensor((0,), DataType.I64, DeviceType.CPU, 0)
-            return empty, []
-        n_outputs = len(state.sampled_req_ids)
+        if len(state.sampled_seq_ids) == 0:
+            return []
+        n_outputs = len(state.sampled_seq_ids)
         if not isinstance(self._sampled_ids_buf, CpuGpuBuffer):
             raise RuntimeError("GPUModelRunner sampled buffer must be CpuGpuBuffer")
         sampled_ids_dev = self._sampled_ids_buf.gpu.slice(0, 0, n_outputs)
         sampled = self.sampler.sample_tokens(
             logits_tensor=state.logits,
             out_ids_dev=sampled_ids_dev,
-            temperatures=state.plan.temperatures,
-            top_ps=state.plan.top_ps,
-            top_ks=state.plan.top_ks,
-            seeds=state.plan.seeds,
-            has_seeds=state.plan.has_seeds,
+            temperatures=state.temperatures,
+            top_ps=state.top_ps,
+            top_ks=state.top_ks,
+            seeds=state.seeds,
+            has_seeds=state.has_seeds,
         )
         if sampled is None:
             raise RuntimeError("sampler returned None for non-empty logits")
-        if int(sampled.shape()[0]) != len(state.sampled_req_ids):
-            raise RuntimeError("sampler output size mismatch with sampled request ids")
+        if int(sampled.shape()[0]) != len(state.sampled_seq_ids):
+            raise RuntimeError("sampler output size mismatch with sampled sequence ids")
         n_outputs = int(sampled.shape()[0])
         if n_outputs > self._max_num_reqs:
             raise RuntimeError("sampled outputs exceed configured max_num_reqs")
@@ -254,8 +290,8 @@ class GPUModelRunner:
         sync_fn = getattr(self._runtime_api, "stream_synchronize", None)
         if callable(sync_fn):
             sync_fn(d2h_stream)
-        sampled = sampled_host
-        return sampled, list(state.sampled_req_ids)
+        token_ids = [int(token_id) for token_id in sampled_host.tolist()]
+        return token_ids
 
     def _make_buffer(self, shape: tuple[int, ...], dtype: DataType, pin_memory: bool = True) -> Buffer:
         if self._device == DeviceType.CPU:
@@ -334,14 +370,14 @@ class GPUModelRunner:
         self._runtime_api.set_device(int(device_id))
         self._runtime_api.stream_wait_event(stream, event)
 
-    def _forward_step(self, plan: BatchPlan) -> tuple[list[int], Tensor, list[Tensor]]:
+    def _forward_step(self) -> tuple[list[int], Tensor, list[Tensor]]:
         forward_fn = getattr(self.model, "forward", None)
         if not callable(forward_fn):
             raise RuntimeError("model wrapper must implement forward(ModelForwardInput, ModelForwardOutput)")
         if self._runtime is None:
             raise RuntimeError("runtime handle is required")
 
-        fin, fout, n_outputs, output_rows, keepalive = self._build_forward_io(plan)
+        fin, fout, n_outputs, output_rows, keepalive = self._build_forward_io()
         if self._device == DeviceType.NVIDIA:
             dev_id = int(self._logits_holder.device_id())
             compute_stream = self._get_runtime_compute_stream(dev_id)
@@ -356,86 +392,92 @@ class GPUModelRunner:
             raise RuntimeError("modelForward logits row count mismatch with logits_indices")
         return output_rows, self._logits_holder, keepalive
 
-    def _normalize_step_inputs(self, plan: BatchPlan, ntoken: int) -> tuple[bool, list[int], list[int], list[int]]:
-        is_block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-        pos = (
-            list(plan.pos_ids)
-            if plan.pos_ids is not None
-            else ([0] * ntoken if not is_block_layout else None)
-        )
-        if pos is None or len(pos) != ntoken:
-            raise ValueError("pos_ids length mismatch")
-        seq = list(plan.seq_ids) if plan.seq_ids is not None else [0] * ntoken
-        if len(seq) != ntoken:
-            raise ValueError("seq_ids length mismatch")
-        mask = list(plan.logits_mask) if plan.logits_mask is not None else [0] * ntoken
-        if plan.logits_mask is None:
-            mask[-1] = 1
-        if len(mask) != ntoken:
-            raise ValueError("logits_mask length mismatch")
-        return is_block_layout, pos, seq, mask
-
     def _build_model_forward_input(
         self,
-        plan: BatchPlan,
         ntoken: int,
-        is_block_layout: bool,
-        pos: list[int],
-        seq: list[int],
-        output_rows: list[int],
-    ) -> tuple[ModelForwardInput, int, list[Tensor]]:
-        n_batch_seq = len(plan.batch_seq_ids) if plan.batch_seq_ids is not None else 0
-        n_block_elems = len(plan.block_tables) if plan.block_tables is not None else 0
+    ) -> tuple[ModelForwardInput, int, list[int], list[Tensor]]:
+        is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
+        n_batch_seq = len(self.input_batch.scheduled_seqs) if is_block_layout else 0
+        block_table_width = int(self.input_batch.block_table_width) if is_block_layout else 0
+        n_block_elems = (
+            n_batch_seq * max(0, block_table_width)
+            if is_block_layout
+            else 0
+        )
         if ntoken > self._max_num_tokens:
             raise RuntimeError("ntoken exceeds configured max_num_batched_tokens")
         if n_batch_seq > self._max_num_reqs:
             raise RuntimeError("n_batch_seq exceeds configured max_num_seqs")
-        if n_block_elems > self._max_block_elems:
+        if n_block_elems > (self._max_num_reqs * self._max_block_table_width):
             raise RuntimeError("n_block_elems exceeds configured BLOCK metadata capacity")
         assert self._input_ids_buf is not None
         assert self._pos_ids_buf is not None
-        assert self._seq_ids_buf is not None
         assert self._output_ids_buf is not None
         if (
             not isinstance(self._input_ids_buf, CpuGpuBuffer)
             or not isinstance(self._pos_ids_buf, CpuGpuBuffer)
-            or not isinstance(self._seq_ids_buf, CpuGpuBuffer)
             or not isinstance(self._output_ids_buf, CpuGpuBuffer)
         ):
-            raise RuntimeError("GPUModelRunner metadata buffers must be CpuGpuBuffer")
+            raise RuntimeError("GPUModelRunner input/pos/output buffers must be CpuGpuBuffer")
         input_ids_host = self._input_ids_buf.cpu.slice(0, 0, ntoken)
         input_ids = self._input_ids_buf.gpu.slice(0, 0, ntoken)
         pos_ids_host = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
         pos_ids = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
-        seq_ids_host = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
-        seq_ids = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
-        logits_indices_host = self._output_ids_buf.cpu.slice(0, 0, len(output_rows))
-        logits_indices = self._output_ids_buf.gpu.slice(0, 0, len(output_rows))
         dev_id = int(input_ids.device_id())
         h2d_stream = self._get_h2d_stream(dev_id)
-        input_ids_host.copy_from_sequence(plan.token_ids)
-        pos_ids_host.copy_from_sequence(pos)
-        seq_ids_host.copy_from_sequence(seq)
-        if output_rows:
-            logits_indices_host.copy_from_sequence(output_rows)
-        input_ids.copy_(input_ids_host, non_blocking=True, stream=h2d_stream)
-        pos_ids.copy_(pos_ids_host, non_blocking=True, stream=h2d_stream)
-        seq_ids.copy_(seq_ids_host, non_blocking=True, stream=h2d_stream)
-        if output_rows:
-            logits_indices.copy_(logits_indices_host, non_blocking=True, stream=h2d_stream)
 
         keepalive: list[Tensor] = [
             input_ids,
-            pos_ids,
-            seq_ids,
-            logits_indices,
             input_ids_host,
+            pos_ids,
             pos_ids_host,
-            seq_ids_host,
-            logits_indices_host,
         ]
+        seq_ids: Tensor | None = None
+        seq_ids_host: Tensor | None = None
+
+        if not is_block_layout:
+            assert self._seq_ids_buf is not None
+            if not isinstance(self._seq_ids_buf, CpuGpuBuffer):
+                raise RuntimeError("GPUModelRunner non-block metadata buffers must be CpuGpuBuffer")
+            seq_ids_host = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
+            seq_ids = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
+            keepalive.extend([
+                seq_ids,
+                seq_ids_host,
+            ])
+
+        if int(self.input_batch.n_tokens) != ntoken:
+            raise RuntimeError("input_batch token count mismatch")
+        output_rows = list(self.input_batch.output_rows)
+        out_idx = int(self.input_batch.n_outputs)
+        if out_idx != len(output_rows):
+            raise RuntimeError("input_batch output row count mismatch")
+        input_ids_host.load(cast(self.input_batch.token_ids_cpu[:ntoken].ctypes.data, c_void_p))
+        pos_ids_host.load(cast(self.input_batch.pos_ids_cpu[:ntoken].ctypes.data, c_void_p))
+        if seq_ids_host is not None:
+            seq_ids_host.load(cast(self.input_batch.seq_ids_cpu[:ntoken].ctypes.data, c_void_p))
+
+        input_ids.copy_(input_ids_host, non_blocking=True, stream=h2d_stream)
+        pos_ids.copy_(pos_ids_host, non_blocking=True, stream=h2d_stream)
+        if seq_ids is not None and seq_ids_host is not None:
+            seq_ids.copy_(seq_ids_host, non_blocking=True, stream=h2d_stream)
+
+        logits_indices_host = self._output_ids_buf.cpu.slice(0, 0, out_idx)
+        logits_indices = self._output_ids_buf.gpu.slice(0, 0, out_idx)
+        if out_idx > 0:
+            logits_indices_host.load(cast(self.input_batch.logits_indices_cpu[:out_idx].ctypes.data, c_void_p))
+            logits_indices.copy_(logits_indices_host, non_blocking=True, stream=h2d_stream)
+        keepalive.extend([
+            logits_indices,
+            logits_indices_host,
+        ])
+
+        if not is_block_layout:
+            assert seq_ids is not None and seq_ids_host is not None
+        else:
+            seq_ids = None
+
         attn, attn_keepalive = self._build_attention_metadata(
-            plan=plan,
             ntoken=ntoken,
             seq_ids=seq_ids,
             pos_ids_host=pos_ids_host,
@@ -450,25 +492,15 @@ class GPUModelRunner:
         fin.pos_ids = pos_ids.lib_tensor()
         fin.logits_indices = logits_indices.lib_tensor()
         fin.attention = attn
-        return fin, len(output_rows), keepalive
+        return fin, len(output_rows), output_rows, keepalive
 
-    def _build_forward_io(
-        self,
-        plan: BatchPlan,
-    ) -> tuple[ModelForwardInput, ModelForwardOutput, int, list[int], list[Tensor]]:
-        ntoken = len(plan.token_ids)
+    def _build_forward_io(self) -> tuple[ModelForwardInput, ModelForwardOutput, int, list[int], list[Tensor]]:
+        ntoken = int(self.input_batch.n_tokens)
         if ntoken <= 0:
             raise RuntimeError("empty step plan")
 
-        is_block_layout, pos, seq, mask = self._normalize_step_inputs(plan, ntoken)
-        output_rows = [i for i, m in enumerate(mask) if int(m) != 0]
-        fin, n_outputs, in_keepalive = self._build_model_forward_input(
-            plan=plan,
+        fin, n_outputs, output_rows, in_keepalive = self._build_model_forward_input(
             ntoken=ntoken,
-            is_block_layout=is_block_layout,
-            pos=pos,
-            seq=seq,
-            output_rows=output_rows,
         )
         fout = ModelForwardOutput()
         fout.logits = self._logits_holder.lib_tensor()
@@ -477,297 +509,123 @@ class GPUModelRunner:
 
     def _build_attention_metadata(
         self,
-        plan: BatchPlan,
         ntoken: int,
-        seq_ids: Tensor,
-        pos_ids_host: Tensor,
+        seq_ids: Tensor | None,
+        pos_ids_host: Tensor | None,
         is_block_layout: bool,
         h2d_stream=None,
     ) -> tuple[AttentionMetadata, list[Tensor]]:
         attn = AttentionMetadata()
         attn.mode = c_int32(int(KvCacheLayout.BLOCK if is_block_layout else KvCacheLayout.SLOT))
-        attn.seq_ids = seq_ids.lib_tensor()
-        attn.pos_ids_host = pos_ids_host.lib_tensor()
-        attn.q_seq_rows = None
-        attn.q_pos = None
+        attn.seq_ids = seq_ids.lib_tensor() if seq_ids is not None else None
+        attn.pos_ids_host = pos_ids_host.lib_tensor() if pos_ids_host is not None else None
+        attn.req_num_scheduled_tokens = None
+        attn.req_num_computed_tokens = None
+        attn.query_start_loc = None
+        attn.seq_lens = None
         attn.slot_mapping = None
-        attn.context_lens = None
-        attn.batch_seq_ids = None
         attn.block_tables = None
         attn.block_table_width = c_int32(0)
 
         if not is_block_layout:
+            if seq_ids is None or pos_ids_host is None:
+                raise RuntimeError("slot path requires seq_ids and pos_ids_host")
             return attn, [seq_ids, pos_ids_host]
 
-        if (
-            plan.q_seq_rows is None
-            or plan.q_pos is None
-            or plan.slot_mapping is None
-            or plan.context_lens is None
-            or plan.batch_seq_ids is None
-            or plan.block_tables is None
-        ):
-            raise ValueError(
-                "incomplete BLOCK metadata: q_seq_rows/q_pos/slot_mapping/context_lens/batch_seq_ids/block_tables must all be set"
-            )
-
-        block_table_width = int(plan.block_table_width)
-        if (
-            len(plan.q_seq_rows) != ntoken
-            or len(plan.q_pos) != ntoken
-            or len(plan.slot_mapping) != ntoken
-            or len(plan.context_lens) != len(plan.batch_seq_ids)
-        ):
+        req_num_scheduled_tokens = list(self.input_batch.req_num_scheduled_tokens_step)
+        req_num_computed_tokens = list(self.input_batch.req_num_computed_tokens_step)
+        block_table_width = int(self.input_batch.block_table_width)
+        n_batch_seq = len(req_num_scheduled_tokens)
+        if n_batch_seq == 0 or len(req_num_computed_tokens) != n_batch_seq:
             raise ValueError("BLOCK metadata length mismatch")
-        if block_table_width <= 0 or len(plan.block_tables) != len(plan.batch_seq_ids) * block_table_width:
-            raise ValueError("block_tables length mismatch")
+        if block_table_width <= 0:
+            raise ValueError("block_table_width must be > 0")
+        if len(self.input_batch.scheduled_seqs) != n_batch_seq:
+            raise ValueError("scheduled_seqs length mismatch with req_num_scheduled_tokens")
+        if sum(int(x) for x in req_num_scheduled_tokens) != ntoken:
+            raise ValueError("sum(req_num_scheduled_tokens) must equal ntoken")
 
-        assert self._batch_seq_ids_buf is not None
-        n_batch_seq = len(plan.context_lens)
-        n_block_elems = len(plan.block_tables)
-        n_block_meta_i32 = (3 * ntoken) + n_batch_seq + n_block_elems
-        if n_block_meta_i32 > self._max_block_meta_i32:
-            raise RuntimeError("BLOCK metadata exceeds configured max_block_meta_i32")
-        assert self._block_meta_buf is not None
-        if not isinstance(self._block_meta_buf, CpuGpuBuffer):
-            raise RuntimeError("GPUModelRunner block metadata buffer must be CpuGpuBuffer")
-        block_meta_host = self._block_meta_buf.cpu.slice(0, 0, n_block_meta_i32)
-        block_meta_dev = self._block_meta_buf.gpu.slice(0, 0, n_block_meta_i32)
-        packed_i32 = [
-            *plan.q_seq_rows,
-            *plan.q_pos,
-            *plan.slot_mapping,
-            *plan.context_lens,
-            *plan.block_tables,
-        ]
-        block_meta_host.copy_from_sequence(packed_i32)
-        block_meta_dev.copy_(block_meta_host, non_blocking=True, stream=h2d_stream)
+        if h2d_stream is None:
+            raise RuntimeError("BLOCK metadata build requires h2d_stream")
+        n_block_elems = n_batch_seq * block_table_width
+        if (
+            not isinstance(self._req_sched_buf, CpuGpuBuffer)
+            or not isinstance(self._req_comp_buf, CpuGpuBuffer)
+            or not isinstance(self._query_start_loc_buf, CpuGpuBuffer)
+            or not isinstance(self._seq_lens_buf, CpuGpuBuffer)
+            or not isinstance(self._slot_mapping_buf, CpuGpuBuffer)
+            or not isinstance(self._block_tables_buf, CpuGpuBuffer)
+        ):
+            raise RuntimeError("BLOCK metadata buffers must be CpuGpuBuffer")
+        req_sched_host = self._req_sched_buf.cpu.slice(0, 0, n_batch_seq)
+        req_comp_host = self._req_comp_buf.cpu.slice(0, 0, n_batch_seq)
+        query_start_loc = self._query_start_loc_buf.gpu.slice(0, 0, n_batch_seq + 1)
+        seq_lens = self._seq_lens_buf.gpu.slice(0, 0, n_batch_seq)
+        slot_mapping = self._slot_mapping_buf.gpu.slice(0, 0, ntoken)
+        block_tables_host = self._block_tables_buf.cpu.slice(0, 0, n_block_elems)
+        req_sched = self._req_sched_buf.gpu.slice(0, 0, n_batch_seq)
+        req_comp = self._req_comp_buf.gpu.slice(0, 0, n_batch_seq)
+        block_tables = self._block_tables_buf.gpu.slice(0, 0, n_block_elems)
+        req_sched_host.copy_from_sequence(req_num_scheduled_tokens)
+        req_comp_host.copy_from_sequence(req_num_computed_tokens)
+        req_indices = np.asarray(
+            [
+                int(self.input_batch.seq_id_to_index[int(seq_obj.seq_id)])
+                for seq_obj in self.input_batch.scheduled_seqs
+            ],
+            dtype=np.int32,
+        )
+        block_table_rows = self.input_batch.block_table_cpu[req_indices, :block_table_width]
+        block_tables_host.load(cast(block_table_rows.reshape(-1).ctypes.data, c_void_p))
+        block_tables.copy_(block_tables_host, non_blocking=True, stream=h2d_stream)
+        req_sched.copy_(req_sched_host, non_blocking=True, stream=h2d_stream)
+        req_comp.copy_(req_comp_host, non_blocking=True, stream=h2d_stream)
+        dev_id = int(req_sched.device_id())
+        compute_stream = self._get_runtime_compute_stream(dev_id)
+        self._runtime_api.set_device(dev_id)
+        evt = self._get_prepare_inputs_event(dev_id)
+        self._runtime_api.event_record(evt, h2d_stream)
+        self._runtime_api.stream_wait_event(compute_stream, evt)
+        rc = int(
+            LIB_LLAISYS.llaisysRuntimeBuildBlockAttentionMetadata(
+                self._runtime,
+                req_sched.lib_tensor(),
+                req_comp.lib_tensor(),
+                block_tables.lib_tensor(),
+                c_int32(block_table_width),
+                c_int32(ntoken),
+                query_start_loc.lib_tensor(),
+                seq_lens.lib_tensor(),
+                slot_mapping.lib_tensor(),
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"RuntimeBuildBlockAttentionMetadata failed with status={rc}")
 
-        off = 0
-        q_seq_rows = block_meta_dev.slice(0, off, off + ntoken)
-        off += ntoken
-        q_pos = block_meta_dev.slice(0, off, off + ntoken)
-        off += ntoken
-        slot_mapping = block_meta_dev.slice(0, off, off + ntoken)
-        off += ntoken
-        context_lens = block_meta_dev.slice(0, off, off + n_batch_seq)
-        off += n_batch_seq
-        block_tables = block_meta_dev.slice(0, off, off + n_block_elems)
-
-        if not isinstance(self._batch_seq_ids_buf, CpuGpuBuffer):
-            raise RuntimeError("GPUModelRunner batch_seq_ids buffer must be CpuGpuBuffer")
-        batch_seq_ids_host = self._batch_seq_ids_buf.cpu.slice(0, 0, len(plan.batch_seq_ids))
-        batch_seq_ids = self._batch_seq_ids_buf.gpu.slice(0, 0, len(plan.batch_seq_ids))
-        batch_seq_ids_host.copy_from_sequence(plan.batch_seq_ids)
-        batch_seq_ids.copy_(batch_seq_ids_host, non_blocking=True, stream=h2d_stream)
-
-        attn.q_seq_rows = q_seq_rows.lib_tensor()
-        attn.q_pos = q_pos.lib_tensor()
+        attn.req_num_scheduled_tokens = req_sched.lib_tensor()
+        attn.req_num_computed_tokens = req_comp.lib_tensor()
+        attn.query_start_loc = query_start_loc.lib_tensor()
+        attn.seq_lens = seq_lens.lib_tensor()
         attn.slot_mapping = slot_mapping.lib_tensor()
-        attn.context_lens = context_lens.lib_tensor()
-        attn.batch_seq_ids = batch_seq_ids.lib_tensor()
         attn.block_tables = block_tables.lib_tensor()
         attn.block_table_width = c_int32(block_table_width)
         return attn, [
-            seq_ids,
-            pos_ids_host,
-            q_seq_rows,
-            q_pos,
+            req_sched_host,
+            req_comp_host,
+            block_tables_host,
+            req_sched,
+            req_comp,
+            query_start_loc,
+            seq_lens,
             slot_mapping,
-            context_lens,
-            batch_seq_ids,
             block_tables,
-            block_meta_host,
-            block_meta_dev,
-            batch_seq_ids_host,
         ]
 
-    def _collect_token_inputs(
-        self,
-        scheduler_outputs: SchedulerOutputs,
-        sampling_params: SamplingParams | None,
-        sampling_params_by_req: dict[str, SamplingParams] | None,
-    ) -> tuple[
-        list[int],
-        list[int],
-        list[float],
-        list[float],
-        list[int],
-        list[int],
-        list[int],
-        list[int],
-        list[int],
-        list[int],
-        list[int],
-        dict[int, str],
-    ]:
-        token_ids: list[int] = []
-        logits_mask: list[int] = []
-        temperatures: list[float] = []
-        top_ps: list[float] = []
-        top_ks: list[int] = []
-        seeds: list[int] = []
-        has_seeds: list[int] = []
-        seq_ids: list[int] = []
-        pos_ids: list[int] = []
-        q_seq_rows: list[int] = []
-        slot_mapping: list[int] = []
-        token_idx_to_req_id: dict[int, str] = {}
+    def _update_states(self, scheduler_outputs: SchedulerOutputs) -> None:
+        self.input_batch.update_states(scheduler_outputs)
 
-        base = 0
-        for row_idx, seq in enumerate(scheduler_outputs.scheduled_seqs):
-            bs = max(1, int(seq.block_size))
-            if scheduler_outputs.is_prefill:
-                start = max(0, int(seq.num_cached_tokens))
-                prompt = seq.prompt_token_ids
-                seq_tokens = [int(t) for t in prompt[start:]]
-                seq_pos = list(range(start, start + len(seq_tokens)))
-                seq_mask = [0] * len(seq_tokens)
-                if seq_mask:
-                    seq_mask[-1] = 1
-            else:
-                seq_tokens = [int(seq.last_token)]
-                seq_pos = [len(seq) - 1]
-                seq_mask = [1]
-
-            rid = str(seq.request_id)
-            if sampling_params_by_req is None and sampling_params is None:
-                raise RuntimeError("missing sampling params for request")
-            params = sampling_params
-            if params is None:
-                params = sampling_params_by_req.get(rid) if sampling_params_by_req is not None else None
-
-            token_ids.extend(seq_tokens)
-            logits_mask.extend(seq_mask)
-            temperatures.extend([float(params.temperature)] * len(seq_tokens))
-            top_ps.extend([float(params.top_p)] * len(seq_tokens))
-            top_ks.extend([int(params.top_k)] * len(seq_tokens))
-            if params.seed is None:
-                has_seeds.extend([0] * len(seq_tokens))
-                seeds.extend([0] * len(seq_tokens))
-            else:
-                has_seeds.extend([1] * len(seq_tokens))
-                seeds.extend([int(params.seed)] * len(seq_tokens))
-
-            pos_ids.extend(seq_pos)
-            seq_ids.extend([int(seq.seq_id)] * len(seq_tokens))
-            q_seq_rows.extend([int(row_idx)] * len(seq_tokens))
-
-            if seq.block_table:
-                for p in seq_pos:
-                    bidx = int(p) // bs
-                    boff = int(p) % bs
-                    if bidx < 0 or bidx >= len(seq.block_table):
-                        raise RuntimeError("executor block table out of range")
-                    bid = int(seq.block_table[bidx])
-                    slot_mapping.append(bid * bs + boff)
-
-            for i, m in enumerate(seq_mask):
-                if m != 0:
-                    token_idx_to_req_id[base + i] = rid
-            base += len(seq_tokens)
-
-        return (
-            token_ids,
-            logits_mask,
-            temperatures,
-            top_ps,
-            top_ks,
-            seeds,
-            has_seeds,
-            seq_ids,
-            pos_ids,
-            q_seq_rows,
-            slot_mapping,
-            token_idx_to_req_id,
-        )
-
-    def _build_block_metadata_inputs(
-        self,
-        outputs: SchedulerOutputs,
-        token_ids: list[int],
-        slot_mapping: list[int],
-    ) -> tuple[list[int] | None, list[int] | None, list[int] | None, int]:
-        block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-        if not block_layout:
-            return None, None, None, 0
-
-        for seq in outputs.scheduled_seqs:
-            if not seq.block_table:
-                raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
-        if len(slot_mapping) != len(token_ids):
-            raise RuntimeError("BLOCK layout requires slot_mapping for every token")
-
-        batch_seq_ids = [int(s.seq_id) for s in outputs.scheduled_seqs]
-        context_lens = [len(s) for s in outputs.scheduled_seqs]
-        block_table_width = max(len(s.block_table) for s in outputs.scheduled_seqs)
-        block_tables: list[int] = []
-        for s in outputs.scheduled_seqs:
-            row = [int(b) for b in s.block_table]
-            if len(row) < block_table_width:
-                row.extend([-1] * (block_table_width - len(row)))
-            block_tables.extend(row)
-
-        return (
-            context_lens if context_lens else None,
-            batch_seq_ids if batch_seq_ids else None,
-            block_tables if block_tables else None,
-            int(block_table_width),
-        )
-
-    def prepare_model_input(
-        self,
-        scheduler_outputs: SchedulerOutputs,
-        sampling_params: SamplingParams | None = None,
-        sampling_params_by_req: dict[str, SamplingParams] | None = None,
-    ) -> tuple[BatchPlan, dict[int, str]]:
-        (
-            token_ids,
-            logits_mask,
-            temperatures,
-            top_ps,
-            top_ks,
-            seeds,
-            has_seeds,
-            seq_ids,
-            pos_ids,
-            q_seq_rows,
-            slot_mapping,
-            token_idx_to_req_id,
-        ) = self._collect_token_inputs(
-            scheduler_outputs,
-            sampling_params=sampling_params,
-            sampling_params_by_req=sampling_params_by_req,
-        )
-
-        context_lens, batch_seq_ids, block_tables, block_table_width = self._build_block_metadata_inputs(
-            scheduler_outputs,
-            token_ids=token_ids,
-            slot_mapping=slot_mapping,
-        )
-        block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-
-        return (
-            BatchPlan(
-                token_ids=token_ids,
-                logits_mask=logits_mask,
-                temperatures=temperatures,
-                top_ps=top_ps,
-                top_ks=top_ks,
-                seeds=seeds,
-                has_seeds=has_seeds,
-                pos_ids=pos_ids,
-                seq_ids=seq_ids,
-                q_seq_rows=q_seq_rows if block_layout else None,
-                q_pos=pos_ids if block_layout else None,
-                slot_mapping=slot_mapping if block_layout else None,
-                context_lens=context_lens,
-                batch_seq_ids=batch_seq_ids,
-                block_tables=block_tables,
-                block_table_width=int(block_table_width),
-            ),
-            token_idx_to_req_id,
-        )
+    def _prepare_inputs(self, *, is_block_layout: bool) -> None:
+        self.input_batch.prepare_inputs(is_block_layout=is_block_layout)
 
     def request_free(self, seq_id: int) -> None:
         if self._runtime is None:

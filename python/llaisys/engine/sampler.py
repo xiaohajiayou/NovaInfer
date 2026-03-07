@@ -19,10 +19,10 @@ class Sampler:
         max_num_seqs: int | None = None,
         config: EngineConfig | None = None,
     ):
-        cfg = (config or EngineConfig(
+        cfg = config or EngineConfig(
             device=device,
             max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
-        )).normalized()
+        )
         self._device = cfg.device
         self._runtime = runtime_handle
         if self._runtime is None:

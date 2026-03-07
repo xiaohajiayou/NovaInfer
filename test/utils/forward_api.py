@@ -172,7 +172,12 @@ def destroy_model_runtime(model, runtime) -> None:
 
 
 def _make_tensor_1d(values, dtype: DataType, device: DeviceType) -> Tensor:
-    t = Tensor((len(values),), dtype, device, 0)
+    n = int(len(values))
+    if n == 0:
+        # Runtime tensor backend does not guarantee 0-sized allocation on all devices.
+        # Keep API-level shape as [0] via slice of a small backing allocation.
+        return Tensor((1,), dtype, device, 0).slice(0, 0, 0)
+    t = Tensor((n,), dtype, device, 0)
     t.copy_from_sequence(values)
     return t
 
@@ -193,35 +198,48 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
     attn.mode = int(batch.mode)
     attn.seq_ids = seq_ids_t.lib_tensor()
     attn.pos_ids_host = pos_ids_host_t.lib_tensor()
-    attn.q_seq_rows = None
-    attn.q_pos = None
+    attn.req_num_scheduled_tokens = None
+    attn.req_num_computed_tokens = None
+    attn.query_start_loc = None
+    attn.seq_lens = None
     attn.slot_mapping = None
-    attn.context_lens = None
-    attn.batch_seq_ids = None
     attn.block_tables = None
     attn.block_table_width = 0
 
     if not batch.invalid and int(batch.mode) == int(KvCacheLayout.BLOCK):
         if (
-            batch.q_seq_rows is None
-            or batch.q_pos is None
-            or batch.slot_mapping is None
-            or batch.context_lens is None
-            or batch.batch_seq_ids is None
+            batch.req_num_scheduled_tokens is None
+            or batch.req_num_computed_tokens is None
             or batch.block_tables is None
         ):
             raise RuntimeError("incomplete BLOCK metadata")
-        q_seq_rows_t = _make_tensor_1d(batch.q_seq_rows, DataType.I32, device)
-        q_pos_t = _make_tensor_1d(batch.q_pos, DataType.I32, device)
-        slot_mapping_t = _make_tensor_1d(batch.slot_mapping, DataType.I32, device)
-        context_lens_t = _make_tensor_1d(batch.context_lens, DataType.I32, device)
-        batch_seq_ids_t = _make_tensor_1d(batch.batch_seq_ids, DataType.I64, DeviceType.CPU)
+        req_sched_t = _make_tensor_1d(batch.req_num_scheduled_tokens, DataType.I32, device)
+        req_comp_t = _make_tensor_1d(batch.req_num_computed_tokens, DataType.I32, device)
         block_tables_t = _make_tensor_1d(batch.block_tables, DataType.I32, device)
-        attn.q_seq_rows = q_seq_rows_t.lib_tensor()
-        attn.q_pos = q_pos_t.lib_tensor()
+        n_batch_seq = len(batch.req_num_scheduled_tokens)
+        query_start_loc_t = Tensor((n_batch_seq + 1,), DataType.I32, device, 0)
+        seq_lens_t = Tensor((n_batch_seq,), DataType.I32, device, 0)
+        slot_mapping_t = Tensor((ntoken,), DataType.I32, device, 0)
+        rc = int(
+            LIB_LLAISYS.llaisysRuntimeBuildBlockAttentionMetadata(
+                runtime,
+                req_sched_t.lib_tensor(),
+                req_comp_t.lib_tensor(),
+                block_tables_t.lib_tensor(),
+                int(batch.block_table_width),
+                int(ntoken),
+                query_start_loc_t.lib_tensor(),
+                seq_lens_t.lib_tensor(),
+                slot_mapping_t.lib_tensor(),
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"RuntimeBuildBlockAttentionMetadata failed with status={rc}")
+        attn.req_num_scheduled_tokens = req_sched_t.lib_tensor()
+        attn.req_num_computed_tokens = req_comp_t.lib_tensor()
+        attn.query_start_loc = query_start_loc_t.lib_tensor()
+        attn.seq_lens = seq_lens_t.lib_tensor()
         attn.slot_mapping = slot_mapping_t.lib_tensor()
-        attn.context_lens = context_lens_t.lib_tensor()
-        attn.batch_seq_ids = batch_seq_ids_t.lib_tensor()
         attn.block_tables = block_tables_t.lib_tensor()
         attn.block_table_width = int(batch.block_table_width)
 

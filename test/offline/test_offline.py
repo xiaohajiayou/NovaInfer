@@ -1,7 +1,7 @@
-from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import SamplingParams
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
+from test.utils.engine_testkit import make_engine_with_runner
 
 
 
@@ -10,7 +10,9 @@ class DummyRunner(DummyModelRunner):
 
 
 def test_offline_engine_argmax_loop():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK))
+    engine = make_engine_with_runner(
+        DummyRunner(max_seq_len=32, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    )
     out = engine.generate(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
@@ -22,7 +24,9 @@ def test_offline_engine_argmax_loop():
 
 
 def test_offline_engine_stream_loop():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK))
+    engine = make_engine_with_runner(
+        DummyRunner(max_seq_len=32, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    )
     chunks = list(
         engine.stream(
             inputs=[1, 2],

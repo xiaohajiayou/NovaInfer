@@ -23,11 +23,8 @@ class BatchBuildResult:
     seq_ids: list[int]
     pos_values: list[int]
     mode: KvCacheLayout
-    q_seq_rows: list[int] | None = None
-    q_pos: list[int] | None = None
-    slot_mapping: list[int] | None = None
-    context_lens: list[int] | None = None
-    batch_seq_ids: list[int] | None = None
+    req_num_scheduled_tokens: list[int] | None = None
+    req_num_computed_tokens: list[int] | None = None
     block_tables: list[int] | None = None
     block_table_width: int = 0
     invalid: bool = False
@@ -141,34 +138,17 @@ def build_decode_batch(
                 table.append(int(st.next_bid))
                 st.next_bid += 1
 
-    uniq_seq = sorted(set(seq_single))
-    if block_state is not None:
-        context_lens = [int(st.next_pos_by_seq.get(sid, 0)) for sid in uniq_seq]
-    else:
-        max_pos_by_seq: dict[int, int] = {}
-        for sid, p in zip(seq_single, pos_values):
-            prev = max_pos_by_seq.get(int(sid), -1)
-            if int(p) > prev:
-                max_pos_by_seq[int(sid)] = int(p)
-        context_lens = [int(max_pos_by_seq.get(int(sid), -1) + 1) for sid in uniq_seq]
-    row_width = max(1, max(len(seq_blocks[sid]) for sid in uniq_seq))
+    # vLLM-style descriptors: query_start_loc is derived from req_num_scheduled_tokens.
+    # For direct core tests (including interleaved seq ids), use one scheduled token per row.
+    req_num_scheduled_tokens = [1] * n
+    req_num_computed_tokens = [int(p) for p in pos_values]
+    row_width = max(1, max(len(seq_blocks[sid]) for sid in seq_single))
     block_tables: list[int] = []
-    for sid in uniq_seq:
+    for sid in seq_single:
         row = list(seq_blocks[sid])
         if len(row) < row_width:
             row.extend([-1] * (row_width - len(row)))
         block_tables.extend(row)
-
-    seq_to_row = {sid: i for i, sid in enumerate(uniq_seq)}
-    slot_mapping: list[int] = []
-    q_seq_rows: list[int] = []
-    for sid, p in zip(seq_single, pos_values):
-        row = seq_to_row[sid]
-        bidx = int(p) // bs
-        boff = int(p) % bs
-        bid = block_tables[row * row_width + bidx]
-        slot_mapping.append(int(bid * bs + boff))
-        q_seq_rows.append(int(row))
 
     return BatchBuildResult(
         token_ids=token_values,
@@ -176,11 +156,8 @@ def build_decode_batch(
         seq_ids=seq_single,
         pos_values=pos_values,
         mode=mode,
-        q_seq_rows=q_seq_rows,
-        q_pos=[int(x) for x in pos_values],
-        slot_mapping=slot_mapping,
-        context_lens=context_lens,
-        batch_seq_ids=[int(x) for x in uniq_seq],
+        req_num_scheduled_tokens=req_num_scheduled_tokens,
+        req_num_computed_tokens=req_num_computed_tokens,
         block_tables=block_tables,
         block_table_width=int(row_width),
     )

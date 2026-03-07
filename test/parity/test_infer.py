@@ -49,8 +49,6 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
         device=device,
         kv_cache_block_size=16,
         max_model_len=None,
-        kv_cache_capacity_tokens=None,
-        kv_cache_auto_capacity=True,
         kv_cache_memory_utilization=0.9,
         max_num_seqs=None,
     )

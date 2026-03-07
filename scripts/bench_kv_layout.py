@@ -84,8 +84,6 @@ def _run_once(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     max_model_len: int,
-    kv_cache_capacity_tokens: int | None,
-    kv_cache_auto_capacity: bool,
     kv_cache_memory_utilization: float,
     prompts: list[list[int]],
     sampling_params: list[SamplingParams],
@@ -106,8 +104,6 @@ def _run_once(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
-            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-            kv_cache_auto_capacity=kv_cache_auto_capacity,
             kv_cache_memory_utilization=kv_cache_memory_utilization,
         )
     t_init1 = time.perf_counter()
@@ -189,8 +185,6 @@ def main() -> int:
     parser.add_argument("--max-input-len", default=1024, type=int)
     parser.add_argument("--max-output-len", default=1024, type=int)
     parser.add_argument("--max-model-len", default=4096, type=int)
-    parser.add_argument("--kv-cache-capacity-tokens", default=4096, type=int)
-    parser.add_argument("--kv-cache-capacity-mode", default="explicit", choices=["explicit", "auto"])
     parser.add_argument("--kv-cache-memory-utilization", default=0.9, type=float)
     parser.add_argument("--max-num-seqs", default=8, type=int)
     parser.add_argument("--max-num-batched-tokens", default=0, type=int)
@@ -203,8 +197,7 @@ def main() -> int:
         f"model_path={args.model_path} device={args.device} block_size={args.block_size} "
         f"num_prompts={args.num_prompts} rounds={args.rounds} seed={args.seed} "
         f"max_input_len={args.max_input_len} max_output_len={args.max_output_len} "
-        f"max_model_len={args.max_model_len} kv_cache_capacity_tokens={args.kv_cache_capacity_tokens} "
-        f"kv_cache_capacity_mode={args.kv_cache_capacity_mode} "
+        f"max_model_len={args.max_model_len} "
         f"kv_cache_memory_utilization={args.kv_cache_memory_utilization} "
         f"max_num_seqs={args.max_num_seqs} max_num_batched_tokens={args.max_num_batched_tokens} "
         f"omp_num_threads={os.environ.get('OMP_NUM_THREADS')} "
@@ -237,12 +230,10 @@ def main() -> int:
     expected_total_tokens_per_round = sum(int(sp.max_new_tokens or 0) for sp in sampling_params)
     print(f"[bench] expected_total_tokens_per_round={expected_total_tokens_per_round}")
     device = _parse_device(args.device)
-    explicit_capacity_tokens = max(1, int(args.kv_cache_capacity_tokens))
-    use_auto_capacity = str(args.kv_cache_capacity_mode) == "auto"
     max_num_batched_tokens = (
         max(1, int(args.max_num_batched_tokens))
         if int(args.max_num_batched_tokens) > 0
-        else explicit_capacity_tokens
+        else max(1, int(max_model_len) * max(1, int(args.max_num_seqs)))
     )
 
     run_layout = args.layout
@@ -261,8 +252,6 @@ def main() -> int:
             max_num_seqs=max(1, int(args.max_num_seqs)),
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
-            kv_cache_capacity_tokens=(None if use_auto_capacity else explicit_capacity_tokens),
-            kv_cache_auto_capacity=use_auto_capacity,
             kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
             prompts=prompts,
             sampling_params=sampling_params,
@@ -280,8 +269,6 @@ def main() -> int:
             max_num_seqs=max(1, int(args.max_num_seqs)),
             max_num_batched_tokens=max_num_batched_tokens,
             max_model_len=max_model_len,
-            kv_cache_capacity_tokens=(None if use_auto_capacity else explicit_capacity_tokens),
-            kv_cache_auto_capacity=use_auto_capacity,
             kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
             prompts=prompts,
             sampling_params=sampling_params,

@@ -1,10 +1,12 @@
+from unittest.mock import patch
+
 import pytest
 
-from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
 from llaisys.entrypoints.llm import LLM
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
+from test.utils.engine_testkit import InjectedWorker
 
 
 
@@ -13,20 +15,21 @@ class DummyRunner(DummyModelRunner):
 
 
 def _build_llm() -> LLM:
-    registry = ModelRegistry(_factories={})
-    registry.register(
-        "dummy",
-        lambda model_path, device: DummyRunner(
-            max_seq_len=32,
+    runner = DummyRunner(
+        max_seq_len=32,
+        end_token_id=5,
+        kv_cache_layout=KvCacheLayout.BLOCK,
+    )
+    fake_worker = InjectedWorker(runner)
+    with patch("llaisys.engine.llm_engine.Worker", side_effect=lambda *args, **kwargs: fake_worker):
+        llm = LLM(
+            model="/tmp/unused",
+            model_type="dummy",
+            max_model_len=32,
             end_token_id=5,
             kv_cache_layout=KvCacheLayout.BLOCK,
-        ),
-    )
-    llm = LLM(
-        model="/tmp/unused",
-        model_type="dummy",
-        model_registry=registry,
-    )
+            num_kvcache_blocks=8,
+        )
     llm._encode_prompt = lambda prompt: [1, 2] if prompt == "p0" else [2, 3]
     return llm
 

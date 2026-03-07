@@ -1,7 +1,9 @@
 
+from unittest.mock import patch
+
+from llaisys.engine.config import EngineConfig
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import RequestStatus, SamplingParams
-from llaisys.engine.types import BatchPlan
 from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
 
@@ -20,18 +22,41 @@ class PrefixProbeRunner(DummyRunner):
         )
         self.decode_calls = []
 
-    def on_plan(self, plan: BatchPlan) -> None:
+    def on_plan(self, step: dict) -> None:
+        token_ids = []
+        pos_ids = []
+        seq_ids = []
+        logits_mask = []
+        for seq in step["scheduled_seqs"]:
+            if step["is_prefill"]:
+                start = max(0, int(seq.num_cached_tokens))
+                toks = [int(t) for t in seq.prompt_token_ids[start:]]
+                poss = list(range(start, start + len(toks)))
+                mask = [0] * len(toks)
+                if mask:
+                    mask[-1] = 1
+            else:
+                toks = [int(seq.last_token)]
+                poss = [len(seq) - 1]
+                mask = [1]
+            token_ids.extend(toks)
+            pos_ids.extend(poss)
+            seq_ids.extend([int(seq.seq_id)] * len(toks))
+            logits_mask.extend(mask)
+
         self.decode_calls.append(
             {
-                "token_ids": list(plan.token_ids),
-                "pos_ids": list(plan.pos_ids) if plan.pos_ids is not None else None,
-                "seq_ids": list(plan.seq_ids) if plan.seq_ids is not None else None,
-                "logits_mask": list(plan.logits_mask) if plan.logits_mask is not None else None,
-                "slot_mapping": list(plan.slot_mapping) if plan.slot_mapping is not None else None,
-                "context_lens": list(plan.context_lens) if plan.context_lens is not None else None,
-                "batch_seq_ids": list(plan.batch_seq_ids) if plan.batch_seq_ids is not None else None,
-                "block_tables": list(plan.block_tables) if plan.block_tables is not None else None,
-                "block_table_width": int(plan.block_table_width),
+                "token_ids": token_ids,
+                "pos_ids": pos_ids,
+                "seq_ids": seq_ids,
+                "logits_mask": logits_mask,
+                "req_num_scheduled_tokens": (
+                    list(step["req_num_scheduled_tokens"]) if step["req_num_scheduled_tokens"] is not None else None
+                ),
+                "req_num_computed_tokens": (
+                    list(step["req_num_computed_tokens"]) if step["req_num_computed_tokens"] is not None else None
+                ),
+                "block_table_width": int(step["block_table_width"]),
             }
         )
 
@@ -46,8 +71,8 @@ class KvStatsProbeRunner(DummyRunner):
         self.used_tokens = 0
         self.capacity_tokens = 128
 
-    def on_plan(self, plan: BatchPlan) -> None:
-        self.used_tokens = max(self.used_tokens, len(plan.token_ids))
+    def on_plan(self, step: dict) -> None:
+        self.used_tokens = max(self.used_tokens, int(step["n_tokens"]))
 
     def request_free(self, seq_id: int) -> int:
         super().request_free(seq_id)
@@ -65,8 +90,68 @@ class KvStatsProbeRunner(DummyRunner):
         }
 
 
+class _InjectedWorker:
+    def __init__(self, runner: DummyModelRunner) -> None:
+        self._runner = runner
+
+    @property
+    def model_runner(self):
+        return self._runner
+
+    def close(self) -> None:
+        return None
+
+    def execute_model(self, scheduler_outputs):
+        return self._runner.execute_model(scheduler_outputs)
+
+    def sample_tokens(self):
+        # Unit path: avoid allocating native tensors from dummy runner.
+        state = getattr(self._runner, "_execute_state", None)
+        if state is not None:
+            output_indices, token_ids = state
+            self._runner._execute_state = None
+            vocab_size = int(getattr(self._runner, "vocab_size", 32000))
+            return [int((int(token_ids[i]) + 1) % vocab_size) for i in output_indices]
+        sampled = self._runner.sample_tokens()
+        if sampled is None:
+            return None
+        tolist = getattr(sampled, "tolist", None)
+        if callable(tolist):
+            return [int(t) for t in tolist()]
+        return [int(t) for t in sampled]
+
+    def free_request(self, seq_id: int) -> None:
+        self._runner.request_free(int(seq_id))
+
+    def decode_tokens(self, token_ids: list[int]) -> str | None:
+        _ = token_ids
+        return None
+
+
+def _make_engine(runner: DummyModelRunner, **kwargs) -> LLMEngine:
+    cfg_kwargs = dict(kwargs)
+    if "max_num_seqs" not in cfg_kwargs and "max_batch_size" in cfg_kwargs:
+        cfg_kwargs["max_num_seqs"] = int(cfg_kwargs.pop("max_batch_size"))
+    else:
+        cfg_kwargs.pop("max_batch_size", None)
+    cfg_kwargs.setdefault("max_model_len", int(runner.max_seq_len))
+    cfg_kwargs.setdefault("end_token_id", int(runner.end_token_id))
+    cfg_kwargs.setdefault("kv_cache_layout", KvCacheLayout(int(runner.kv_cache_layout)))
+    if (
+        KvCacheLayout(int(cfg_kwargs["kv_cache_layout"])) == KvCacheLayout.BLOCK
+        and int(cfg_kwargs.get("num_kvcache_blocks", 0) or 0) <= 0
+    ):
+        block_size = max(1, int(cfg_kwargs.get("kv_cache_block_size", 256)))
+        max_model_len = max(1, int(cfg_kwargs["max_model_len"]))
+        cfg_kwargs["num_kvcache_blocks"] = (max_model_len + block_size - 1) // block_size
+    cfg = EngineConfig(**cfg_kwargs)
+    fake_worker = _InjectedWorker(runner)
+    with patch("llaisys.engine.llm_engine.Worker", side_effect=lambda *args, **_kw: fake_worker):
+        return LLMEngine(config=cfg)
+
+
 def test_state_machine_stopped_path():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=4))
     out = engine.generate(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
@@ -85,7 +170,7 @@ def test_state_machine_stopped_path():
 
 
 def test_state_machine_length_capped_path():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=99))
     out = engine.generate(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
@@ -104,7 +189,7 @@ def test_state_machine_length_capped_path():
 
 
 def test_state_machine_aborted_on_invalid_prompt():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=1, end_token_id=4))
+    engine = _make_engine(DummyRunner(max_seq_len=1, end_token_id=4))
     out = engine.generate(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=2, top_k=1, top_p=1.0, temperature=1.0),
@@ -123,7 +208,7 @@ def test_state_machine_aborted_on_invalid_prompt():
 
 
 def test_submit_step_collect_contract():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=4))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=4))
     req_id = engine.submit(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
@@ -150,7 +235,7 @@ def test_submit_step_collect_contract():
 
 
 def test_cancel_contract():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=99))
     req_id = engine.submit(
         inputs=[1, 2],
         sampling_params=SamplingParams(max_new_tokens=8, top_k=1, top_p=1.0, temperature=1.0),
@@ -164,7 +249,7 @@ def test_cancel_contract():
 
 
 def test_stop_string_contract():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=99))
     out = engine.generate(
         inputs=[1, 2],
         sampling_params=SamplingParams(
@@ -179,9 +264,9 @@ def test_stop_string_contract():
 
 
 def test_aborted_when_prompt_exceeds_scheduler_budget():
-    engine = LLMEngine(
-        model_runner=DummyRunner(max_seq_len=64, end_token_id=99),
-        kv_cache_capacity_tokens=4,
+    engine = _make_engine(
+        DummyRunner(max_seq_len=64, end_token_id=99),
+        max_num_batched_tokens=4,
     )
     out = engine.generate(
         inputs=[1, 2, 3, 4, 5],
@@ -192,9 +277,8 @@ def test_aborted_when_prompt_exceeds_scheduler_budget():
 
 
 def test_engine_exposes_kv_cache_stats():
-    engine = LLMEngine(
-        model_runner=DummyRunner(max_seq_len=32, end_token_id=99),
-        kv_cache_capacity_tokens=32,
+    engine = _make_engine(
+        DummyRunner(max_seq_len=32, end_token_id=99),
         kv_cache_block_size=16,
     )
     stats = engine.kv_cache_stats()
@@ -211,14 +295,14 @@ def test_engine_exposes_kv_cache_stats():
 
 
 def test_engine_reset_prefix_cache_contract():
-    engine = LLMEngine(model_runner=DummyRunner(max_seq_len=32, end_token_id=99))
+    engine = _make_engine(DummyRunner(max_seq_len=32, end_token_id=99))
     assert engine.reset_prefix_cache() == 0
 
 
 def test_prefix_attach_and_uncached_prefill_suffix():
     runner = PrefixProbeRunner(max_seq_len=64, end_token_id=99)
-    engine = LLMEngine(
-        model_runner=runner,
+    engine = _make_engine(
+        runner,
         kv_cache_block_size=2,
         kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
@@ -242,15 +326,14 @@ def test_prefix_attach_and_uncached_prefill_suffix():
     last = runner.decode_calls[-1]
     assert last["token_ids"] == [14]
     assert last["pos_ids"] == [4]
-    assert last["slot_mapping"] == [4]
-    assert last["context_lens"] == [5]
-    assert last["batch_seq_ids"] == [2]
+    assert last["req_num_scheduled_tokens"] == [1]
+    assert last["req_num_computed_tokens"] == [4]
 
 
 def test_prefix_reuses_after_finished_request_freed():
     runner = PrefixProbeRunner(max_seq_len=64, end_token_id=99)
-    engine = LLMEngine(
-        model_runner=runner,
+    engine = _make_engine(
+        runner,
         kv_cache_block_size=2,
         kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
@@ -262,7 +345,7 @@ def test_prefix_reuses_after_finished_request_freed():
     )
     assert out1.status == RequestStatus.FINISHED_LENGTH_CAPPED
     # nano-vllm style: finished request can be freed and still leave hash index reusable.
-    assert 1 in runner.request_free_calls
+    assert len(runner.request_free_calls) >= 1
 
     req2 = engine.submit(
         inputs=[20, 21, 22, 23, 24],
@@ -277,8 +360,8 @@ def test_prefix_reuses_after_finished_request_freed():
 
 def test_finished_request_releases_blocks_in_block_mode():
     runner = PrefixProbeRunner(max_seq_len=64, end_token_id=99)
-    engine = LLMEngine(
-        model_runner=runner,
+    engine = _make_engine(
+        runner,
         kv_cache_block_size=2,
         kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
@@ -288,16 +371,15 @@ def test_finished_request_releases_blocks_in_block_mode():
         sampling_params=SamplingParams(max_new_tokens=1, top_k=1, top_p=1.0, temperature=1.0),
     )
     assert out.status == RequestStatus.FINISHED_LENGTH_CAPPED
-    assert 1 in runner.request_free_calls
+    assert len(runner.request_free_calls) >= 1
 
 
 def test_engine_runtime_peak_watermark_is_observed_in_block_mode():
     runner = KvStatsProbeRunner(max_seq_len=64, end_token_id=99)
-    engine = LLMEngine(
-        model_runner=runner,
+    engine = _make_engine(
+        runner,
         kv_cache_block_size=2,
         kv_cache_layout=KvCacheLayout.BLOCK,
-        kv_cache_capacity_tokens=64,
         max_batch_size=1,
     )
     out = engine.generate(

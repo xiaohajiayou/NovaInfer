@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-from ctypes import POINTER, c_int64, cast
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterator, Sequence
+from dataclasses import fields
+from typing import Dict, Sequence
 
-from ..libllaisys import DataType, DeviceType
 from ..libllaisys.model import KvCacheLayout
-from ..tensor import Tensor
 from .config import EngineConfig
 from .executor import Executor
 from .model_registry import ModelRegistry
-from .output_processor import OutputProcessor
 from .sequence import Sequence as EngineSequence
-from .scheduler import RequestScheduler, SchedulerOutputs
+from .scheduler import RequestScheduler
 from .types import (
     GenerationOutput,
     RequestState,
@@ -52,105 +47,53 @@ _ALLOWED_TRANSITIONS = {
 }
 
 
-@dataclass
-class _RequestContext:
-    # User-visible request state (status/history/tokens).
-    request: RequestState
-    # Effective sampling config bound to this request.
-    sampling_params: SamplingParams
-    # Scheduler-facing sequence state (block table / running queue metadata).
-    seq: EngineSequence
-    # Computed per-request generation cap; -1 means "not computed yet".
-    max_new_tokens: int = -1
-    # Number of completion tokens generated so far.
-    num_generated: int = 0
-    # Matched stop string for final text trimming.
-    matched_stop: str | None = None
-    # Cached terminal output returned by collect(request_id).
-    finished_output: GenerationOutput | None = None
-
-
 class LLMEngine:
     """Stage-1 offline engine with explicit submit/step/collect/cancel contract."""
 
     def __init__(
         self,
-        model_type: str = "qwen2",
-        model_path: Path | str | None = None,
-        device: DeviceType = DeviceType.CPU,
-        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
-        kv_cache_block_size: int = 16,
-        max_model_len: int | None = None,
-        kv_cache_capacity_tokens: int | None = None,
-        worker: Worker | None = None,
-        model_runner=None,
-        model_registry: ModelRegistry | None = None,
-        max_batch_size: int = 8,
-        max_num_batched_tokens: int | None = None,
-        kv_cache_auto_capacity: bool = False,
-        kv_cache_memory_utilization: float = 0.9,
         config: EngineConfig | None = None,
+        model_registry: ModelRegistry | None = None,
+        **kwargs,
     ):
-        cfg = (config or EngineConfig(
-            model_type=model_type,
-            model_path=model_path,
-            device=device,
-            kv_cache_layout=kv_cache_layout,
-            kv_cache_block_size=kv_cache_block_size,
-            max_model_len=max_model_len,
-            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-            max_num_seqs=max_batch_size,
-            max_num_batched_tokens=max_num_batched_tokens,
-            kv_cache_auto_capacity=kv_cache_auto_capacity,
-            kv_cache_memory_utilization=kv_cache_memory_utilization,
-        )).normalized()
+        if "max_num_seqs" not in kwargs and "max_batch_size" in kwargs:
+            kwargs["max_num_seqs"] = kwargs["max_batch_size"]
+        if "model_path" not in kwargs and "model" in kwargs:
+            kwargs["model_path"] = kwargs["model"]
+        config_fields = {field.name for field in fields(EngineConfig)}
+        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+        unexpected = sorted(
+            k for k in kwargs.keys() if k not in config_fields and k not in ("max_batch_size", "model")
+        )
+        if unexpected:
+            names = ", ".join(unexpected)
+            raise TypeError(f"LLMEngine got unexpected keyword argument(s): {names}")
+        cfg = config or EngineConfig(**config_kwargs)
         self._config = cfg
 
-        self._worker = worker if worker is not None else Worker(
+        self._worker = Worker(
             config=cfg,
-            model_runner=model_runner,
             model_registry=model_registry,
         )
         self._prefix_cache_enabled = (
             cfg.kv_cache_layout == KvCacheLayout.BLOCK and bool(cfg.enable_prefix_caching)
         )
+        # Runtime-derived capacity/length are synced into cfg during model runner init.
+        # Prefix caching is forced off when not using BLOCK layout.
+        cfg.enable_prefix_caching = bool(self._prefix_cache_enabled)
+        if cfg.end_token_id is None:
+            raise ValueError("end_token_id is required")
+        self._end_token_id = int(cfg.end_token_id)
 
-        # Reconcile effective runtime capacities from the real runner and make
-        # EngineConfig the single source of truth for downstream components.
-        cfg.effective_max_model_len = int(self._worker.max_seq_len)
-        cfg.effective_kv_cache_capacity_tokens = (
-            int(self._worker.kv_cache_capacity_tokens)
-            if getattr(self._worker, "kv_cache_capacity_tokens", None) is not None
-            else int(cfg.effective_max_model_len)
-        )
-        cfg.effective_kv_cache_capacity_tokens = max(1, int(cfg.effective_kv_cache_capacity_tokens))
-        eff_block_size = max(1, int(cfg.kv_cache_block_size))
-        cfg.num_kvcache_blocks = (
-            (int(cfg.effective_kv_cache_capacity_tokens) + eff_block_size - 1) // eff_block_size
-            if cfg.kv_cache_layout == KvCacheLayout.BLOCK
-            else 0
-        )
-        cfg.effective_enable_prefix_caching = bool(self._prefix_cache_enabled)
-        cfg.normalized()
-
-        self._scheduler = RequestScheduler(
-            max_num_seqs=cfg.max_num_seqs,
-            max_num_batched_tokens=(
-                max(1, int(cfg.max_num_batched_tokens))
-                if cfg.max_num_batched_tokens is not None
-                else int(cfg.effective_kv_cache_capacity_tokens)
-            ),
-            block_size=eff_block_size,
-            num_kvcache_blocks=int(cfg.num_kvcache_blocks),
-            enable_prefix_cache=self._prefix_cache_enabled,
-        )
+        self._scheduler = RequestScheduler(cfg)
         self._executor = Executor(self._worker)
-        self._output = OutputProcessor()
 
         self._requests: Dict[str, RequestState] = {}
-        self._request_contexts: Dict[str, _RequestContext] = {}
+        self._seq_by_id: Dict[int, EngineSequence] = {}
+        self._request_id_by_seq_id: Dict[int, str] = {}
+        self._seq_id_by_request: Dict[str, int] = {}
+        self._finished_outputs: Dict[str, GenerationOutput] = {}
         self._request_counter = 0
-        self._seq_counter = 0
         self._last_request_id: str | None = None
         self._max_batch_size = int(cfg.max_num_seqs)
         self._runtime_peak_used_tokens_observed = 0
@@ -167,7 +110,6 @@ class LLMEngine:
         out = {
             "config": {
                 "enable_prefix_caching": bool(self._config.enable_prefix_caching),
-                "effective_enable_prefix_caching": bool(self._prefix_cache_enabled),
             },
             "allocator": {
                 "block_size": int(scheduler_stats.block_size),
@@ -227,159 +169,81 @@ class LLMEngine:
     def submit(self, inputs: Sequence[int], sampling_params: SamplingParams) -> str:
         req = self._create_request([int(t) for t in inputs])
         seq = EngineSequence(
-            request_id=req.request_id,
-            seq_id=self._alloc_seq_id(),
             token_ids=[int(t) for t in inputs],
             sampling_params=sampling_params,
-            block_size=self._scheduler.block_manager.block_size,
         )
-        request_context = _RequestContext(
-            request=req,
-            sampling_params=sampling_params,
-            seq=seq,
-        )
-        self._request_contexts[req.request_id] = request_context
+        seq.max_tokens = self._compute_max_new(len(req.prompt_tokens), sampling_params)
+        req.output_tokens = seq.token_ids
+        seq_id = int(seq.seq_id)
+        self._seq_by_id[seq_id] = seq
+        self._request_id_by_seq_id[seq_id] = req.request_id
+        self._seq_id_by_request[req.request_id] = seq_id
         self._scheduler.add(seq)
         return req.request_id
 
     def step(self) -> list[GenerationOutput]:
-        # Step flow (reading guide):
-        # 1) Ask scheduler for this round's work.
-        # 2) Validate/filter scheduled requests into executable active set.
-        # 3) Execute one model step for active set.
-        # 4) Append sampled tokens, finalize finished requests, return completions.
         sched = self._scheduler.schedule(max_num_seqs=self._max_batch_size)
         if sched is None:
-            # No schedulable work.
-            # Guardrail: abort waiting requests that can never be admitted
-            # (prompt already exceeds model/scheduler budget), so callers do
-            # not spin forever waiting for an impossible request.
-            completions: list[GenerationOutput] = []
-            for seq in list(self._scheduler.waiting):
-                request_context = self._request_contexts.get(seq.request_id)
-                if request_context is None:
-                    self._scheduler.finish(seq.request_id)
-                    continue
-                req = request_context.request
-                if req.status in TERMINAL_REQUEST_STATUSES:
-                    self._scheduler.finish(seq.request_id)
-                    continue
-                prompt_len = len(req.prompt_tokens)
-                if prompt_len > self._worker.max_seq_len or prompt_len > self._scheduler.max_num_batched_tokens:
-                    req.error = "prompt exceeds model/scheduler budget"
-                    completions.append(self._complete_request(request_context, RequestStatus.FINISHED_ABORTED, "aborted"))
-            return completions
+            return []
 
         completions: list[GenerationOutput] = []
-        active_contexts: list[_RequestContext] = []
-        active_seqs: list[EngineSequence] = []
-
-        # Build executable batch from scheduler output.
-        # This stage handles state transition, budget checks, and per-request
-        # generation-cap initialization.
-        for seq in sched.scheduled_seqs:
-            req_id = seq.request_id
-            # 1) Scheduler may hold stale seqs; drop them if context is already gone.
-            request_context = self._request_contexts.get(req_id)
-            if request_context is None:
-                self._scheduler.finish(req_id)
+        for seq_id in list(sched.finished_seq_ids):
+            sid = int(seq_id)
+            req_key = self._request_id_by_seq_id.get(sid)
+            if req_key is None:
                 continue
-
-            req = request_context.request
-            # 2) Terminal requests are removed from scheduler queues and their
-            # cached output is surfaced once in this step result.
+            req = self._requests.get(req_key)
+            seq = self._seq_by_id.get(sid)
+            if req is None or seq is None:
+                continue
             if req.status in TERMINAL_REQUEST_STATUSES:
-                self._scheduler.finish(req_id)
-                if request_context.finished_output is not None:
-                    completions.append(request_context.finished_output)
                 continue
+            finish_reason = str(seq.finish_reason or "aborted")
+            if finish_reason == "aborted" and req.error is None:
+                req.error = "prompt exceeds model/scheduler budget"
+            completions.append(
+                self._complete_request(seq, finish_reason)
+            )
 
-            try:
-                # 3) Move WAITING -> RUNNING when the request is admitted.
-                if req.status == RequestStatus.WAITING:
-                    self._transition(req, RequestStatus.RUNNING)
-
-                # 4) Empty prompt is a valid no-op request and is completed
-                # immediately as ignored.
-                if not req.prompt_tokens:
-                    completions.append(self._complete_request(request_context, RequestStatus.FINISHED_IGNORED, "empty"))
-                    continue
-
-                # 5) Enforce hard budgets before execution.
-                if len(req.prompt_tokens) > self._worker.max_seq_len:
-                    raise ValueError("Prompt length exceeds maxseq")
-                if len(req.prompt_tokens) > self._scheduler.max_num_batched_tokens:
-                    raise ValueError("Prompt length exceeds scheduler token budget")
-
-                # 6) Compute request-local generation cap once.
-                if request_context.max_new_tokens < 0:
-                    request_context.max_new_tokens = self._compute_max_new(
-                        len(req.prompt_tokens), request_context.sampling_params
-                    )
-                # Cap can become zero if prompt already reaches model length.
-                if request_context.max_new_tokens <= 0:
-                    completions.append(
-                        self._complete_request(request_context, RequestStatus.FINISHED_LENGTH_CAPPED, "length")
-                    )
-                    continue
-
-                # 7) Request is executable in this round.
-                active_contexts.append(request_context)
-                active_seqs.append(seq)
-            except Exception as exc:
-                # Any per-request setup failure is converted into aborted output
-                # so upper layers do not hang waiting for this request.
-                req.error = str(exc)
-                completions.append(self._complete_request(request_context, RequestStatus.FINISHED_ABORTED, "aborted"))
-
-        if not active_seqs:
+        if not sched.scheduled_seqs:
+            if sched.finished_seq_ids:
+                self._executor.execute_scheduler_step(
+                    sched,
+                )
             return completions
 
-        # Execute one decode/prefill step for active requests.
-        sampling_params_by_req = {
-            request_context.request.request_id: request_context.sampling_params
-            for request_context in active_contexts
-        }
-        sampled_t, sampled_req_ids = self._executor.execute_scheduler_step(
-            SchedulerOutputs(scheduled_seqs=active_seqs, is_prefill=sched.is_prefill),
-            sampling_params_by_req=sampling_params_by_req,
-        )
+        for seq in sched.scheduled_seqs:
+            req_id = self._request_id_by_seq_id.get(int(seq.seq_id))
+            if req_id is None:
+                raise RuntimeError(f"missing request mapping for seq_id={seq.seq_id}")
+            req = self._requests.get(req_id)
+            if req is None:
+                raise RuntimeError(f"missing request state for seq_id={seq.seq_id}")
+            if req.status == RequestStatus.WAITING:
+                self._transition(req, RequestStatus.RUNNING)
+
+        sampled_token_ids = self._executor.execute_scheduler_step(sched)
         self._observe_runtime_kv_peak()
-        if sampled_t is None:
+        if sampled_token_ids is None:
             return completions
 
-        if len(sampled_req_ids) != int(sampled_t.shape()[0]):
-            raise RuntimeError("executor sampled/output mapping size mismatch")
+        self._scheduler.postprocess(
+            sched.scheduled_seqs,
+            sampled_token_ids,
+            self._end_token_id,
+        )
 
-        # Apply sampled tokens and finalize requests that hit stop/length.
-        for req_id, token in zip(sampled_req_ids, self._iter_sampled_token_ids(sampled_t, len(sampled_req_ids))):
-            request_context = self._request_contexts.get(req_id)
-            if request_context is None:
-                continue
-            req = request_context.request
-            req.output_tokens.append(int(token))
-            request_context.seq.append_token(int(token))
-            request_context.num_generated += 1
-
-            finish_reason = self._maybe_finish_reason(request_context, int(token))
+        for seq in sched.scheduled_seqs:
+            finish_reason = seq.finish_reason
             if finish_reason is not None:
                 completions.append(
-                    self._complete_request(request_context, RequestStatus.FINISHED_STOPPED, finish_reason)
-                )
-                continue
-
-            if request_context.num_generated >= request_context.max_new_tokens:
-                completions.append(
-                    self._complete_request(request_context, RequestStatus.FINISHED_LENGTH_CAPPED, "length")
+                    self._complete_request(seq, finish_reason)
                 )
 
         return completions
 
     def collect(self, request_id: str) -> GenerationOutput | None:
-        request_context = self._request_contexts.get(request_id)
-        if request_context is None:
-            return None
-        return request_context.finished_output
+        return self._finished_outputs.get(request_id)
 
     def stream(self, inputs: Sequence[int], sampling_params: SamplingParams):
         request_id = self.submit(inputs=inputs, sampling_params=sampling_params)
@@ -438,21 +302,27 @@ class LLMEngine:
             if done is not None:
                 return done
 
-            if not self._scheduler.has_work():
-                raise RuntimeError("Engine finished without output for request")
             _ = self.step()
 
+            done = self.collect(request_id)
+            if done is not None:
+                return done
+
+            if not self._scheduler.has_work():
+                raise RuntimeError("Engine finished without output for request")
+
     def abort_request(self, request_id: str) -> bool:
-        request_context = self._request_contexts.get(request_id)
-        if request_context is None:
+        req = self._requests.get(request_id)
+        seq_id = self._seq_id_by_request.get(request_id)
+        seq = self._seq_by_id.get(int(seq_id)) if seq_id is not None else None
+        if req is None or seq is None or seq_id is None:
             return False
 
-        req = request_context.request
         if req.status in TERMINAL_REQUEST_STATUSES:
             return True
 
         req.error = "aborted by user"
-        self._complete_request(request_context, RequestStatus.FINISHED_ABORTED, "aborted")
+        self._complete_request(seq, "aborted")
         return True
 
     def cancel(self, request_id: str) -> bool:
@@ -491,20 +361,17 @@ class LLMEngine:
     def _create_request(self, prompt_tokens: Sequence[int]) -> RequestState:
         self._request_counter += 1
         req_id = f"req-{self._request_counter}"
+        prompt_ids = [int(t) for t in prompt_tokens]
         req = RequestState(
             request_id=req_id,
             status=RequestStatus.WAITING,
-            prompt_tokens=[int(t) for t in prompt_tokens],
-            output_tokens=[int(t) for t in prompt_tokens],
+            prompt_tokens=prompt_ids,
+            output_tokens=list(prompt_ids),
             history=[RequestStatus.WAITING],
         )
         self._requests[req_id] = req
         self._last_request_id = req_id
         return req
-
-    def _alloc_seq_id(self) -> int:
-        self._seq_counter += 1
-        return int(self._seq_counter)
 
     def _transition(self, req: RequestState, next_status: RequestStatus) -> None:
         current = req.status
@@ -522,80 +389,54 @@ class LLMEngine:
 
     def _complete_request(
         self,
-        request_context: _RequestContext,
-        terminal_status: RequestStatus,
+        seq: EngineSequence,
         finish_reason: str,
     ) -> GenerationOutput:
-        req = request_context.request
-        if req.status not in TERMINAL_REQUEST_STATUSES:
-            self._transition(req, terminal_status)
+        seq_id = int(seq.seq_id)
+        request_id = self._request_id_by_seq_id.get(seq_id)
+        if request_id is None:
+            raise RuntimeError(f"missing request mapping for completion: seq_id={seq_id}")
+        req_state = self._requests.get(request_id)
+        if req_state is None:
+            raise RuntimeError(f"missing request state for completion: request_id={request_id}")
+        terminal_status = {
+            "empty": RequestStatus.FINISHED_IGNORED,
+            "length": RequestStatus.FINISHED_LENGTH_CAPPED,
+            "aborted": RequestStatus.FINISHED_ABORTED,
+        }.get(str(finish_reason), RequestStatus.FINISHED_STOPPED)
+        if req_state.status not in TERMINAL_REQUEST_STATUSES:
+            self._transition(req_state, terminal_status)
 
-        text = self._decode_completion_text(req)
-        if finish_reason == "stop_string" and request_context.matched_stop and text is not None:
-            idx = text.find(request_context.matched_stop)
-            if idx >= 0:
-                text = text[:idx]
-
-        output = self._output.finalize(
-            request_id=req.request_id,
-            prompt_len=len(req.prompt_tokens),
-            token_ids=req.output_tokens,
-            finish_reason=finish_reason,
-            status=req.status,
+        total = len(req_state.output_tokens)
+        prompt_len = len(req_state.prompt_tokens)
+        completion = max(0, total - int(prompt_len))
+        completion_tokens = req_state.output_tokens[prompt_len:]
+        text = "" if not completion_tokens else self._worker.decode_tokens(completion_tokens)
+        output = GenerationOutput(
+            request_id=req_state.request_id,
+            token_ids=list(req_state.output_tokens),
+            finish_reason=str(finish_reason),
+            status=req_state.status,
             text=text,
+            usage={
+                "prompt_tokens": int(prompt_len),
+                "completion_tokens": int(completion),
+                "total_tokens": int(total),
+            },
         )
-        request_context.finished_output = output
-        self._scheduler.finish(req.request_id)
-        self._worker.free_request(request_context.seq.seq_id)
+        self._finished_outputs[request_id] = output
+        self._scheduler.finish(seq_id)
+        self._worker.free_request(seq.seq_id)
+        self._seq_by_id.pop(seq_id, None)
+        self._request_id_by_seq_id.pop(seq_id, None)
+        self._seq_id_by_request.pop(request_id, None)
         return output
 
     def _compute_max_new(self, prompt_len: int, sampling_params: SamplingParams) -> int:
-        remaining = self._worker.max_seq_len - int(prompt_len)
+        remaining = int(self._config.max_model_len) - int(prompt_len)
         if remaining <= 0:
             return 0
         max_new = remaining
         if sampling_params.max_new_tokens is not None:
             max_new = min(max_new, int(sampling_params.max_new_tokens))
         return int(max_new)
-
-    def _decode_completion_text(self, req: RequestState) -> str | None:
-        completion_tokens = req.output_tokens[len(req.prompt_tokens) :]
-        if not completion_tokens:
-            return ""
-        return self._worker.decode_tokens([int(t) for t in completion_tokens])
-
-    def _maybe_finish_reason(self, request_context: _RequestContext, token_id: int) -> str | None:
-        sampling_params = request_context.sampling_params
-        if (not bool(sampling_params.ignore_eos)) and token_id == self._worker.end_token_id:
-            return "eos_token"
-        if sampling_params.stop_token_ids and token_id in set(sampling_params.stop_token_ids):
-            return "stop_token"
-        if sampling_params.stop:
-            completion_text = self._decode_completion_text(request_context.request)
-            if completion_text is not None:
-                for stop_str in sampling_params.stop:
-                    if stop_str and stop_str in completion_text:
-                        request_context.matched_stop = stop_str
-                        return "stop_string"
-        return None
-
-    def _iter_sampled_token_ids(self, sampled_t: Tensor, expected_n: int) -> Iterator[int]:
-        token_tensor = sampled_t
-        if token_tensor.device_type() != DeviceType.CPU:
-            raise RuntimeError("sampled token tensor must be on CPU")
-
-        shape = token_tensor.shape()
-        if len(shape) != 1:
-            raise RuntimeError("sampled token tensor must be 1D")
-        n = int(shape[0])
-        if n != int(expected_n):
-            raise RuntimeError("sampled token tensor length mismatch")
-        if n <= 0:
-            return
-
-        if token_tensor.dtype() != DataType.I64:
-            raise RuntimeError("sampled token tensor dtype must be I64")
-
-        ptr = cast(token_tensor.data_ptr(), POINTER(c_int64))
-        for i in range(n):
-            yield int(ptr[i])

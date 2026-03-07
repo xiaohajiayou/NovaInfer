@@ -84,7 +84,6 @@ def load_llaisys_llm(model_path, device_name, kv_layout: str = "block"):
         model_type="qwen2",
         device=llaisys_device(device_name),
         kv_cache_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
-        kv_cache_auto_capacity=True,
     )
 
 def _set_attn_backend(backend: str | None):

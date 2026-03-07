@@ -5,7 +5,6 @@ import time
 
 import pytest
 
-from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import SamplingParams
 from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
@@ -16,6 +15,7 @@ from llaisys.server.openai_server import (
 )
 from llaisys.server.schemas import ChatCompletionRequest, ChatMessage
 from test.utils.dummy_model_runner import DummyModelRunner
+from test.utils.engine_testkit import make_engine_with_runner
 
 
 class DummyRunner(DummyModelRunner):
@@ -23,8 +23,8 @@ class DummyRunner(DummyModelRunner):
 
 
 def _make_server() -> OpenAIServer:
-    engine = LLMEngine(
-        model_runner=DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    engine = make_engine_with_runner(
+        DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
     )
     async_engine = AsyncLLMEngine(engine=engine)
     return OpenAIServer(async_engine)
@@ -144,10 +144,14 @@ def test_async_stream_late_subscribe_replays_prefix_and_tail(server: OpenAIServe
 def test_online_cancel_request(server: OpenAIServer):
     params = SamplingParams(max_new_tokens=32, top_k=1, top_p=1.0, temperature=1.0)
     req_id = server._async_engine.submit(inputs=[1, 2, 3], sampling_params=params)
-    assert server.cancel(req_id) is True
+    ok = server.cancel(req_id)
     out = server._async_engine.collect(req_id)
     assert out is not None
-    assert out.status.value.startswith("finished_")
+    if ok:
+        assert out.status.value == "finished_aborted"
+    else:
+        # Request may already finish before cancel is processed.
+        assert out.status.value.startswith("finished_")
 
 
 def test_online_concurrent_requests(server: OpenAIServer):

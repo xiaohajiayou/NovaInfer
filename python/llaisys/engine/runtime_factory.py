@@ -163,8 +163,6 @@ def plan_qwen2_runtime(
     device: DeviceType,
     kv_cache_block_size: int,
     max_model_len: Optional[int],
-    kv_cache_capacity_tokens: Optional[int],
-    kv_cache_auto_capacity: bool,
     kv_cache_memory_utilization: float,
     max_num_seqs: Optional[int],
 ) -> RuntimePlan:
@@ -180,71 +178,53 @@ def plan_qwen2_runtime(
 
     token_bytes = _kv_token_bytes(meta)
     util = min(0.98, max(0.01, float(kv_cache_memory_utilization)))
-    if kv_cache_capacity_tokens is not None:
-        resolved_kv_capacity_tokens = max(1, int(kv_cache_capacity_tokens))
-        explicit_blocks = (resolved_kv_capacity_tokens + int(kv_cache_block_size) - 1) // int(kv_cache_block_size)
+    if device == DeviceType.NVIDIA:
+        auto_max_num_seqs = (
+            max(1, int(max_num_seqs))
+            if max_num_seqs is not None
+            else max(1, int(os.getenv("LLAISYS_KV_AUTO_MAX_SEQS", "8")))
+        )
+        capacity_tokens, probe = _estimate_cuda_kv_capacity_tokens(
+            available_bytes=int(available_memory_bytes),
+            token_bytes=token_bytes,
+            block_size=int(kv_cache_block_size),
+            memory_utilization=util,
+            max_model_len=resolved_max_model_len,
+            max_num_seqs=auto_max_num_seqs,
+        )
+        print(
+            "[kv] probe "
+            f"device={int(device)} free_bytes={probe['free_bytes']} budget_bytes={probe['budget_bytes']} "
+            f"reserve_bytes={probe['reserve_bytes']} token_bytes={token_bytes} block_size={int(kv_cache_block_size)} "
+            f"util={probe['util']:.2f} max_model_len={resolved_max_model_len} auto_max_num_seqs={auto_max_num_seqs}"
+        )
+        if capacity_tokens <= 0:
+            raise RuntimeError("estimated num_kvcache_blocks <= 0")
+        resolved_kv_capacity_tokens = int(capacity_tokens)
+        print(
+            "[kv] capacity auto "
+            f"block_bytes={probe['block_bytes']} blocks={probe['num_blocks']} "
+            f"capacity_tokens_est={probe['capacity_tokens_est']} "
+            f"logical_cap_tokens={probe['logical_cap_tokens']} "
+            f"capacity_tokens={resolved_kv_capacity_tokens}"
+        )
+    else:
+        bs = max(1, int(kv_cache_block_size))
+        block_bytes = max(1, int(token_bytes) * bs)
+        num_blocks = int((int(available_memory_bytes) * util) // block_bytes)
+        capacity_tokens = max(1, int(num_blocks) * bs)
         print(
             "[kv] probe "
             f"device={int(device)} available_bytes={available_memory_bytes} "
             f"token_bytes={token_bytes} block_size={int(kv_cache_block_size)} util={util:.2f}"
         )
+        if num_blocks <= 0:
+            raise RuntimeError("estimated num_kvcache_blocks <= 0")
+        resolved_kv_capacity_tokens = int(capacity_tokens)
         print(
-            "[kv] capacity explicit "
-            f"capacity_tokens={resolved_kv_capacity_tokens} num_blocks={explicit_blocks}"
-        )
-    elif kv_cache_auto_capacity:
-        if device == DeviceType.NVIDIA:
-            auto_max_num_seqs = (
-                max(1, int(max_num_seqs))
-                if max_num_seqs is not None
-                else max(1, int(os.getenv("LLAISYS_KV_AUTO_MAX_SEQS", "8")))
-            )
-            capacity_tokens, probe = _estimate_cuda_kv_capacity_tokens(
-                available_bytes=int(available_memory_bytes),
-                token_bytes=token_bytes,
-                block_size=int(kv_cache_block_size),
-                memory_utilization=util,
-                max_model_len=resolved_max_model_len,
-                max_num_seqs=auto_max_num_seqs,
-            )
-            print(
-                "[kv] probe "
-                f"device={int(device)} free_bytes={probe['free_bytes']} budget_bytes={probe['budget_bytes']} "
-                f"reserve_bytes={probe['reserve_bytes']} token_bytes={token_bytes} block_size={int(kv_cache_block_size)} "
-                f"util={probe['util']:.2f} max_model_len={resolved_max_model_len} auto_max_num_seqs={auto_max_num_seqs}"
-            )
-            if capacity_tokens <= 0:
-                raise RuntimeError("estimated num_kvcache_blocks <= 0")
-            resolved_kv_capacity_tokens = int(capacity_tokens)
-            print(
-                "[kv] capacity auto "
-                f"block_bytes={probe['block_bytes']} blocks={probe['num_blocks']} "
-                f"capacity_tokens_est={probe['capacity_tokens_est']} "
-                f"logical_cap_tokens={probe['logical_cap_tokens']} "
-                f"capacity_tokens={resolved_kv_capacity_tokens}"
-            )
-        else:
-            bs = max(1, int(kv_cache_block_size))
-            block_bytes = max(1, int(token_bytes) * bs)
-            num_blocks = int((int(available_memory_bytes) * util) // block_bytes)
-            capacity_tokens = max(1, int(num_blocks) * bs)
-            print(
-                "[kv] probe "
-                f"device={int(device)} available_bytes={available_memory_bytes} "
-                f"token_bytes={token_bytes} block_size={int(kv_cache_block_size)} util={util:.2f}"
-            )
-            if num_blocks <= 0:
-                raise RuntimeError("estimated num_kvcache_blocks <= 0")
-            resolved_kv_capacity_tokens = int(capacity_tokens)
-            print(
-                "[kv] capacity auto "
-                f"block_bytes={block_bytes} blocks={num_blocks} "
-                f"capacity_tokens={resolved_kv_capacity_tokens}"
-            )
-    else:
-        raise RuntimeError(
-            "kv cache capacity is unspecified: set kv_cache_capacity_tokens "
-            "or enable kv_cache_auto_capacity"
+            "[kv] capacity auto "
+            f"block_bytes={block_bytes} blocks={num_blocks} "
+            f"capacity_tokens={resolved_kv_capacity_tokens}"
         )
 
     return RuntimePlan(

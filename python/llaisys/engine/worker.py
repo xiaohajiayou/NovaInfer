@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
 from .config import EngineConfig
 from .cpu_model_runner import CPUModelRunner
 from .gpu_model_runner import GPUModelRunner
@@ -18,98 +16,31 @@ class Worker:
 
     def __init__(
         self,
-        model_type: str = "qwen2",
-        model_path: Path | str | None = None,
-        device: DeviceType = DeviceType.CPU,
-        kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
-        kv_cache_block_size: int = 16,
-        max_model_len: int | None = None,
-        kv_cache_capacity_tokens: int | None = None,
-        kv_cache_auto_capacity: bool = False,
-        kv_cache_memory_utilization: float = 0.9,
         config: EngineConfig | None = None,
-        model_runner=None,
         model_registry: ModelRegistry | None = None,
+        **kwargs,
     ):
-        cfg = (config or EngineConfig(
-            model_type=model_type,
-            model_path=model_path,
-            device=device,
-            kv_cache_layout=kv_cache_layout,
-            kv_cache_block_size=kv_cache_block_size,
-            max_model_len=max_model_len,
-            kv_cache_capacity_tokens=kv_cache_capacity_tokens,
-            kv_cache_auto_capacity=kv_cache_auto_capacity,
-            kv_cache_memory_utilization=kv_cache_memory_utilization,
-        )).normalized()
+        cfg = config or EngineConfig(**kwargs)
         self._config = cfg
-        self._model_type = cfg.model_type
         self._model_path = Path(cfg.model_path) if cfg.model_path is not None else None
-        self._device = cfg.device
-        self._kv_cache_layout = cfg.kv_cache_layout
-        self._kv_cache_block_size = int(cfg.kv_cache_block_size)
-        self._max_model_len = int(cfg.max_model_len) if cfg.max_model_len is not None else None
-        self._kv_cache_capacity_tokens = (
-            int(cfg.kv_cache_capacity_tokens) if cfg.kv_cache_capacity_tokens is not None else None
-        )
-        self._kv_cache_auto_capacity = bool(cfg.kv_cache_auto_capacity)
-        self._kv_cache_memory_utilization = float(cfg.kv_cache_memory_utilization)
         self._model_registry = model_registry if model_registry is not None else create_default_registry()
-        runtime_handle = None
-        runner_obj = model_runner
-        if runner_obj is None:
-            runtime_handle, runtime_info = self._create_runtime()
-            try:
-                runner_obj = self._create_model_wrapper(runtime_info=runtime_info)
-            except Exception:
-                if runtime_handle is not None:
-                    from ..libllaisys import LIB_LLAISYS
-
-                    LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
-                raise
-            if runtime_info:
-                self._max_model_len = int(runtime_info.get("max_model_len", self._max_model_len or 0)) or self._max_model_len
-                self._kv_cache_capacity_tokens = int(
-                    runtime_info.get("kv_cache_capacity_tokens", self._kv_cache_capacity_tokens or 0)
-                ) or self._kv_cache_capacity_tokens
-        if hasattr(runner_obj, "execute_model") and hasattr(runner_obj, "sample_tokens"):
-            self._model_runner = runner_obj
-        else:
-            runner_cls = CPUModelRunner if self._device == DeviceType.CPU else GPUModelRunner
-            self._model_runner = runner_cls(
-                runner_obj,
-                self._device,
-                kv_cache_layout=self._kv_cache_layout,
-                config=self._config,
-                runtime_handle=runtime_handle,
-            )
+        model_obj = self._create_model_wrapper()
+        runner_cls = CPUModelRunner if cfg.device == DeviceType.CPU else GPUModelRunner
+        self._model_runner = runner_cls(
+            model_obj,
+            config=self._config,
+            model_registry=self._model_registry,
+        )
         self._input_processor = InputProcessor(self._model_path)
 
-    def _create_runtime(self) -> tuple[Any | None, dict]:
+    def _create_model_wrapper(self):
         if self._model_path is None:
-            raise ValueError("model_path is required when model_runner is not provided")
-        return self._model_registry.create_runtime(
-            self._model_type,
-            self._model_path,
-            self._device,
-            kv_cache_layout=self._kv_cache_layout,
-            kv_cache_block_size=self._kv_cache_block_size,
-            max_model_len=self._max_model_len,
-            max_num_seqs=int(self._config.max_num_seqs),
-            kv_cache_capacity_tokens=self._kv_cache_capacity_tokens,
-            kv_cache_auto_capacity=self._kv_cache_auto_capacity,
-            kv_cache_memory_utilization=self._kv_cache_memory_utilization,
-        )
-
-    def _create_model_wrapper(self, runtime_info: dict | None = None):
-        if self._model_path is None:
-            raise ValueError("model_path is required when model_runner is not provided")
-        runtime_info = runtime_info or {}
+            raise ValueError("model_path is required")
         return self._model_registry.create(
-            self._model_type,
+            self._config.model_type,
             self._model_path,
-            self._device,
-            max_model_len=runtime_info.get("max_model_len", self._max_model_len),
+            self._config.device,
+            max_model_len=self._config.max_model_len,
         )
 
     @property
@@ -124,47 +55,11 @@ class Worker:
         if callable(close_fn):
             close_fn()
 
-    @property
-    def max_seq_len(self) -> int:
-        if hasattr(self._model_runner, "max_seq_len"):
-            return int(self._model_runner.max_seq_len)
-        return int(self._model_runner.model._meta_info.maxseq)
-
-    @property
-    def end_token_id(self) -> int:
-        if hasattr(self._model_runner, "end_token_id"):
-            return int(self._model_runner.end_token_id)
-        return int(self._model_runner.model._meta_info.end_token)
-
-    @property
-    def kv_cache_capacity_tokens(self) -> int | None:
-        if hasattr(self._model_runner, "kv_cache_capacity_tokens"):
-            try:
-                return int(self._model_runner.kv_cache_capacity_tokens)
-            except Exception:
-                return self._kv_cache_capacity_tokens
-        return self._kv_cache_capacity_tokens
-
-    def execute_model(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
-        return self._model_runner.execute_model(
-            scheduler_outputs,
-            sampling_params=sampling_params,
-            sampling_params_by_req=sampling_params_by_req,
-        )
+    def execute_model(self, scheduler_outputs):
+        return self._model_runner.execute_model(scheduler_outputs)
 
     def sample_tokens(self):
         return self._model_runner.sample_tokens()
-
-    def execute(self, scheduler_outputs, sampling_params=None, sampling_params_by_req=None):
-        self._model_runner.execute_model(
-            scheduler_outputs,
-            sampling_params=sampling_params,
-            sampling_params_by_req=sampling_params_by_req,
-        )
-        sampled = self._model_runner.sample_tokens(None)
-        if sampled is None:
-            return None, []
-        return sampled
 
     def free_request(self, seq_id: int) -> None:
         fn = getattr(self._model_runner, "request_free", None)

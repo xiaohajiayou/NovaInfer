@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .sequence import Sequence
 
 
 class RequestStatus(str, Enum):
@@ -45,26 +48,6 @@ class SamplingParams:
     ignore_eos: bool = False
     stop_token_ids: Sequence[int] = field(default_factory=tuple)
     stop: Sequence[str] = field(default_factory=tuple)
-
-
-@dataclass(frozen=True)
-class BatchPlan:
-    token_ids: List[int]
-    logits_mask: List[int]
-    temperatures: Optional[List[float]] = None
-    top_ps: Optional[List[float]] = None
-    top_ks: Optional[List[int]] = None
-    seeds: Optional[List[int]] = None
-    has_seeds: Optional[List[int]] = None
-    pos_ids: Optional[List[int]] = None
-    seq_ids: Optional[List[int]] = None
-    q_seq_rows: Optional[List[int]] = None
-    q_pos: Optional[List[int]] = None
-    slot_mapping: Optional[List[int]] = None
-    context_lens: Optional[List[int]] = None
-    batch_seq_ids: Optional[List[int]] = None
-    block_tables: Optional[List[int]] = None
-    block_table_width: int = 0
 
 
 @dataclass(frozen=True)

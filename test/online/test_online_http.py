@@ -5,12 +5,12 @@ import urllib.request
 
 import pytest
 
-from llaisys.engine.llm_engine import LLMEngine
 from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.http_server import LlaisysHTTPServer
 from llaisys.server.openai_server import OpenAIServer
 from test.utils.dummy_model_runner import DummyModelRunner
+from test.utils.engine_testkit import make_engine_with_runner
 
 # Disable environment proxy for localhost tests; CI/dev shells may inject HTTP_PROXY.
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -21,8 +21,8 @@ class DummyRunner(DummyModelRunner):
 
 
 def _start_http_server() -> LlaisysHTTPServer:
-    engine = LLMEngine(
-        model_runner=DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+    engine = make_engine_with_runner(
+        DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
     )
     async_engine = AsyncLLMEngine(engine=engine)
     server = OpenAIServer(async_engine)
