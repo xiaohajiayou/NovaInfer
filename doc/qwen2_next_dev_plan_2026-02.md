@@ -56,7 +56,7 @@
 
 指令:
 ```shell
-CUDA_VISIBLE_DEVICES=2 \
+CUDA_VISIBLE_DEVICES=5 \
   LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
    python scripts/bench_compare_vllm.py\
     --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
@@ -69,10 +69,10 @@ CUDA_VISIBLE_DEVICES=2 \
     --max-model-len 4096 \
     --seed 0 \
     --max-num-seqs 256 \
-    --max-num-batched-tokens 16384 \
-    --kv-cache-capacity-mode auto
+    --max-num-batched-tokens 16384
 
-CUDA_VISIBLE_DEVICES=2 \
+
+CUDA_VISIBLE_DEVICES=4 \
    python scripts/bench_compare_vllm.py\
     --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --backend vllm \
@@ -85,7 +85,6 @@ CUDA_VISIBLE_DEVICES=2 \
     --seed 0 \
     --max-num-seqs 256 \
     --max-num-batched-tokens 16384 \
-    --kv-cache-capacity-mode auto \
     --vllm-fair-mode
 ```
 结果记录（持续追加）：

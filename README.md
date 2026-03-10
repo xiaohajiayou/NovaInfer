@@ -269,13 +269,12 @@ PYTHONPATH=python python -m llaisys.server \
 NVIDIA backend (cuDNN paged attention):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
+CUDA_VISIBLE_DEVICES=2 \
 LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
 PYTHONPATH=python python -m llaisys.server \
-  --model-path models/DeepSeek-R1-Distill-Qwen-1.5B \
+  --model-path /home/xiaohajiayou/NovaInfer/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
   --model-type qwen2 \
   --device nvidia \
-  --kv-cache-capacity-mode auto \
   --kv-cache-memory-utilization 0.9 \
   --host 127.0.0.1 \
   --port 8000 \
