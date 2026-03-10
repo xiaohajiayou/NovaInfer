@@ -410,26 +410,38 @@ class GPUModelRunner:
         ntoken: int,
     ) -> tuple[list[int], list[int], list[int], int]:
         b_exec = int(ntoken)
-        seq_q_rows: list[int] = [1] * b_exec
-        seq_kv_rows: list[int] = [0] * b_exec
-        page_rows: list[int] = [0] * (b_exec * int(block_table_width))
+        nseq = len(block_table_rows)
+        if nseq <= 0:
+            raise RuntimeError("cudnn decode metadata requires non-empty batch")
+        if len(cu_seqlens_q) != nseq + 1 or len(cu_seqlens_k) != nseq + 1:
+            raise RuntimeError("cudnn decode metadata cu_seqlens size mismatch")
 
-        row_idx = 0
-        for seq_row in range(len(block_table_rows)):
-            seq_len = int(cu_seqlens_k[seq_row + 1]) - int(cu_seqlens_k[seq_row])
-            row_start = int(cu_seqlens_q[seq_row])
-            row_end = int(cu_seqlens_q[seq_row + 1])
-            row_scheduled = int(row_end - row_start)
-            table_row = block_table_rows[seq_row]
-            for local in range(row_scheduled):
-                qpos = int(seq_len - row_scheduled + local)
-                visible = int(max(0, min(seq_len, qpos + 1)))
-                seq_kv_rows[row_idx] = visible
-                dst = row_idx * int(block_table_width)
-                page_rows[dst: dst + int(block_table_width)] = table_row
-                row_idx += 1
-        if row_idx != int(ntoken):
+        cu_q = np.asarray(cu_seqlens_q, dtype=np.int32)
+        cu_k = np.asarray(cu_seqlens_k, dtype=np.int32)
+        row_scheduled = np.diff(cu_q)
+        row_seq_lens = np.diff(cu_k)
+        if np.any(row_scheduled < 0) or np.any(row_seq_lens < 0):
+            raise RuntimeError("cudnn decode metadata has invalid negative lengths")
+        if int(row_scheduled.sum(dtype=np.int64)) != int(ntoken):
             raise RuntimeError("cudnn metadata row count mismatch")
+
+        block_rows_np = np.asarray(block_table_rows, dtype=np.int32)
+        if block_rows_np.shape != (nseq, int(block_table_width)):
+            raise RuntimeError("cudnn decode page_table shape mismatch")
+
+        row_ids = np.repeat(np.arange(nseq, dtype=np.int32), row_scheduled.astype(np.int64))
+        if row_ids.shape[0] != int(ntoken):
+            raise RuntimeError("cudnn decode expanded row count mismatch")
+        local = np.arange(int(ntoken), dtype=np.int32) - np.repeat(cu_q[:-1], row_scheduled.astype(np.int64))
+        seq_len_tok = row_seq_lens[row_ids]
+        row_sched_tok = row_scheduled[row_ids]
+        qpos = seq_len_tok - row_sched_tok + local
+        seq_kv_rows_np = np.minimum(seq_len_tok, np.maximum(0, qpos + 1)).astype(np.int32, copy=False)
+        page_rows_np = block_rows_np[row_ids].reshape(-1)
+
+        seq_q_rows = np.ones((b_exec,), dtype=np.int32).tolist()
+        seq_kv_rows = seq_kv_rows_np.tolist()
+        page_rows = page_rows_np.tolist()
         if any(int(v) < 0 for v in page_rows):
             raise RuntimeError("cudnn decode page_table contains invalid negative block id")
         return seq_q_rows, seq_kv_rows, page_rows, int(b_exec)
@@ -449,17 +461,26 @@ class GPUModelRunner:
         if len(cu_seqlens_q) != nseq + 1 or len(cu_seqlens_k) != nseq + 1:
             raise RuntimeError("cudnn prefill metadata cu_seqlens size mismatch")
 
-        seq_q_rows = [int(cu_seqlens_q[i + 1] - cu_seqlens_q[i]) for i in range(nseq)]
-        seq_kv_rows = [int(cu_seqlens_k[i + 1] - cu_seqlens_k[i]) for i in range(nseq)]
-        if any(v <= 0 for v in seq_q_rows):
+        cu_q = np.asarray(cu_seqlens_q, dtype=np.int32)
+        cu_k = np.asarray(cu_seqlens_k, dtype=np.int32)
+        seq_q_rows_np = np.diff(cu_q)
+        seq_kv_rows_np = np.diff(cu_k)
+        if np.any(seq_q_rows_np <= 0):
             raise RuntimeError("cudnn prefill metadata requires seq_len_q > 0 for every sequence")
-        if any(v <= 0 for v in seq_kv_rows):
+        if np.any(seq_kv_rows_np <= 0):
             raise RuntimeError("cudnn prefill metadata requires seq_len_kv > 0 for every sequence")
-        if int(sum(seq_q_rows)) != int(ntoken):
+        if int(seq_q_rows_np.sum(dtype=np.int64)) != int(ntoken):
             raise RuntimeError("cudnn prefill metadata token count mismatch")
 
+        block_rows_np = np.asarray(block_table_rows, dtype=np.int32)
+        if block_rows_np.shape != (nseq, int(block_table_width)):
+            raise RuntimeError("cudnn prefill page_table shape mismatch")
+
         b_exec = int(nseq)
-        page_rows = [int(v) for row in block_table_rows for v in row]
+        page_rows_np = block_rows_np.reshape(-1)
+        seq_q_rows = seq_q_rows_np.tolist()
+        seq_kv_rows = seq_kv_rows_np.tolist()
+        page_rows = page_rows_np.tolist()
         if len(page_rows) != int(b_exec) * int(block_table_width):
             raise RuntimeError("cudnn prefill page_table size mismatch")
         if any(int(v) < 0 for v in page_rows):
@@ -468,10 +489,13 @@ class GPUModelRunner:
         hd = int(self._num_heads) * int(self._head_dim)
         if hd <= 0:
             raise RuntimeError("invalid model heads/head_dim for cudnn ragged prefill")
-        token_prefix: list[int] = [0]
-        for qlen in seq_q_rows:
-            token_prefix.append(int(token_prefix[-1]) + int(qlen))
-        ragged_offsets = [int(v) * int(hd) for v in token_prefix]
+        token_prefix = np.concatenate(
+            (
+                np.zeros((1,), dtype=np.int64),
+                np.cumsum(seq_q_rows_np, dtype=np.int64),
+            )
+        )
+        ragged_offsets = (token_prefix * np.int64(hd)).astype(np.int64, copy=False).tolist()
         return seq_q_rows, seq_kv_rows, page_rows, b_exec, ragged_offsets
 
     def _build_block_common_tensors(
@@ -837,17 +861,38 @@ class GPUModelRunner:
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/prefill"):
             is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
-            input_ids: list[int] = []
-            positions: list[int] = []
-            scheduled_token_counts: list[int] = []
-            for seq in seqs:
+            nseq = len(seqs)
+            if nseq <= 0:
+                return None
+            starts = np.empty((nseq,), dtype=np.int64)
+            ends = np.empty((nseq,), dtype=np.int64)
+            seqlens = np.empty((nseq,), dtype=np.int64)
+            for i, seq in enumerate(seqs):
                 start = max(0, int(seq.num_cached_tokens))
                 end = int(len(seq))
                 if end <= start:
                     raise RuntimeError("scheduler invariant violated: prefill sequence has zero scheduled tokens")
-                input_ids.extend([int(t) for t in seq[start:end]])
-                positions.extend(range(start, end))
-                scheduled_token_counts.append(int(end - start))
+                starts[i] = int(start)
+                ends[i] = int(end)
+                seqlens[i] = int(end)
+
+            scheduled_token_counts = (ends - starts).astype(np.int64, copy=False)
+            ntoken = int(scheduled_token_counts.sum(dtype=np.int64))
+            input_ids = np.empty((ntoken,), dtype=np.int64)
+            positions = np.empty((ntoken,), dtype=np.int64)
+            offsets = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int64),
+                    np.cumsum(scheduled_token_counts, dtype=np.int64),
+                )
+            )
+            for i, seq in enumerate(seqs):
+                row_start = int(offsets[i])
+                row_end = int(offsets[i + 1])
+                tok_start = int(starts[i])
+                tok_end = int(ends[i])
+                input_ids[row_start:row_end] = np.asarray(seq.prompt_token_ids[tok_start:tok_end], dtype=np.int64)
+                positions[row_start:row_end] = np.arange(tok_start, tok_end, dtype=np.int64)
             if len(input_ids) <= 0:
                 return None
 
@@ -861,31 +906,39 @@ class GPUModelRunner:
                 prepared.phase = int(AttentionPhase.PREFILL)
                 return prepared
 
-            cu_seqlens_q = [0]
-            cu_seqlens_k = [0]
-            max_seqlen_q = 0
-            max_seqlen_k = 0
-            slot_mapping: list[int] = []
+            seqlen_q = scheduled_token_counts.astype(np.int32, copy=False)
+            seqlen_k = seqlens.astype(np.int32, copy=False)
+            cu_seqlens_q = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int32),
+                    np.cumsum(seqlen_q, dtype=np.int32),
+                )
+            )
+            cu_seqlens_k = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int32),
+                    np.cumsum(seqlen_k, dtype=np.int32),
+                )
+            )
+            max_seqlen_q = int(seqlen_q.max())
+            max_seqlen_k = int(seqlen_k.max())
+            slot_mapping = np.empty((ntoken,), dtype=np.int32)
+            slot_off = 0
             for seq in seqs:
                 if not seq.block_table:
                     raise ValueError("BLOCK layout requires non-empty block_table for every scheduled sequence")
-                seqlen = int(len(seq))
-                seqlen_q = max(0, seqlen - int(seq.num_cached_tokens))
-                seqlen_k = seqlen
-                cu_seqlens_q.append(int(cu_seqlens_q[-1]) + seqlen_q)
-                cu_seqlens_k.append(int(cu_seqlens_k[-1]) + seqlen_k)
-                max_seqlen_q = max(max_seqlen_q, seqlen_q)
-                max_seqlen_k = max(max_seqlen_k, seqlen_k)
                 for i in range(int(seq.num_cached_blocks), int(seq.num_blocks)):
                     start = int(seq.block_table[i]) * int(self._config.kv_cache_block_size)
                     if i != int(seq.num_blocks) - 1:
                         end = start + int(self._config.kv_cache_block_size)
                     else:
                         end = start + int(seq.last_block_num_tokens)
-                    slot_mapping.extend(range(start, end))
-            if int(cu_seqlens_q[-1]) != int(len(input_ids)):
+                    n = int(end - start)
+                    slot_mapping[slot_off: slot_off + n] = np.arange(start, end, dtype=np.int32)
+                    slot_off += n
+            if int(cu_seqlens_q[-1]) != int(ntoken):
                 raise ValueError("sum(seqlen_q) must equal ntoken")
-            if len(slot_mapping) != int(len(input_ids)):
+            if int(slot_off) != int(ntoken):
                 raise ValueError("slot_mapping length must equal ntoken")
 
             block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
@@ -895,8 +948,8 @@ class GPUModelRunner:
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_q=cu_seqlens_q.tolist(),
+                cu_seqlens_k=cu_seqlens_k.tolist(),
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=int(max_seqlen_k),
                 slot_mapping=slot_mapping,
@@ -912,9 +965,18 @@ class GPUModelRunner:
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/decode"):
             is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
-            input_ids: list[int] = [int(seq.last_token) for seq in seqs]
-            positions: list[int] = [max(0, int(len(seq) - 1)) for seq in seqs]
-            scheduled_token_counts: list[int] = [1] * len(seqs)
+            nseq = len(seqs)
+            if nseq <= 0:
+                return None
+            input_ids = np.empty((nseq,), dtype=np.int64)
+            positions = np.empty((nseq,), dtype=np.int64)
+            seqlens_k = np.empty((nseq,), dtype=np.int32)
+            for i, seq in enumerate(seqs):
+                seqlen = int(len(seq))
+                input_ids[i] = int(seq.last_token)
+                positions[i] = max(0, seqlen - 1)
+                seqlens_k[i] = int(seqlen)
+            scheduled_token_counts = np.ones((nseq,), dtype=np.int64)
             if len(input_ids) <= 0:
                 return None
 
@@ -928,26 +990,27 @@ class GPUModelRunner:
                 prepared.phase = int(AttentionPhase.DECODE)
                 return prepared
 
-            cu_seqlens_q = [0]
-            cu_seqlens_k = [0]
+            cu_seqlens_q = np.arange(nseq + 1, dtype=np.int32)
+            cu_seqlens_k = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int32),
+                    np.cumsum(seqlens_k, dtype=np.int32),
+                )
+            )
             max_seqlen_q = 1
-            max_seqlen_k = 0
-            slot_mapping: list[int] = []
-            for seq in seqs:
+            max_seqlen_k = int(seqlens_k.max())
+            slot_mapping = np.empty((nseq,), dtype=np.int32)
+            for i, seq in enumerate(seqs):
                 if not seq.block_table:
                     raise ValueError("BLOCK layout requires non-empty block_table for every scheduled sequence")
-                seqlen_k = int(len(seq))
-                cu_seqlens_q.append(int(cu_seqlens_q[-1]) + 1)
-                cu_seqlens_k.append(int(cu_seqlens_k[-1]) + seqlen_k)
-                max_seqlen_k = max(max_seqlen_k, seqlen_k)
-                slot_mapping.append(
+                slot_mapping[i] = (
                     int(seq.block_table[-1]) * int(self._config.kv_cache_block_size)
                     + int(seq.last_block_num_tokens)
                     - 1
                 )
             if int(cu_seqlens_q[-1]) != int(len(input_ids)):
                 raise ValueError("sum(seqlen_q) must equal ntoken")
-            if len(slot_mapping) != int(len(input_ids)):
+            if int(slot_mapping.shape[0]) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
             block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
@@ -957,8 +1020,8 @@ class GPUModelRunner:
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_q=cu_seqlens_q.tolist(),
+                cu_seqlens_k=cu_seqlens_k.tolist(),
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=int(max_seqlen_k),
                 slot_mapping=slot_mapping,
