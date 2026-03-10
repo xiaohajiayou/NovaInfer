@@ -4,11 +4,12 @@ import pytest
 
 import llaisys
 from llaisys.engine.buffers import CpuGpuBuffer
+from llaisys.engine.config import EngineConfig
 from llaisys.engine.cpu_model_runner import CPUModelRunner
-from llaisys.engine.gpu_input_batch import InputBatch
-from llaisys.engine.gpu_model_runner import GPUModelRunner, _ExecuteModelState
+from llaisys.engine.gpu_model_runner import GPUModelRunner
 from llaisys.engine.sequence import Sequence
 from llaisys.engine.types import SamplingParams
+from llaisys.libllaisys.model import KvCacheLayout
 
 
 class _FakeSampler:
@@ -34,15 +35,15 @@ class _FakeRuntimeAPI:
 
 def _make_state(n: int, seq_ids: list[int]):
     logits = llaisys.Tensor((n, 4), llaisys.DataType.F32, llaisys.DeviceType.CPU, 0)
-    return _ExecuteModelState(
-        logits=logits,
-        sampled_seq_ids=seq_ids,
-        keepalive=[],
-        temperatures=[1.0] * n,
-        top_ps=[1.0] * n,
-        top_ks=[0] * n,
-        seeds=[0] * n,
-        has_seeds=[0] * n,
+    return (
+        logits,
+        len(seq_ids),
+        [],
+        [1.0] * n,
+        [1.0] * n,
+        [0] * n,
+        [0] * n,
+        [0] * n,
     )
 
 
@@ -85,27 +86,26 @@ def test_sample_tokens_cpu_gpu_runner_semantics_match():
 
 def test_cpu_runner_block_metadata_capacity_guard():
     runner = CPUModelRunner.__new__(CPUModelRunner)
-    runner.input_batch = InputBatch(max_num_reqs=2, max_num_batched_tokens=4, max_block_table_width=1)
+    runner._config = EngineConfig(
+        kv_cache_layout=KvCacheLayout.BLOCK,
+        kv_cache_block_size=1,
+    )
+    runner._max_num_reqs = 2
+    runner._max_num_tokens = 4
+    runner._max_block_table_width = 1
+    runner._input_ids_buf = llaisys.Tensor((4,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._pos_ids_buf = llaisys.Tensor((4,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._seq_ids_buf = llaisys.Tensor((4,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._output_ids_buf = llaisys.Tensor((4,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._cu_seqlens_q_buf = llaisys.Tensor((3,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cu_seqlens_k_buf = llaisys.Tensor((3,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._slot_mapping_buf = llaisys.Tensor((4,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._block_tables_buf = llaisys.Tensor((2,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
     sp = SamplingParams(max_new_tokens=1, top_k=1, top_p=1.0, temperature=1.0)
     seq1 = Sequence(seq_id=1, token_ids=[1, 2], sampling_params=sp, block_size=1)
     seq2 = Sequence(seq_id=2, token_ids=[3], sampling_params=sp, block_size=1)
-    seq1.block_table = [7]
+    seq1.block_table = [7, 8]
     seq2.block_table = [8]
-    runner.input_batch.scheduled_seqs = [seq1, seq2]
-    runner.input_batch.seq_id_to_index = {1: 0, 2: 1}
-    runner.input_batch.req_num_scheduled_tokens_step = [2, 1]
-    runner.input_batch.req_num_computed_tokens_step = [0, 0]
-    runner.input_batch.block_table_width = 1
-    runner.input_batch.block_table_cpu[0, 0] = 7
-    runner.input_batch.block_table_cpu[1, 0] = 8
 
-    seq_ids = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-    pos_ids_host = llaisys.Tensor((2,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
-
-    with pytest.raises(ValueError, match="sum\\(req_num_scheduled_tokens\\)"):
-        runner._build_attention_metadata(
-            ntoken=2,
-            seq_ids=seq_ids,
-            pos_ids_host=pos_ids_host,
-            is_block_layout=True,
-        )
+    with pytest.raises(RuntimeError, match="n_block_elems exceeds configured BLOCK metadata capacity"):
+        runner.prepare_prefill([seq1, seq2])

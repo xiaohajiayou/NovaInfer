@@ -16,6 +16,7 @@ using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
 
 bool attention_mode_supported(llaisysDeviceType_t device_type, int32_t mode) {
     if (mode == ATTENTION_MODE_BLOCK) {
+        (void)device_type;
         return true;
     }
     if (mode == ATTENTION_MODE_SLOT) {
@@ -28,6 +29,10 @@ bool attention_mode_supported(llaisysDeviceType_t device_type, int32_t mode) {
         return true;
     }
     return false;
+}
+
+bool attention_phase_valid(int32_t phase) {
+    return phase == ATTENTION_PHASE_PREFILL || phase == ATTENTION_PHASE_DECODE;
 }
 
 tensor_t kv_layer_k_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
@@ -355,12 +360,12 @@ tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::ve
     return buffer->slice(0, 0, len);
 }
 
-tensor_t Qwen2Model::run_attention_layer_(size_t layer,
-                                          size_t ntoken,
-                                          const tensor_t &attn_normed,
-                                          const tensor_t &pos_ids,
-                                          const AttentionExecState &attn_state) {
-    LLAISYS_NVTX_SCOPE("forward/attention_layer");
+tensor_t Qwen2Model::run_slot_attention_layer_(size_t layer,
+                                               size_t ntoken,
+                                               const tensor_t &attn_normed,
+                                               const tensor_t &pos_ids,
+                                               const AttentionExecState &attn_state) {
+    LLAISYS_NVTX_SCOPE("forward/attention_layer_slot");
     const auto &ws = workspace_->view();
     const size_t nh = meta_.nh;
     const size_t nkvh = meta_.nkvh;
@@ -391,75 +396,137 @@ tensor_t Qwen2Model::run_attention_layer_(size_t layer,
 
     tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
     tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
-#ifdef ENABLE_NVIDIA_API
-    if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
-        CHECK_ARGUMENT(attn_state.slot_mapping != nullptr, "Qwen2: missing slot_mapping");
-        {
-            LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
-            ops::cuda::reshape_and_cache(
-                layer_k_cache, layer_v_cache, rope_k, v_new_3d, attn_state.slot_mapping);
-        }
-    } else
-#endif
+    CHECK_ARGUMENT(attn_state.slot_idxs.size() >= ntoken, "Qwen2: slot_idxs size mismatch");
     {
-        const auto *slot_map =
-            attn_state.paged_attention ? reinterpret_cast<const int32_t *>(attn_state.slot_mapping->data()) : nullptr;
         LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
         for (size_t i = 0; i < ntoken; ++i) {
-            const int32_t slot = attn_state.paged_attention ? slot_map[i] : attn_state.slot_idxs[i];
+            const int32_t slot = attn_state.slot_idxs[i];
             copy_token_into_cache_(layer_k_cache, slot, rope_k, i);
             copy_token_into_cache_(layer_v_cache, slot, v_new_3d, i);
         }
     }
 
     tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
-    if (attn_state.paged_attention) {
+    const size_t kvlen = attn_state.used_slots.size();
+    tensor_t k_full = gather_cache_by_slots_(layer_k_cache, attn_state.used_slots, kvlen, ws.k_ctx);
+    tensor_t v_full = gather_cache_by_slots_(layer_v_cache, attn_state.used_slots, kvlen, ws.v_ctx);
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/core");
+        ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_state.attn_mask, scale);
+    }
+    return attn_out->view({ntoken, nh * dh});
+}
+
+tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
+                                                size_t ntoken,
+                                                const tensor_t &attn_normed,
+                                                const tensor_t &pos_ids,
+                                                const AttentionExecState &attn_state) {
+    LLAISYS_NVTX_SCOPE("forward/attention_layer_block");
+    const auto &ws = workspace_->view();
+    const size_t nh = meta_.nh;
+    const size_t nkvh = meta_.nkvh;
+    const size_t dh = meta_.dh;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
+
+    tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
+    tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
+    tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/qkv_proj");
+        ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
+        ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
+        ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
+    }
+
+    tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
+    tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
+    tensor_t v_new_3d = view_2d_to_3d_(v_proj, ntoken, nkvh, dh);
+
+    tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
+    tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/rope");
+        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
+        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
+    }
+
+    tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
+    tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
+    CHECK_ARGUMENT(attn_state.slot_mapping != nullptr, "Qwen2: missing slot_mapping");
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
 #ifdef ENABLE_NVIDIA_API
         if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
-            const ops::cuda::CommonAttentionMetadata prepared{
-                reinterpret_cast<const int32_t *>(attn_state.q_seq_rows->data()),
-                reinterpret_cast<const int32_t *>(attn_state.q_pos->data()),
-                reinterpret_cast<const int32_t *>(attn_state.block_tables->data()),
-                reinterpret_cast<const int32_t *>(attn_state.seq_lens->data()),
-                static_cast<int32_t>(attn_state.seq_lens->shape()[0]),
-            };
-            {
-                LLAISYS_NVTX_SCOPE("forward/attn/core");
-                ops::cuda::dispatch_attention_with_backend(
-                    attn_out,
-                    rope_q,
-                    layer_k_cache,
-                    layer_v_cache,
-                    prepared,
-                    paged_attn_backend_,
-                    attn_state.block_table_width,
-                    static_cast<int32_t>(runtime_.kv_block_size),
-                    scale);
-            }
+            ops::cuda::reshape_and_cache(
+                layer_k_cache, layer_v_cache, rope_k, v_new_3d, attn_state.slot_mapping);
         } else
 #endif
         {
-            LLAISYS_NVTX_SCOPE("forward/attn/core");
+            const auto *slot_map = reinterpret_cast<const int32_t *>(attn_state.slot_mapping->data());
+            for (size_t i = 0; i < ntoken; ++i) {
+                const int32_t slot = slot_map[i];
+                CHECK_ARGUMENT(slot >= 0, "Qwen2: invalid slot_mapping value");
+                copy_token_into_cache_(layer_k_cache, slot, rope_k, i);
+                copy_token_into_cache_(layer_v_cache, slot, v_new_3d, i);
+            }
+        }
+    }
+
+    tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
+    {
+        LLAISYS_NVTX_SCOPE("forward/attn/core");
+#ifdef ENABLE_NVIDIA_API
+        if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+            const ops::cuda::CommonAttentionMetadata prepared{
+                reinterpret_cast<const int32_t *>(attn_state.cu_seqlens_q != nullptr ? attn_state.cu_seqlens_q->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.cu_seqlens_k != nullptr ? attn_state.cu_seqlens_k->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.block_tables != nullptr ? attn_state.block_tables->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.slot_mapping != nullptr ? attn_state.slot_mapping->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.cudnn_seq_lens_q != nullptr ? attn_state.cudnn_seq_lens_q->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.cudnn_seq_lens_kv != nullptr ? attn_state.cudnn_seq_lens_kv->data() : nullptr),
+                reinterpret_cast<const int32_t *>(attn_state.cudnn_page_table != nullptr ? attn_state.cudnn_page_table->data() : nullptr),
+                reinterpret_cast<const int32_t *>(
+                    attn_state.cudnn_qo_ragged_offset != nullptr ? attn_state.cudnn_qo_ragged_offset->data() : nullptr),
+                int(attn_state.cudnn_b_exec),
+                int(attn_state.n_batch_seq),
+                int(attn_state.max_seqlen_q),
+                int(attn_state.max_seqlen_k),
+                static_cast<ops::cuda::AttentionPhase>(attn_state.attention_phase),
+            };
+            const bool use_cudnn_decode =
+                attn_state.use_cudnn_backend && attn_state.attention_phase == ATTENTION_PHASE_DECODE;
+            const auto backend =
+                use_cudnn_decode ? paged_attn_backend_ : ops::cuda::PagedAttentionBackend::NATIVE;
+            ops::cuda::dispatch_attention_with_backend(
+                attn_out,
+                rope_q,
+                layer_k_cache,
+                layer_v_cache,
+                prepared,
+                backend,
+                attn_state.block_table_width,
+                static_cast<int32_t>(runtime_.kv_block_size),
+                scale);
+        } else
+#endif
+        {
+            CHECK_ARGUMENT(attn_state.cu_seqlens_q != nullptr && attn_state.cu_seqlens_k != nullptr && attn_state.block_tables != nullptr,
+                           "Qwen2: missing native BLOCK metadata");
             ops::self_attention_paged(
                 attn_out,
                 rope_q,
                 layer_k_cache,
                 layer_v_cache,
-                attn_state.q_seq_rows,
-                attn_state.q_pos,
+                attn_state.cu_seqlens_q,
+                attn_state.cu_seqlens_k,
                 attn_state.block_tables,
-                attn_state.seq_lens,
+                attn_state.slot_mapping,
+                attn_state.max_seqlen_q,
+                attn_state.max_seqlen_k,
                 attn_state.block_table_width,
                 static_cast<int32_t>(runtime_.kv_block_size),
                 scale);
-        }
-    } else {
-        const size_t kvlen = attn_state.used_slots.size();
-        tensor_t k_full = gather_cache_by_slots_(layer_k_cache, attn_state.used_slots, kvlen, ws.k_ctx);
-        tensor_t v_full = gather_cache_by_slots_(layer_v_cache, attn_state.used_slots, kvlen, ws.v_ctx);
-        {
-            LLAISYS_NVTX_SCOPE("forward/attn/core");
-            ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_state.attn_mask, scale);
         }
     }
     return attn_out->view({ntoken, nh * dh});
@@ -551,42 +618,105 @@ int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMe
                                                              AttentionExecState *state) {
     LLAISYS_NVTX_SCOPE("attn_meta/block/validate");
     ASSERT(state != nullptr, "Qwen2: attention state is null");
-    auto validate_block_meta_tensor_1d = [this, ntoken](llaisysTensor_t handle, llaisysDataType_t dtype, const char *name) -> tensor_t {
+    auto validate_block_meta_tensor_1d = [this](llaisysTensor_t handle, llaisysDataType_t dtype, const char *name) -> tensor_t {
         CHECK_ARGUMENT(handle != nullptr && handle->tensor != nullptr, "Qwen2: missing BLOCK attention metadata tensor");
         tensor_t t = handle->tensor;
         CHECK_ARGUMENT(t->ndim() == 1, "Qwen2: BLOCK metadata ndim mismatch");
         CHECK_ARGUMENT(t->dtype() == dtype, "Qwen2: BLOCK metadata dtype mismatch");
         CHECK_ARGUMENT(t->isContiguous(), "Qwen2: BLOCK metadata must be contiguous");
-        CHECK_ARGUMENT(t->shape()[0] == ntoken, "Qwen2: BLOCK metadata token length mismatch");
         CHECK_ARGUMENT(t->deviceType() == device_type_ && t->deviceId() == device_id_, "Qwen2: BLOCK metadata device mismatch");
         (void)name;
         return t;
     };
 
-    state->q_seq_rows = validate_block_meta_tensor_1d(attn.q_seq_rows, LLAISYS_DTYPE_I32, "q_seq_rows");
-    state->q_pos = validate_block_meta_tensor_1d(attn.q_pos, LLAISYS_DTYPE_I32, "q_pos");
-    state->slot_mapping = validate_block_meta_tensor_1d(attn.slot_mapping, LLAISYS_DTYPE_I32, "slot_mapping");
+    bool want_cudnn_backend = false;
+#ifdef ENABLE_NVIDIA_API
+    want_cudnn_backend = (device_type_ == LLAISYS_DEVICE_NVIDIA) &&
+                         (paged_attn_backend_ == ops::cuda::PagedAttentionBackend::CUDNN);
+#endif
+    const auto has_tensor = [](llaisysTensor_t handle) -> bool {
+        return handle != nullptr && handle->tensor != nullptr;
+    };
+    const bool has_cudnn_meta =
+        has_tensor(attn.cudnn_seq_lens_q) &&
+        has_tensor(attn.cudnn_seq_lens_kv) &&
+        has_tensor(attn.cudnn_page_table) &&
+        (attn.phase != ATTENTION_PHASE_PREFILL || has_tensor(attn.cudnn_qo_ragged_offset));
+    const bool use_cudnn_backend = want_cudnn_backend && has_cudnn_meta;
+    state->use_cudnn_backend = use_cudnn_backend;
 
-    CHECK_ARGUMENT(attn.context_lens != nullptr && attn.context_lens->tensor != nullptr, "Qwen2: missing context_lens");
-    state->seq_lens = attn.context_lens->tensor;
-    CHECK_ARGUMENT(state->seq_lens->ndim() == 1 && state->seq_lens->dtype() == LLAISYS_DTYPE_I32 && state->seq_lens->isContiguous(),
-                   "Qwen2: context_lens must be contiguous i32 1D");
-    CHECK_ARGUMENT(state->seq_lens->deviceType() == device_type_ && state->seq_lens->deviceId() == device_id_,
-                   "Qwen2: context_lens device mismatch");
+    state->max_seqlen_q = int(attn.max_seqlen_q);
+    state->max_seqlen_k = int(attn.max_seqlen_k);
+    CHECK_ARGUMENT(state->max_seqlen_q > 0, "Qwen2: invalid max_seqlen_q");
+    CHECK_ARGUMENT(state->max_seqlen_k > 0, "Qwen2: invalid max_seqlen_k");
+    CHECK_ARGUMENT(attention_phase_valid(attn.phase), "Qwen2: invalid attention phase");
+    state->attention_phase = int(attn.phase);
+    if (state->attention_phase == ATTENTION_PHASE_DECODE) {
+        CHECK_ARGUMENT(state->max_seqlen_q == 1, "Qwen2: decode BLOCK phase requires max_seqlen_q == 1");
+    }
+
+    state->slot_mapping = validate_block_meta_tensor_1d(attn.slot_mapping, LLAISYS_DTYPE_I32, "slot_mapping");
+    CHECK_ARGUMENT(state->slot_mapping->shape()[0] == ntoken, "Qwen2: slot_mapping token length mismatch");
 
     state->block_table_width = attn.block_table_width;
     CHECK_ARGUMENT(state->block_table_width > 0, "Qwen2: invalid block_table_width");
-    const int32_t n_batch_seq = static_cast<int32_t>(state->seq_lens->shape()[0]);
-    CHECK_ARGUMENT(n_batch_seq > 0, "Qwen2: empty BLOCK batch");
 
     CHECK_ARGUMENT(attn.block_tables != nullptr && attn.block_tables->tensor != nullptr, "Qwen2: missing block_tables");
     state->block_tables = attn.block_tables->tensor;
-    const size_t block_table_len = static_cast<size_t>(n_batch_seq) * static_cast<size_t>(state->block_table_width);
+    CHECK_ARGUMENT(state->block_tables->ndim() == 1 && state->block_tables->dtype() == LLAISYS_DTYPE_I32 &&
+                       state->block_tables->isContiguous(),
+                   "Qwen2: invalid block_tables");
+    CHECK_ARGUMENT((state->block_tables->shape()[0] % static_cast<size_t>(state->block_table_width)) == 0,
+                   "Qwen2: block_tables length not divisible by block_table_width");
+    state->n_batch_seq = static_cast<int32_t>(state->block_tables->shape()[0] / static_cast<size_t>(state->block_table_width));
+    CHECK_ARGUMENT(state->n_batch_seq > 0, "Qwen2: empty BLOCK batch");
+    const size_t block_table_len = static_cast<size_t>(state->n_batch_seq) * static_cast<size_t>(state->block_table_width);
     CHECK_ARGUMENT(state->block_tables->ndim() == 1 && state->block_tables->dtype() == LLAISYS_DTYPE_I32 &&
                        state->block_tables->isContiguous() && state->block_tables->shape()[0] == block_table_len,
                    "Qwen2: invalid block_tables");
     CHECK_ARGUMENT(state->block_tables->deviceType() == device_type_ && state->block_tables->deviceId() == device_id_,
                    "Qwen2: block_tables device mismatch");
+
+    if (use_cudnn_backend) {
+        state->cu_seqlens_q = nullptr;
+        state->cu_seqlens_k = nullptr;
+        state->cudnn_seq_lens_q = validate_block_meta_tensor_1d(attn.cudnn_seq_lens_q, LLAISYS_DTYPE_I32, "cudnn_seq_lens_q");
+        state->cudnn_seq_lens_kv = validate_block_meta_tensor_1d(attn.cudnn_seq_lens_kv, LLAISYS_DTYPE_I32, "cudnn_seq_lens_kv");
+        state->cudnn_page_table = validate_block_meta_tensor_1d(attn.cudnn_page_table, LLAISYS_DTYPE_I32, "cudnn_page_table");
+        state->cudnn_qo_ragged_offset = nullptr;
+        state->cudnn_b_exec = int(attn.cudnn_b_exec);
+        CHECK_ARGUMENT(state->cudnn_b_exec > 0, "Qwen2: invalid cudnn_b_exec");
+        CHECK_ARGUMENT(state->cudnn_seq_lens_q->shape()[0] == static_cast<size_t>(state->cudnn_b_exec),
+                       "Qwen2: cudnn_seq_lens_q size mismatch");
+        CHECK_ARGUMENT(state->cudnn_seq_lens_kv->shape()[0] == static_cast<size_t>(state->cudnn_b_exec),
+                       "Qwen2: cudnn_seq_lens_kv size mismatch");
+        CHECK_ARGUMENT(
+            state->cudnn_page_table->shape()[0] ==
+                static_cast<size_t>(state->cudnn_b_exec) * static_cast<size_t>(state->block_table_width),
+            "Qwen2: cudnn_page_table size mismatch");
+        if (state->attention_phase == ATTENTION_PHASE_PREFILL) {
+            state->cudnn_qo_ragged_offset =
+                validate_block_meta_tensor_1d(attn.cudnn_qo_ragged_offset, LLAISYS_DTYPE_I32, "cudnn_qo_ragged_offset");
+            CHECK_ARGUMENT(
+                state->cudnn_qo_ragged_offset->shape()[0] == static_cast<size_t>(state->cudnn_b_exec + 1),
+                "Qwen2: cudnn_qo_ragged_offset size mismatch");
+        }
+    } else {
+        state->cudnn_seq_lens_q = nullptr;
+        state->cudnn_seq_lens_kv = nullptr;
+        state->cudnn_page_table = nullptr;
+        state->cudnn_qo_ragged_offset = nullptr;
+        state->cudnn_b_exec = 0;
+
+        state->cu_seqlens_q = validate_block_meta_tensor_1d(attn.cu_seqlens_q, LLAISYS_DTYPE_I32, "cu_seqlens_q");
+        CHECK_ARGUMENT(state->cu_seqlens_q->shape()[0] >= 2, "Qwen2: cu_seqlens_q must have at least 2 elements");
+        const int32_t n_batch_seq_from_cu = static_cast<int32_t>(state->cu_seqlens_q->shape()[0]) - 1;
+        CHECK_ARGUMENT(n_batch_seq_from_cu == state->n_batch_seq, "Qwen2: cu_seqlens_q batch size mismatch with block_tables");
+
+        state->cu_seqlens_k = validate_block_meta_tensor_1d(attn.cu_seqlens_k, LLAISYS_DTYPE_I32, "cu_seqlens_k");
+        CHECK_ARGUMENT(state->cu_seqlens_k->shape()[0] == static_cast<size_t>(n_batch_seq_from_cu + 1),
+                       "Qwen2: cu_seqlens_k size mismatch");
+    }
 
     state->paged_attention = true;
     return 0;
@@ -628,6 +758,9 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         if (input.attention.mode != ATTENTION_MODE_SLOT && input.attention.mode != ATTENTION_MODE_BLOCK) {
             return fail("invalid attention mode");
         }
+        if (!attention_phase_valid(input.attention.phase)) {
+            return fail("invalid attention phase");
+        }
         if (!attention_mode_supported(device_type_, input.attention.mode)) {
             return fail("attention mode unsupported");
         }
@@ -668,9 +801,6 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             return fail("missing logits_indices");
         }
         tensor_t logits_indices = input.logits_indices->tensor;
-        if (logits_indices == nullptr) {
-            return fail("null logits_indices tensor");
-        }
         if (logits_indices->ndim() != 1 || logits_indices->dtype() != LLAISYS_DTYPE_I64 || !logits_indices->isContiguous()) {
             return fail("invalid logits_indices");
         }
@@ -695,19 +825,22 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         }
 
         AttentionExecState attn_state{};
-        attn_state = AttentionExecState{};
-        int32_t attn_rc = 0;
         {
             LLAISYS_NVTX_SCOPE("forward/prepare_attention_state");
             if (input.attention.mode == ATTENTION_MODE_SLOT) {
-                attn_rc = prepare_slot_attention_state_(ntoken, seq_ids_t, pos_ids_host_t, &attn_state);
+                const int32_t rc = prepare_slot_attention_state_(ntoken, seq_ids_t, pos_ids_host_t, &attn_state);
+                if (rc != 0) {
+                    std::cerr << "[Qwen2Model::forward] prepare slot attention state rc=" << rc << std::endl;
+                    return rc;
+                }
+                attn_state.attention_phase = int(input.attention.phase);
             } else {
-                attn_rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
+                const int32_t rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
+                if (rc != 0) {
+                    std::cerr << "[Qwen2Model::forward] bind block attention state rc=" << rc << std::endl;
+                    return rc;
+                }
             }
-        }
-        if (attn_rc != 0) {
-            std::cerr << "[Qwen2Model::forward] prepare attention state rc=" << attn_rc << std::endl;
-            return attn_rc;
         }
 
         for (size_t layer = 0; layer < meta_.nlayer; ++layer) {
@@ -715,12 +848,22 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
             ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
 
-            tensor_t attn_out_2d = run_attention_layer_(
-                layer,
-                ntoken,
-                attn_normed,
-                pos_ids,
-                attn_state);
+            tensor_t attn_out_2d{};
+            if (input.attention.mode == ATTENTION_MODE_SLOT) {
+                attn_out_2d = run_slot_attention_layer_(
+                    layer,
+                    ntoken,
+                    attn_normed,
+                    pos_ids,
+                    attn_state);
+            } else {
+                attn_out_2d = run_block_attention_layer_(
+                    layer,
+                    ntoken,
+                    attn_normed,
+                    pos_ids,
+                    attn_state);
+            }
             tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
             {
                 LLAISYS_NVTX_SCOPE("forward/layer/attn_out_proj");

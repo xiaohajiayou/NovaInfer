@@ -98,10 +98,12 @@ void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
                           tensor_t v_cache,
-                          tensor_t q_seq_rows,
-                          tensor_t q_pos,
+                          tensor_t cu_seqlens_q,
+                          tensor_t cu_seqlens_k,
                           tensor_t block_tables,
-                          tensor_t seq_lens,
+                          tensor_t slot_mapping,
+                          int32_t max_seqlen_q,
+                          int32_t max_seqlen_k,
                           int32_t block_table_width,
                           int32_t block_size,
                           float scale) {
@@ -120,22 +122,25 @@ void self_attention_paged(tensor_t attn_val,
            "SelfAttentionPaged: all tensors must be contiguous.");
     ASSERT(block_table_width > 0, "SelfAttentionPaged: block_table_width must be > 0.");
     ASSERT(block_size > 0, "SelfAttentionPaged: block_size must be > 0.");
-    ASSERT(q_seq_rows != nullptr && q_pos != nullptr && block_tables != nullptr && seq_lens != nullptr,
+    ASSERT(max_seqlen_q > 0 && max_seqlen_k > 0, "SelfAttentionPaged: max_seqlen must be > 0.");
+    ASSERT(cu_seqlens_q != nullptr && cu_seqlens_k != nullptr && block_tables != nullptr && slot_mapping != nullptr,
            "SelfAttentionPaged: metadata tensors must be non-null.");
-    ASSERT(q_seq_rows->deviceType() == LLAISYS_DEVICE_CPU && q_pos->deviceType() == LLAISYS_DEVICE_CPU &&
-               block_tables->deviceType() == LLAISYS_DEVICE_CPU && seq_lens->deviceType() == LLAISYS_DEVICE_CPU,
-           "SelfAttentionPaged: metadata tensors must be CPU.");
-    ASSERT(q_seq_rows->dtype() == LLAISYS_DTYPE_I32 && q_pos->dtype() == LLAISYS_DTYPE_I32 &&
-               block_tables->dtype() == LLAISYS_DTYPE_I32 && seq_lens->dtype() == LLAISYS_DTYPE_I32,
+    ASSERT(cu_seqlens_q->deviceType() == q->deviceType() && cu_seqlens_k->deviceType() == q->deviceType() &&
+               block_tables->deviceType() == q->deviceType() && slot_mapping->deviceType() == q->deviceType(),
+           "SelfAttentionPaged: metadata device must match q.");
+    ASSERT(cu_seqlens_q->dtype() == LLAISYS_DTYPE_I32 && cu_seqlens_k->dtype() == LLAISYS_DTYPE_I32 &&
+               block_tables->dtype() == LLAISYS_DTYPE_I32 && slot_mapping->dtype() == LLAISYS_DTYPE_I32,
            "SelfAttentionPaged: metadata dtype must be I32.");
-    ASSERT(q_seq_rows->ndim() == 1 && q_pos->ndim() == 1 && block_tables->ndim() == 1 && seq_lens->ndim() == 1,
+    ASSERT(cu_seqlens_q->ndim() == 1 && cu_seqlens_k->ndim() == 1 && block_tables->ndim() == 1 && slot_mapping->ndim() == 1,
            "SelfAttentionPaged: metadata tensors must be 1-D.");
-    ASSERT(q_seq_rows->isContiguous() && q_pos->isContiguous() && block_tables->isContiguous() && seq_lens->isContiguous(),
+    ASSERT(cu_seqlens_q->isContiguous() && cu_seqlens_k->isContiguous() && block_tables->isContiguous() &&
+               slot_mapping->isContiguous(),
            "SelfAttentionPaged: metadata tensors must be contiguous.");
-    ASSERT(q_seq_rows->shape()[0] == q->shape()[0], "SelfAttentionPaged: q_seq_rows size mismatch.");
-    ASSERT(q_pos->shape()[0] == q->shape()[0], "SelfAttentionPaged: q_pos size mismatch.");
-    ASSERT(seq_lens->shape()[0] > 0, "SelfAttentionPaged: seq_lens must be non-empty.");
-    ASSERT(block_tables->shape()[0] == seq_lens->shape()[0] * static_cast<size_t>(block_table_width),
+    ASSERT(slot_mapping->shape()[0] == q->shape()[0], "SelfAttentionPaged: slot_mapping size mismatch.");
+    ASSERT(cu_seqlens_q->shape()[0] == cu_seqlens_k->shape()[0], "SelfAttentionPaged: cu_seqlens size mismatch.");
+    ASSERT(cu_seqlens_q->shape()[0] >= 2, "SelfAttentionPaged: cu_seqlens must have at least 2 elements.");
+    const size_t nseq = cu_seqlens_q->shape()[0] - 1;
+    ASSERT(block_tables->shape()[0] == nseq * static_cast<size_t>(block_table_width),
            "SelfAttentionPaged: block_tables size mismatch.");
     switch (attn_val->deviceType()) {
     case LLAISYS_DEVICE_CPU:
@@ -144,10 +149,12 @@ void self_attention_paged(tensor_t attn_val,
             q,
             k_cache,
             v_cache,
-            q_seq_rows,
-            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
             block_tables,
-            seq_lens,
+            slot_mapping,
+            max_seqlen_q,
+            max_seqlen_k,
             block_table_width,
             block_size,
             scale);
@@ -158,10 +165,12 @@ void self_attention_paged(tensor_t attn_val,
             q,
             k_cache,
             v_cache,
-            q_seq_rows,
-            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
             block_tables,
-            seq_lens,
+            slot_mapping,
+            max_seqlen_q,
+            max_seqlen_k,
             block_table_width,
             block_size,
             scale);

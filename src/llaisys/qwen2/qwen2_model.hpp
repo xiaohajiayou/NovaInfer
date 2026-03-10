@@ -109,13 +109,22 @@ private:
 #endif
     struct AttentionExecState {
         bool paged_attention{false};
+        bool use_cudnn_backend{false};
+        int32_t attention_phase{0}; // AttentionPhase::PREFILL
+        int32_t n_batch_seq{0};
         int32_t block_table_width{0};
+        int32_t max_seqlen_q{0};
+        int32_t max_seqlen_k{0};
         tensor_t attn_mask{};
-        tensor_t q_seq_rows{};
-        tensor_t q_pos{};
+        tensor_t cu_seqlens_q{};
+        tensor_t cu_seqlens_k{};
         tensor_t slot_mapping{};
-        tensor_t seq_lens{};
         tensor_t block_tables{};
+        tensor_t cudnn_seq_lens_q{};
+        tensor_t cudnn_seq_lens_kv{};
+        tensor_t cudnn_page_table{};
+        tensor_t cudnn_qo_ragged_offset{};
+        int32_t cudnn_b_exec{0};
         std::vector<int32_t> slot_idxs{};
         std::vector<int32_t> used_slots{};
     };
@@ -137,11 +146,16 @@ private:
                                                      AttentionExecState *state);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
-    tensor_t run_attention_layer_(size_t layer,
-                                  size_t ntoken,
-                                  const tensor_t &attn_normed,
-                                  const tensor_t &pos_ids,
-                                  const AttentionExecState &attn_state);
+    tensor_t run_slot_attention_layer_(size_t layer,
+                                       size_t ntoken,
+                                       const tensor_t &attn_normed,
+                                       const tensor_t &pos_ids,
+                                       const AttentionExecState &attn_state);
+    tensor_t run_block_attention_layer_(size_t layer,
+                                        size_t ntoken,
+                                        const tensor_t &attn_normed,
+                                        const tensor_t &pos_ids,
+                                        const AttentionExecState &attn_state);
 
     tensor_t create_zero_tensor_(const std::vector<size_t> &shape, llaisysDataType_t dtype) const;
 

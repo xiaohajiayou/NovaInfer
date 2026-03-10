@@ -261,10 +261,9 @@ void self_attention_paged_(
     const T* q,   // [seqlen, nhead, head_dim]
     const T* k_cache, // [nslot, nkvhead, head_dim]
     const T* v_cache, // [nslot, nkvhead, head_dim]
-    const int32_t* q_seq_rows, // [seqlen], query token -> seq row
-    const int32_t* q_pos, // [seqlen], query position in sequence
+    const int32_t* cu_seqlens_q, // [nseq+1]
+    const int32_t* cu_seqlens_k, // [nseq+1]
     const int32_t* block_tables, // [nseq, block_table_width]
-    const int32_t* seq_lens, // [nseq]
     int32_t nseq,
     int32_t block_table_width,
     int32_t block_size,
@@ -275,12 +274,34 @@ void self_attention_paged_(
     size_t head_dim,
     float scale)
 {
+    auto find_row_for_token = [cu_seqlens_q, nseq](size_t token_idx) -> int32_t {
+        int32_t lo = 0;
+        int32_t hi = nseq;
+        const int32_t t = static_cast<int32_t>(token_idx);
+        while (lo < hi) {
+            const int32_t mid = lo + (hi - lo) / 2;
+            if (cu_seqlens_q[mid + 1] <= t) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    };
     size_t group_size = nhead / nkvhead;
     for (size_t t = 0; t < seqlen; ++t) {
-        const int32_t row = q_seq_rows[t];
-        ASSERT(row >= 0 && row < nseq, "self_attention_paged: q_seq_rows out of range");
-        const int32_t seq_len = seq_lens[row];
-        const int32_t vmax = std::min<int32_t>(q_pos[t], seq_len - 1);
+        const int32_t row = find_row_for_token(t);
+        ASSERT(row >= 0 && row < nseq, "self_attention_paged: token->row out of range");
+        const int32_t row_start = cu_seqlens_q[row];
+        const int32_t row_end = cu_seqlens_q[row + 1];
+        const int32_t row_scheduled = row_end - row_start;
+        ASSERT(row_scheduled > 0, "self_attention_paged: invalid row schedule length");
+        const int32_t local = static_cast<int32_t>(t) - row_start;
+        ASSERT(local >= 0 && local < row_scheduled, "self_attention_paged: token row offset out of range");
+        const int32_t seq_len = cu_seqlens_k[row + 1] - cu_seqlens_k[row];
+        ASSERT(seq_len > 0, "self_attention_paged: invalid seq_len");
+        const int32_t q_pos = (seq_len - row_scheduled) + local;
+        const int32_t vmax = std::min<int32_t>(q_pos, seq_len - 1);
         const size_t n_visible = (vmax >= 0) ? (static_cast<size_t>(vmax) + 1) : 0;
 
         if (n_visible == 0) {
@@ -533,25 +554,28 @@ void self_attention_paged(tensor_t attn_val,
         tensor_t q,
         tensor_t k_cache,
         tensor_t v_cache,
-        tensor_t q_seq_rows_t,
-        tensor_t q_pos_t,
+        tensor_t cu_seqlens_q_t,
+        tensor_t cu_seqlens_k_t,
         tensor_t block_tables_t,
-        tensor_t seq_lens_t,
+        tensor_t slot_mapping_t,
+        int32_t max_seqlen_q,
+        int32_t max_seqlen_k,
         int32_t block_table_width,
         int32_t block_size,
         float scale) {
     CHECK_SAME_DEVICE(attn_val, q, k_cache, v_cache);
-    ASSERT(q_seq_rows_t != nullptr && q_pos_t != nullptr && block_tables_t != nullptr && seq_lens_t != nullptr,
+    ASSERT(cu_seqlens_q_t != nullptr && cu_seqlens_k_t != nullptr && block_tables_t != nullptr && slot_mapping_t != nullptr,
            "self_attention_paged: metadata tensors must be non-null");
-    ASSERT(q_seq_rows_t->deviceType() == LLAISYS_DEVICE_CPU && q_pos_t->deviceType() == LLAISYS_DEVICE_CPU &&
-               block_tables_t->deviceType() == LLAISYS_DEVICE_CPU && seq_lens_t->deviceType() == LLAISYS_DEVICE_CPU,
+    ASSERT(cu_seqlens_q_t->deviceType() == LLAISYS_DEVICE_CPU && block_tables_t->deviceType() == LLAISYS_DEVICE_CPU &&
+               cu_seqlens_k_t->deviceType() == LLAISYS_DEVICE_CPU && slot_mapping_t->deviceType() == LLAISYS_DEVICE_CPU,
            "self_attention_paged: metadata tensors must be CPU");
-    ASSERT(q_seq_rows_t->dtype() == LLAISYS_DTYPE_I32 && q_pos_t->dtype() == LLAISYS_DTYPE_I32 &&
-               block_tables_t->dtype() == LLAISYS_DTYPE_I32 && seq_lens_t->dtype() == LLAISYS_DTYPE_I32,
+    ASSERT(cu_seqlens_q_t->dtype() == LLAISYS_DTYPE_I32 && block_tables_t->dtype() == LLAISYS_DTYPE_I32 &&
+               cu_seqlens_k_t->dtype() == LLAISYS_DTYPE_I32 && slot_mapping_t->dtype() == LLAISYS_DTYPE_I32,
            "self_attention_paged: metadata dtype must be I32");
-    ASSERT(q_seq_rows_t->ndim() == 1 && q_pos_t->ndim() == 1 && block_tables_t->ndim() == 1 && seq_lens_t->ndim() == 1,
+    ASSERT(cu_seqlens_q_t->ndim() == 1 && block_tables_t->ndim() == 1 && cu_seqlens_k_t->ndim() == 1 && slot_mapping_t->ndim() == 1,
            "self_attention_paged: metadata tensors must be 1-D");
-    ASSERT(q_seq_rows_t->isContiguous() && q_pos_t->isContiguous() && block_tables_t->isContiguous() && seq_lens_t->isContiguous(),
+    ASSERT(cu_seqlens_q_t->isContiguous() && block_tables_t->isContiguous() && cu_seqlens_k_t->isContiguous() &&
+               slot_mapping_t->isContiguous(),
            "self_attention_paged: metadata tensors must be contiguous");
 
     ASSERT(attn_val->isContiguous() && q->isContiguous() &&
@@ -575,17 +599,18 @@ void self_attention_paged(tensor_t attn_val,
 
     ASSERT(block_table_width > 0, "self_attention_paged: block_table_width must be > 0");
     ASSERT(block_size > 0, "self_attention_paged: block_size must be > 0");
-    ASSERT(q_seq_rows_t->shape()[0] == seqlen, "self_attention_paged: q_seq_rows size mismatch");
-    ASSERT(q_pos_t->shape()[0] == seqlen, "self_attention_paged: q_pos size mismatch");
-    ASSERT(seq_lens_t->shape()[0] > 0, "self_attention_paged: seq_lens must be non-empty");
-    ASSERT(block_tables_t->shape()[0] == seq_lens_t->shape()[0] * static_cast<size_t>(block_table_width),
+    ASSERT(max_seqlen_q > 0 && max_seqlen_k > 0, "self_attention_paged: invalid max_seqlen");
+    ASSERT(slot_mapping_t->shape()[0] == seqlen, "self_attention_paged: slot_mapping size mismatch");
+    ASSERT(cu_seqlens_q_t->shape()[0] == cu_seqlens_k_t->shape()[0], "self_attention_paged: cu_seqlens size mismatch");
+    ASSERT(cu_seqlens_q_t->shape()[0] >= 2, "self_attention_paged: empty cu_seqlens");
+    const size_t nseq_size = cu_seqlens_q_t->shape()[0] - 1;
+    ASSERT(block_tables_t->shape()[0] == nseq_size * static_cast<size_t>(block_table_width),
            "self_attention_paged: block_tables size mismatch");
 
-    const auto *q_seq_rows = reinterpret_cast<const int32_t *>(q_seq_rows_t->data());
-    const auto *q_pos = reinterpret_cast<const int32_t *>(q_pos_t->data());
+    const auto *cu_seqlens_q = reinterpret_cast<const int32_t *>(cu_seqlens_q_t->data());
+    const auto *cu_seqlens_k = reinterpret_cast<const int32_t *>(cu_seqlens_k_t->data());
     const auto *block_tables = reinterpret_cast<const int32_t *>(block_tables_t->data());
-    const auto *seq_lens = reinterpret_cast<const int32_t *>(seq_lens_t->data());
-    const int32_t nseq = static_cast<int32_t>(seq_lens_t->shape()[0]);
+    const int32_t nseq = static_cast<int32_t>(nseq_size);
 
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
@@ -594,10 +619,9 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const float*>(q->data()),
             reinterpret_cast<const float*>(k_cache->data()),
             reinterpret_cast<const float*>(v_cache->data()),
-            q_seq_rows,
-            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
             block_tables,
-            seq_lens,
             nseq,
             block_table_width,
             block_size,
@@ -608,10 +632,9 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::bf16_t*>(q->data()),
             reinterpret_cast<const llaisys::bf16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::bf16_t*>(v_cache->data()),
-            q_seq_rows,
-            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
             block_tables,
-            seq_lens,
             nseq,
             block_table_width,
             block_size,
@@ -622,10 +645,9 @@ void self_attention_paged(tensor_t attn_val,
             reinterpret_cast<const llaisys::fp16_t*>(q->data()),
             reinterpret_cast<const llaisys::fp16_t*>(k_cache->data()),
             reinterpret_cast<const llaisys::fp16_t*>(v_cache->data()),
-            q_seq_rows,
-            q_pos,
+            cu_seqlens_q,
+            cu_seqlens_k,
             block_tables,
-            seq_lens,
             nseq,
             block_table_width,
             block_size,

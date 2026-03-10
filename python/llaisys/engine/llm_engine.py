@@ -4,6 +4,7 @@ from dataclasses import fields
 from typing import Dict, Sequence
 
 from ..libllaisys.model import KvCacheLayout
+from ..nvtx import nvtx_range
 from .config import EngineConfig
 from .executor import Executor
 from .model_registry import ModelRegistry
@@ -182,65 +183,73 @@ class LLMEngine:
         return req.request_id
 
     def step(self) -> list[GenerationOutput]:
-        sched = self._scheduler.schedule(max_num_seqs=self._max_batch_size)
-        if sched is None:
-            return []
+        with nvtx_range("py/engine/step"):
+            with nvtx_range("py/engine/step/schedule"):
+                sched = self._scheduler.schedule(max_num_seqs=self._max_batch_size)
+            if sched is None:
+                return []
 
-        completions: list[GenerationOutput] = []
-        for seq_id in list(sched.finished_seq_ids):
-            sid = int(seq_id)
-            req_key = self._request_id_by_seq_id.get(sid)
-            if req_key is None:
-                continue
-            req = self._requests.get(req_key)
-            seq = self._seq_by_id.get(sid)
-            if req is None or seq is None:
-                continue
-            if req.status in TERMINAL_REQUEST_STATUSES:
-                continue
-            finish_reason = str(seq.finish_reason or "aborted")
-            if finish_reason == "aborted" and req.error is None:
-                req.error = "prompt exceeds model/scheduler budget"
-            completions.append(
-                self._complete_request(seq, finish_reason)
-            )
+            completions: list[GenerationOutput] = []
+            with nvtx_range("py/engine/step/complete_finished"):
+                for seq_id in list(sched.finished_seq_ids):
+                    sid = int(seq_id)
+                    req_key = self._request_id_by_seq_id.get(sid)
+                    if req_key is None:
+                        continue
+                    req = self._requests.get(req_key)
+                    seq = self._seq_by_id.get(sid)
+                    if req is None or seq is None:
+                        continue
+                    if req.status in TERMINAL_REQUEST_STATUSES:
+                        continue
+                    finish_reason = str(seq.finish_reason or "aborted")
+                    if finish_reason == "aborted" and req.error is None:
+                        req.error = "prompt exceeds model/scheduler budget"
+                    completions.append(
+                        self._complete_request(seq, finish_reason)
+                    )
 
-        if not sched.scheduled_seqs:
-            if sched.finished_seq_ids:
-                self._executor.execute_scheduler_step(
-                    sched,
+            if not sched.scheduled_seqs:
+                if sched.finished_seq_ids:
+                    with nvtx_range("py/engine/step/execute_empty"):
+                        self._executor.execute_scheduler_step(
+                            sched,
+                        )
+                return completions
+
+            with nvtx_range("py/engine/step/transition_running"):
+                for seq in sched.scheduled_seqs:
+                    req_id = self._request_id_by_seq_id.get(int(seq.seq_id))
+                    if req_id is None:
+                        raise RuntimeError(f"missing request mapping for seq_id={seq.seq_id}")
+                    req = self._requests.get(req_id)
+                    if req is None:
+                        raise RuntimeError(f"missing request state for seq_id={seq.seq_id}")
+                    if req.status == RequestStatus.WAITING:
+                        self._transition(req, RequestStatus.RUNNING)
+
+            with nvtx_range("py/engine/step/execute"):
+                sampled_token_ids = self._executor.execute_scheduler_step(sched)
+            self._observe_runtime_kv_peak()
+            if sampled_token_ids is None:
+                return completions
+
+            with nvtx_range("py/engine/step/postprocess"):
+                self._scheduler.postprocess(
+                    sched.scheduled_seqs,
+                    sampled_token_ids,
+                    self._end_token_id,
                 )
+
+            with nvtx_range("py/engine/step/complete_scheduled"):
+                for seq in sched.scheduled_seqs:
+                    finish_reason = seq.finish_reason
+                    if finish_reason is not None:
+                        completions.append(
+                            self._complete_request(seq, finish_reason)
+                        )
+
             return completions
-
-        for seq in sched.scheduled_seqs:
-            req_id = self._request_id_by_seq_id.get(int(seq.seq_id))
-            if req_id is None:
-                raise RuntimeError(f"missing request mapping for seq_id={seq.seq_id}")
-            req = self._requests.get(req_id)
-            if req is None:
-                raise RuntimeError(f"missing request state for seq_id={seq.seq_id}")
-            if req.status == RequestStatus.WAITING:
-                self._transition(req, RequestStatus.RUNNING)
-
-        sampled_token_ids = self._executor.execute_scheduler_step(sched)
-        self._observe_runtime_kv_peak()
-        if sampled_token_ids is None:
-            return completions
-
-        self._scheduler.postprocess(
-            sched.scheduled_seqs,
-            sampled_token_ids,
-            self._end_token_id,
-        )
-
-        for seq in sched.scheduled_seqs:
-            finish_reason = seq.finish_reason
-            if finish_reason is not None:
-                completions.append(
-                    self._complete_request(seq, finish_reason)
-                )
-
-        return completions
 
     def collect(self, request_id: str) -> GenerationOutput | None:
         return self._finished_outputs.get(request_id)

@@ -218,10 +218,9 @@ __global__ void paged_attention_warp_kernel(T *out,
                                             const T *q,
                                             const T *k_cache,
                                             const T *v_cache,
-                                            const int32_t *q_seq_rows,
-                                            const int32_t *q_pos,
+                                            const int32_t *cu_seqlens_q,
                                             const int32_t *block_tables,
-                                            const int32_t *seq_lens,
+                                            const int32_t *cu_seqlens_k,
                                             std::int32_t seqlen,
                                             std::int32_t nslot,
                                             std::int32_t nseq,
@@ -248,16 +247,183 @@ __global__ void paged_attention_warp_kernel(T *out,
                                * static_cast<std::size_t>(head_dim);
     const T *q_ptr = q + q_base;
 
-    const int32_t row = q_seq_rows[t];
+    int32_t row = 0;
+    {
+        int32_t lo = 0;
+        int32_t hi = nseq;
+        while (lo < hi) {
+            const int32_t mid = lo + ((hi - lo) >> 1);
+            if (cu_seqlens_q[mid + 1] <= t) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        row = lo;
+    }
     if (row < 0 || row >= nseq) {
         return;
     }
-    const int32_t qpos = q_pos[t];
-    const int32_t seq_len = seq_lens[row];
+    const int32_t row_start = cu_seqlens_q[row];
+    const int32_t row_end = cu_seqlens_q[row + 1];
+    const int32_t row_scheduled = row_end - row_start;
+    if (row_scheduled <= 0) {
+        return;
+    }
+    const int32_t local = t - row_start;
+    if (local < 0 || local >= row_scheduled) {
+        return;
+    }
+    const int32_t seq_len = cu_seqlens_k[row + 1] - cu_seqlens_k[row];
+    if (seq_len <= 0) {
+        return;
+    }
+    const int32_t qpos = (seq_len - row_scheduled) + local;
     const int32_t vmax = min(qpos, seq_len - 1);
     if (vmax < 0) {
         return;
     }
+
+    float maxv = -FLT_MAX;
+    for (int32_t p = 0; p <= vmax; ++p) {
+        const int32_t bidx = p / block_size;
+        const int32_t boff = p % block_size;
+        if (bidx < 0 || bidx >= block_table_width) {
+            continue;
+        }
+        const int32_t bid = block_tables[row * block_table_width + bidx];
+        if (bid < 0) {
+            continue;
+        }
+        const int32_t slot = bid * block_size + boff;
+        if (slot < 0 || slot >= nslot) {
+            continue;
+        }
+        const std::size_t k_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead) + static_cast<std::size_t>(kvh))
+                                   * static_cast<std::size_t>(head_dim);
+        const T *k_ptr = k_cache + k_base;
+        float dot_local = 0.0f;
+        for (std::int32_t j = lane; j < head_dim; j += WARP) {
+            dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                         llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+        }
+        float dot = warp_sum(dot_local) * scale;
+        if (dot > maxv) {
+            maxv = dot;
+        }
+    }
+
+    float sum = 0.0f;
+    for (int32_t p = 0; p <= vmax; ++p) {
+        const int32_t bidx = p / block_size;
+        const int32_t boff = p % block_size;
+        if (bidx < 0 || bidx >= block_table_width) {
+            continue;
+        }
+        const int32_t bid = block_tables[row * block_table_width + bidx];
+        if (bid < 0) {
+            continue;
+        }
+        const int32_t slot = bid * block_size + boff;
+        if (slot < 0 || slot >= nslot) {
+            continue;
+        }
+        const std::size_t k_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead) + static_cast<std::size_t>(kvh))
+                                   * static_cast<std::size_t>(head_dim);
+        const T *k_ptr = k_cache + k_base;
+        float dot_local = 0.0f;
+        for (std::int32_t j = lane; j < head_dim; j += WARP) {
+            dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                         llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+        }
+        const float dot = warp_sum(dot_local) * scale;
+        sum += expf(dot - maxv);
+    }
+
+    T *out_ptr = out + q_base;
+    if (sum <= 0.0f) {
+        sum = 1.0f;
+    }
+    for (std::int32_t d = lane; d < head_dim; d += WARP) {
+        float acc = 0.0f;
+        for (int32_t p = 0; p <= vmax; ++p) {
+            const int32_t bidx = p / block_size;
+            const int32_t boff = p % block_size;
+            if (bidx < 0 || bidx >= block_table_width) {
+                continue;
+            }
+            const int32_t bid = block_tables[row * block_table_width + bidx];
+            if (bid < 0) {
+                continue;
+            }
+            const int32_t slot = bid * block_size + boff;
+            if (slot < 0 || slot >= nslot) {
+                continue;
+            }
+            const std::size_t k_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead)
+                                        + static_cast<std::size_t>(kvh))
+                                       * static_cast<std::size_t>(head_dim);
+            const std::size_t v_base = (static_cast<std::size_t>(slot) * static_cast<std::size_t>(nkvhead)
+                                        + static_cast<std::size_t>(kvh))
+                                       * static_cast<std::size_t>(head_dim);
+            const T *k_ptr = k_cache + k_base;
+            const T *v_ptr = v_cache + v_base;
+            float dot_local = 0.0f;
+            for (std::int32_t j = lane; j < head_dim; j += WARP) {
+                dot_local += llaisys::device::nvidia::dtype::to_float<T>(q_ptr[j]) *
+                             llaisys::device::nvidia::dtype::to_float<T>(k_ptr[j]);
+            }
+            const float dot = warp_sum(dot_local) * scale;
+            const float w = expf(dot - maxv) / sum;
+            acc += w * llaisys::device::nvidia::dtype::to_float<T>(v_ptr[d]);
+        }
+        out_ptr[d] = llaisys::device::nvidia::dtype::from_float<T>(acc);
+    }
+}
+
+template <typename T, int WARPS_PER_BLOCK>
+__global__ void paged_attention_decode_warp_kernel(T *out,
+                                                   const T *q,
+                                                   const T *k_cache,
+                                                   const T *v_cache,
+                                                   const int32_t *cu_seqlens_k,
+                                                   const int32_t *block_tables,
+                                                   std::int32_t seqlen,
+                                                   std::int32_t nslot,
+                                                   std::int32_t nseq,
+                                                   std::int32_t block_table_width,
+                                                   std::int32_t block_size,
+                                                   std::int32_t nhead,
+                                                   std::int32_t nkvhead,
+                                                   std::int32_t head_dim,
+                                                   float scale) {
+    constexpr int WARP = 32;
+    const int warp_id = static_cast<int>(threadIdx.x) / WARP;
+    const int lane = static_cast<int>(threadIdx.x) % WARP;
+    const std::int32_t idx = static_cast<std::int32_t>(blockIdx.x * WARPS_PER_BLOCK + warp_id);
+    const std::int32_t total = seqlen * nhead;
+    if (idx >= total) {
+        return;
+    }
+
+    const std::int32_t t = idx / nhead;
+    const std::int32_t qh = idx % nhead;
+    const std::int32_t group_size = nhead / nkvhead;
+    const std::int32_t kvh = qh / group_size;
+    const std::size_t q_base = (static_cast<std::size_t>(t) * static_cast<std::size_t>(nhead) + static_cast<std::size_t>(qh))
+                               * static_cast<std::size_t>(head_dim);
+    const T *q_ptr = q + q_base;
+
+    // Decode invariant: one scheduled token per sequence, and tokens are ordered by sequence row.
+    const int32_t row = t;
+    if (row < 0 || row >= nseq) {
+        return;
+    }
+    const int32_t seq_len = cu_seqlens_k[row + 1] - cu_seqlens_k[row];
+    if (seq_len <= 0) {
+        return;
+    }
+    const int32_t vmax = seq_len - 1;
 
     float maxv = -FLT_MAX;
     for (int32_t p = 0; p <= vmax; ++p) {
@@ -381,10 +547,9 @@ void launch_paged_attention_prepared(tensor_t attn_val,
         reinterpret_cast<const T *>(q->data()),
         reinterpret_cast<const T *>(k_cache->data()),
         reinterpret_cast<const T *>(v_cache->data()),
-        prepared.q_seq_rows,
-        prepared.q_pos,
+        prepared.cu_seqlens_q,
         prepared.block_tables,
-        prepared.seq_lens,
+        prepared.cu_seqlens_k,
         seqlen,
         nslot,
         nseq,
@@ -397,46 +562,64 @@ void launch_paged_attention_prepared(tensor_t attn_val,
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename T>
+void launch_paged_attention_decode_prepared(tensor_t attn_val,
+                                            tensor_t q,
+                                            tensor_t k_cache,
+                                            tensor_t v_cache,
+                                            const CommonAttentionMetadata &prepared,
+                                            std::int32_t block_table_width,
+                                            std::int32_t block_size,
+                                            float scale,
+                                            std::int32_t seqlen,
+                                            std::int32_t nslot,
+                                            std::int32_t nseq,
+                                            std::int32_t nhead,
+                                            std::int32_t nkvhead,
+                                            std::int32_t head_dim) {
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kBlock = kWarpsPerBlock * 32;
+    const int total = seqlen * nhead;
+    const int grid = (total + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    paged_attention_decode_warp_kernel<T, kWarpsPerBlock><<<grid, kBlock, 0, stream>>>(
+        reinterpret_cast<T *>(attn_val->data()),
+        reinterpret_cast<const T *>(q->data()),
+        reinterpret_cast<const T *>(k_cache->data()),
+        reinterpret_cast<const T *>(v_cache->data()),
+        prepared.cu_seqlens_k,
+        prepared.block_tables,
+        seqlen,
+        nslot,
+        nseq,
+        block_table_width,
+        block_size,
+        nhead,
+        nkvhead,
+        head_dim,
+        scale);
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
+bool is_decode_phase(const CommonAttentionMetadata &prepared) {
+    return prepared.phase == AttentionPhase::DECODE;
+}
+
+bool is_prefill_phase(const CommonAttentionMetadata &prepared) {
+    return prepared.phase == AttentionPhase::PREFILL;
+}
+
 #ifdef ENABLE_CUDNN_API
-struct CudnnPlanKey {
-    llaisysDataType_t dtype{LLAISYS_DTYPE_F32};
-    int64_t b{0};
-    int64_t nhead{0};
-    int64_t nkvhead{0};
-    int64_t head_dim{0};
-    int64_t nslot{0};
-    int32_t block_size{0};
-    int32_t block_table_capacity{0};
-
-    bool operator==(const CudnnPlanKey &o) const {
-        return dtype == o.dtype && b == o.b && nhead == o.nhead && nkvhead == o.nkvhead &&
-               head_dim == o.head_dim && nslot == o.nslot && block_size == o.block_size &&
-               block_table_capacity == o.block_table_capacity;
-    }
-};
-
-struct CudnnPlanKeyHash {
-    size_t operator()(const CudnnPlanKey &k) const {
-        size_t h = 1469598103934665603ull;
-        auto mix = [&](uint64_t v) {
-            h ^= static_cast<size_t>(v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2));
-        };
-        mix(static_cast<uint64_t>(k.dtype));
-        mix(static_cast<uint64_t>(k.b));
-        mix(static_cast<uint64_t>(k.nhead));
-        mix(static_cast<uint64_t>(k.nkvhead));
-        mix(static_cast<uint64_t>(k.head_dim));
-        mix(static_cast<uint64_t>(k.nslot));
-        mix(static_cast<uint64_t>(k.block_size));
-        mix(static_cast<uint64_t>(k.block_table_capacity));
-        return h;
-    }
-};
-
 struct CudnnPagedPlan {
 #ifdef ENABLE_CUDNN_FRONTEND
     std::shared_ptr<cudnn_frontend::graph::Graph> graph{};
     bool graph_ready{false};
+    int64_t built_b{0};
+    int64_t built_s_q{0};
+    int32_t built_table_size{0};
+    int64_t built_max_seq_len_kv{0};
+    int64_t built_num_blocks{0};
+    int32_t built_block_size{0};
 
     void *workspace{nullptr};
     size_t workspace_cap{0};
@@ -451,24 +634,6 @@ struct CudnnPagedPlan {
     }
 };
 
-struct CudnnMetaBuffer {
-    int32_t *d_meta{nullptr};
-    int32_t *h_meta{nullptr};
-    size_t cap{0};
-
-    ~CudnnMetaBuffer() {
-        if (d_meta != nullptr) {
-            cudaFree(d_meta);
-            d_meta = nullptr;
-        }
-        if (h_meta != nullptr) {
-            cudaFreeHost(h_meta);
-            h_meta = nullptr;
-        }
-        cap = 0;
-    }
-};
-
 constexpr int64_t Q_UID = 1;
 constexpr int64_t K_UID = 2;
 constexpr int64_t V_UID = 3;
@@ -477,34 +642,12 @@ constexpr int64_t SEQ_LEN_Q_UID = 7;
 constexpr int64_t SEQ_LEN_KV_UID = 8;
 constexpr int64_t PAGE_TABLE_K_UID = 9;
 constexpr int64_t PAGE_TABLE_V_UID = 10;
+constexpr int64_t QO_RAGGED_OFFSET_UID = 11;
 
 struct CudnnRuntimeState {
     cudnnHandle_t handle{nullptr};
-    std::unordered_map<CudnnPlanKey, std::unique_ptr<CudnnPagedPlan>, CudnnPlanKeyHash> plan_cache;
-    std::unordered_map<size_t, int64_t> prebuilt_max_bucket;
-    CudnnMetaBuffer meta_buf;
-};
-
-struct CudnnProblemShape {
-    int64_t seqlen{0};
-    int64_t nhead{0};
-    int64_t head_dim{0};
-    int64_t nslot{0};
-    int64_t nkvhead{0};
-    int64_t b_exec{0};
-    int32_t block_table_capacity{0};
-    int64_t table_size{0};
-    int64_t num_blocks{0};
-    int64_t max_seq_len_kv{0};
-};
-
-struct CudnnMetaPtrs {
-    int32_t *d_seq_q{nullptr};
-    int32_t *d_seq_kv{nullptr};
-    int32_t *d_page{nullptr};
-    size_t bsz{0};
-    size_t page_n{0};
-    size_t meta_n{0};
+    CudnnPagedPlan decode_plan{};
+    CudnnPagedPlan prefill_plan{};
 };
 
 static CudnnRuntimeState &cudnn_runtime_state() {
@@ -512,89 +655,8 @@ static CudnnRuntimeState &cudnn_runtime_state() {
     return state;
 }
 
-static bool cudnn_validate_inputs(tensor_t q,
-                                  tensor_t k_cache,
-                                  tensor_t v_cache,
-                                  const CommonAttentionMetadata &prepared,
-                                  int32_t block_table_width,
-                                  int32_t block_size,
-                                  CudnnProblemShape &shape) {
-    if (cudnnGetVersion() < 90500) {
-        static bool warned_version = false;
-        if (!warned_version) {
-            warned_version = true;
-            printf("[warn] self_attention_paged: CUDNN paged SDPA requires cuDNN>=9.5.0, fallback to NATIVE\n");
-        }
-        return false;
-    }
-    if (q->dtype() != LLAISYS_DTYPE_F16 && q->dtype() != LLAISYS_DTYPE_BF16) {
-        return false;
-    }
-    if (q->dtype() != k_cache->dtype() || q->dtype() != v_cache->dtype()) {
-        return false;
-    }
-    shape.seqlen = static_cast<int64_t>(q->shape()[0]);
-    shape.nhead = static_cast<int64_t>(q->shape()[1]);
-    shape.head_dim = static_cast<int64_t>(q->shape()[2]);
-    shape.nslot = static_cast<int64_t>(k_cache->shape()[0]);
-    shape.nkvhead = static_cast<int64_t>(k_cache->shape()[1]);
-    if (shape.seqlen <= 0 || shape.nhead <= 0 || shape.head_dim <= 0 || shape.nslot <= 0 || shape.nkvhead <= 0) {
-        return false;
-    }
-    if (block_size <= 0 || block_table_width <= 0 || (shape.nslot % block_size) != 0) {
-        return false;
-    }
-    if (prepared.q_seq_rows == nullptr || prepared.q_pos == nullptr || prepared.seq_lens == nullptr ||
-        prepared.block_tables == nullptr || prepared.nseq <= 0) {
-        return false;
-    }
-
-    shape.b_exec = 1;
-    while (shape.b_exec < shape.seqlen) {
-        shape.b_exec <<= 1;
-    }
-    int32_t width_p2 = 1;
-    while (width_p2 < block_table_width) {
-        width_p2 <<= 1;
-    }
-    shape.block_table_capacity = width_p2;
-    if (const char *raw = std::getenv("LLAISYS_CUDNN_BLOCK_TABLE_CAP"); raw != nullptr) {
-        int32_t cfg_cap = static_cast<int32_t>(std::atoi(raw));
-        if (cfg_cap > 0) {
-            int32_t cfg_p2 = 1;
-            while (cfg_p2 < cfg_cap) {
-                cfg_p2 <<= 1;
-            }
-            shape.block_table_capacity = std::max<int32_t>(shape.block_table_capacity, cfg_p2);
-        }
-    }
-    shape.table_size = shape.block_table_capacity;
-    shape.num_blocks = shape.nslot / block_size;
-    shape.max_seq_len_kv = static_cast<int64_t>(shape.block_table_capacity) * static_cast<int64_t>(block_size);
-    return true;
-}
-
-static CudnnPlanKey make_cudnn_plan_key(llaisysDataType_t dtype,
-                                        const CudnnProblemShape &shape,
-                                        int32_t block_size,
-                                        int64_t b_key) {
-    return CudnnPlanKey{
-        dtype, b_key, shape.nhead, shape.nkvhead, shape.head_dim, shape.nslot, block_size, shape.block_table_capacity};
-}
-
-static size_t make_cudnn_bucket_signature(llaisysDataType_t dtype, const CudnnProblemShape &shape, int32_t block_size) {
-    size_t sig = 1469598103934665603ull;
-    auto mix_sig = [&](uint64_t v) {
-        sig ^= static_cast<size_t>(v + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2));
-    };
-    mix_sig(static_cast<uint64_t>(dtype));
-    mix_sig(static_cast<uint64_t>(shape.nhead));
-    mix_sig(static_cast<uint64_t>(shape.nkvhead));
-    mix_sig(static_cast<uint64_t>(shape.head_dim));
-    mix_sig(static_cast<uint64_t>(shape.nslot));
-    mix_sig(static_cast<uint64_t>(block_size));
-    mix_sig(static_cast<uint64_t>(shape.block_table_capacity));
-    return sig;
+static CudnnPagedPlan &select_cudnn_plan(CudnnRuntimeState &state, bool is_prefill) {
+    return is_prefill ? state.prefill_plan : state.decode_plan;
 }
 
 static bool cudnn_set_stream(cudnnHandle_t &handle, cudaStream_t stream) {
@@ -607,89 +669,145 @@ static bool cudnn_set_stream(cudnnHandle_t &handle, cudaStream_t stream) {
 }
 
 #ifdef ENABLE_CUDNN_FRONTEND
-__global__ void build_cudnn_meta_kernel(int64_t b_exec,
-                                        int64_t b_valid,
-                                        int32_t table_size,
-                                        int32_t block_table_width,
-                                        int32_t nseq,
-                                        const int32_t *q_seq_rows,
-                                        const int32_t *q_pos,
-                                        const int32_t *seq_lens,
-                                        const int32_t *block_tables,
-                                        int32_t *seq_q_out,
-                                        int32_t *seq_kv_out,
-                                        int32_t *page_out) {
-    const int64_t row_idx = static_cast<int64_t>(blockIdx.x);
-    if (row_idx >= b_exec) {
-        return;
-    }
+static void build_cudnn_override_tensors(bool is_prefill,
+                                         int64_t b_exec,
+                                         int64_t s_q_exec,
+                                         int64_t nhead,
+                                         int64_t head_dim,
+                                         int32_t table_size,
+                                         std::vector<int64_t> &override_uids,
+                                         std::vector<std::vector<int64_t>> &override_shapes,
+                                         std::vector<std::vector<int64_t>> &override_strides) {
+    override_uids.clear();
+    override_shapes.clear();
+    override_strides.clear();
 
-    int32_t row = -1;
-    int32_t visible = 0;
-    if (row_idx < b_valid) {
-        row = q_seq_rows[row_idx];
-        if (row >= 0 && row < nseq) {
-            const int32_t seq_len = seq_lens[row];
-            const int32_t qpos = q_pos[row_idx];
-            const int32_t q_visible = qpos + 1;
-            visible = q_visible < 0 ? 0 : (q_visible > seq_len ? seq_len : q_visible);
-        }
-    }
+    auto push = [&](int64_t uid, std::vector<int64_t> shape, std::vector<int64_t> stride) {
+        override_uids.push_back(uid);
+        override_shapes.push_back(std::move(shape));
+        override_strides.push_back(std::move(stride));
+    };
 
-    seq_q_out[row_idx] = 1;
-    seq_kv_out[row_idx] = visible;
+    const int64_t q0 = nhead * s_q_exec * head_dim;
+    const int64_t q1 = s_q_exec * head_dim;
+    const int64_t q2 = head_dim;
+    push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q0, q1, q2, 1});
+    push(O_UID, {b_exec, nhead, s_q_exec, head_dim}, {q0, q1, q2, 1});
 
-    const int64_t dst_base = row_idx * static_cast<int64_t>(table_size);
-    for (int32_t c = static_cast<int32_t>(threadIdx.x); c < table_size; c += static_cast<int32_t>(blockDim.x)) {
-        int32_t v = -1;
-        if (row >= 0 && row < nseq && c < block_table_width) {
-            const int64_t src_idx = static_cast<int64_t>(row) * static_cast<int64_t>(block_table_width) + c;
-            v = block_tables[src_idx];
-        }
-        page_out[dst_base + static_cast<int64_t>(c)] = v;
+    push(SEQ_LEN_Q_UID, {b_exec, 1, 1, 1}, {1, 1, 1, 1});
+    push(SEQ_LEN_KV_UID, {b_exec, 1, 1, 1}, {1, 1, 1, 1});
+
+    const int64_t tbl = static_cast<int64_t>(table_size);
+    push(PAGE_TABLE_K_UID, {b_exec, 1, tbl, 1}, {tbl, tbl, 1, 1});
+    push(PAGE_TABLE_V_UID, {b_exec, 1, tbl, 1}, {tbl, tbl, 1, 1});
+
+    if (is_prefill) {
+        push(QO_RAGGED_OFFSET_UID, {b_exec + 1, 1, 1, 1}, {1, 1, 1, 1});
     }
 }
 
 static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                     cudnnHandle_t handle,
                                     llaisysDataType_t dtype,
-                                    const CudnnProblemShape &shape,
+                                    bool is_prefill,
+                                    int64_t b_exec,
+                                    int64_t max_seq_len_q,
+                                    int64_t nhead,
+                                    int64_t nkvhead,
+                                    int64_t head_dim,
+                                    int64_t num_blocks,
+                                    int32_t table_size,
+                                    int64_t max_seq_len_kv,
                                     int32_t block_size,
-                                    int64_t b_plan,
                                     float scale) {
+    LLAISYS_NVTX_SCOPE(is_prefill ? "attn/cudnn/prefill/ensure_plan" : "attn/cudnn/decode/ensure_plan");
     namespace fe = cudnn_frontend;
-    if (plan.graph_ready) {
+    const int64_t b_exec_safe = std::max<int64_t>(1, b_exec);
+    const int64_t s_q_exec = is_prefill ? std::max<int64_t>(1, max_seq_len_q) : 1;
+    bool need_rebuild = !plan.graph_ready;
+    if (!need_rebuild) {
+        if (plan.built_num_blocks != num_blocks || plan.built_block_size != block_size) {
+            need_rebuild = true;
+        }
+    }
+    if (!need_rebuild) {
+        if (b_exec_safe > plan.built_b || s_q_exec > plan.built_s_q || table_size > plan.built_table_size ||
+            max_seq_len_kv > plan.built_max_seq_len_kv) {
+            need_rebuild = true;
+        }
+    }
+    // printf(
+    //     "[cudnn] ensure_plan phase=%s need_rebuild=%d dynamic=%d dtype=%d b_exec=%lld s_q_exec=%lld nhead=%lld nkvhead=%lld "
+    //     "head_dim=%lld num_blocks=%lld table_size=%d max_seq_len_kv=%lld block_size=%d built_b=%lld built_s_q=%lld cudnn=%lld\n",
+    //     is_prefill ? "prefill" : "decode",
+    //     int(need_rebuild),
+    //     int(use_dynamic_shape),
+    //     int(dtype),
+    //     static_cast<long long>(b_exec),
+    //     static_cast<long long>(s_q_exec),
+    //     static_cast<long long>(nhead),
+    //     static_cast<long long>(nkvhead),
+    //     static_cast<long long>(head_dim),
+    //     static_cast<long long>(num_blocks),
+    //     int(table_size),
+    //     static_cast<long long>(max_seq_len_kv),
+    //     int(block_size),
+    //     static_cast<long long>(plan.built_b),
+    //     static_cast<long long>(plan.built_s_q),
+    //     static_cast<long long>(cudnnGetVersion()));
+    if (!need_rebuild) {
         return true;
     }
 
     auto io_dtype = dtype == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
-    constexpr int64_t s_q = 1;
+    const int64_t b_plan = b_exec_safe;
+    const int64_t s_q_plan = s_q_exec;
+    if (is_prefill && cudnnGetVersion() < 90700) {
+        return false;
+    }
     plan.graph = std::make_shared<fe::graph::Graph>();
-    plan.graph->set_io_data_type(io_dtype).set_intermediate_data_type(fe::DataType_t::FLOAT).set_compute_data_type(
-        fe::DataType_t::FLOAT);
+    plan.graph->set_io_data_type(io_dtype)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT)
+        .set_dynamic_shape_enabled(true);
 
-    auto Q = plan.graph->tensor(fe::graph::Tensor_attributes()
-                                     .set_name("Q")
-                                     .set_uid(Q_UID)
-                                     .set_dim({b_plan, shape.nhead, s_q, shape.head_dim})
-                                     .set_stride({shape.nhead * s_q * shape.head_dim, s_q * shape.head_dim, shape.head_dim, 1}));
+    std::shared_ptr<fe::graph::Tensor_attributes> qo_ragged_offset = nullptr;
+    if (is_prefill) {
+        qo_ragged_offset = plan.graph->tensor(fe::graph::Tensor_attributes()
+                                                  .set_name("QO_ragged_offset")
+                                                  .set_uid(QO_RAGGED_OFFSET_UID)
+                                                  .set_dim({b_plan + 1, 1, 1, 1})
+                                                  .set_stride({1, 1, 1, 1})
+                                                  .set_data_type(fe::DataType_t::INT32));
+    }
+
+    auto q_attrs = fe::graph::Tensor_attributes()
+                       .set_name("Q")
+                       .set_uid(Q_UID)
+                       .set_dim({b_plan, nhead, s_q_plan, head_dim})
+                       .set_stride({nhead * s_q_plan * head_dim, s_q_plan * head_dim, head_dim, 1});
+    if (qo_ragged_offset != nullptr) {
+        q_attrs.set_ragged_offset(qo_ragged_offset);
+    }
+
+    auto Q = plan.graph->tensor(q_attrs);
 
     auto K = plan.graph->tensor(fe::graph::Tensor_attributes()
                                      .set_name("container_K")
                                      .set_uid(K_UID)
-                                     .set_dim({shape.num_blocks, shape.nkvhead, static_cast<int64_t>(block_size), shape.head_dim})
-                                     .set_stride({static_cast<int64_t>(block_size) * shape.nkvhead * shape.head_dim,
-                                                  shape.head_dim,
-                                                  shape.nkvhead * shape.head_dim,
+                                     .set_dim({num_blocks, nkvhead, static_cast<int64_t>(block_size), head_dim})
+                                     .set_stride({static_cast<int64_t>(block_size) * nkvhead * head_dim,
+                                                  static_cast<int64_t>(block_size) * head_dim,
+                                                  head_dim,
                                                   1}));
 
     auto V = plan.graph->tensor(fe::graph::Tensor_attributes()
                                      .set_name("container_V")
                                      .set_uid(V_UID)
-                                     .set_dim({shape.num_blocks, shape.nkvhead, static_cast<int64_t>(block_size), shape.head_dim})
-                                     .set_stride({static_cast<int64_t>(block_size) * shape.nkvhead * shape.head_dim,
-                                                  shape.head_dim,
-                                                  shape.nkvhead * shape.head_dim,
+                                     .set_dim({num_blocks, nkvhead, static_cast<int64_t>(block_size), head_dim})
+                                     .set_stride({static_cast<int64_t>(block_size) * nkvhead * head_dim,
+                                                  static_cast<int64_t>(block_size) * head_dim,
+                                                  head_dim,
                                                   1}));
 
     auto seq_q = plan.graph->tensor(fe::graph::Tensor_attributes()
@@ -707,130 +825,78 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     auto page_table_k = plan.graph->tensor(fe::graph::Tensor_attributes()
                                                 .set_name("page_table_k")
                                                 .set_uid(PAGE_TABLE_K_UID)
-                                                .set_dim({b_plan, 1, shape.table_size, 1})
-                                                .set_stride({shape.table_size, shape.table_size, 1, 1})
+                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size), 1})
+                                                .set_stride({static_cast<int64_t>(table_size), static_cast<int64_t>(table_size), 1, 1})
                                                 .set_data_type(fe::DataType_t::INT32));
     auto page_table_v = plan.graph->tensor(fe::graph::Tensor_attributes()
                                                 .set_name("page_table_v")
                                                 .set_uid(PAGE_TABLE_V_UID)
-                                                .set_dim({b_plan, 1, shape.table_size, 1})
-                                                .set_stride({shape.table_size, shape.table_size, 1, 1})
+                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size), 1})
+                                                .set_stride({static_cast<int64_t>(table_size), static_cast<int64_t>(table_size), 1, 1})
                                                 .set_data_type(fe::DataType_t::INT32));
 
     auto sdpa_options =
         fe::graph::SDPA_attributes().set_name("novainfer_paged_sdpa").set_generate_stats(false).set_attn_scale(scale);
+    if (is_prefill) {
+        // Paged prefill uses Q=suffix, KV=full context (q_len <= kv_len).
+        // Causal masking must align query's right edge to kv right edge.
+        sdpa_options.set_diagonal_alignment(fe::DiagonalAlignment_t::BOTTOM_RIGHT).set_diagonal_band_right_bound(0);
+    }
     sdpa_options.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
     sdpa_options.set_paged_attention_k_table(page_table_k);
     sdpa_options.set_paged_attention_v_table(page_table_v);
-    sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(shape.max_seq_len_kv));
+    sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(max_seq_len_kv));
 
     auto [O, Stats] = plan.graph->sdpa(Q, K, V, sdpa_options);
     (void)Stats;
-    O->set_output(true).set_uid(O_UID).set_dim({b_plan, shape.nhead, s_q, shape.head_dim}).set_stride(
-        {shape.nhead * s_q * shape.head_dim, s_q * shape.head_dim, shape.head_dim, 1});
+    O->set_output(true)
+        .set_uid(O_UID)
+        .set_dim({b_plan, nhead, s_q_plan, head_dim})
+        .set_stride({nhead * s_q_plan * head_dim, s_q_plan * head_dim, head_dim, 1});
+    // NOTE: cuDNN paged SDPA sample attaches ragged offset to Q only.
+    // Keep O dense to maximize engine availability in prefill.
 
-    auto build_status = plan.graph->build(handle, {fe::HeurMode_t::A});
+    auto build_status = [&]() {
+        LLAISYS_NVTX_SCOPE(is_prefill ? "attn/cudnn/prefill/graph_build" : "attn/cudnn/decode/graph_build");
+        return plan.graph->build(handle, {fe::HeurMode_t::A});
+    }();
     if (build_status.is_bad()) {
+        printf(
+            "[cudnn] build_failed phase=%s b_plan=%lld s_q_plan=%lld nhead=%lld nkvhead=%lld head_dim=%lld "
+            "num_blocks=%lld table_size=%d max_seq_len_kv=%lld block_size=%d scale=%f msg=%s\n",
+            is_prefill ? "prefill" : "decode",
+            static_cast<long long>(b_plan),
+            static_cast<long long>(s_q_plan),
+            static_cast<long long>(nhead),
+            static_cast<long long>(nkvhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(num_blocks),
+            int(table_size),
+            static_cast<long long>(max_seq_len_kv),
+            int(block_size),
+            static_cast<double>(scale),
+            build_status.get_message().c_str());
         static bool warned_build = false;
         if (!warned_build) {
             warned_build = true;
-            printf("[warn] self_attention_paged: CUDNN build failed: %s; fallback to NATIVE\n",
+            printf("[warn] self_attention_paged: CUDNN build failed: %s\n",
                    build_status.get_message().c_str());
         }
         plan.graph_ready = false;
         return false;
     }
     plan.graph_ready = true;
+    plan.built_b = b_plan;
+    plan.built_s_q = s_q_plan;
+    plan.built_table_size = table_size;
+    plan.built_max_seq_len_kv = max_seq_len_kv;
+    plan.built_num_blocks = num_blocks;
+    plan.built_block_size = block_size;
     return true;
-}
-
-static bool prebuild_cudnn_buckets(CudnnRuntimeState &state,
-                                   llaisysDataType_t dtype,
-                                   const CudnnProblemShape &shape,
-                                   int32_t block_size,
-                                   float scale) {
-    const size_t sig = make_cudnn_bucket_signature(dtype, shape, block_size);
-    int64_t warmup_target = std::max<int64_t>(shape.b_exec, 64);
-    if (const char *raw = std::getenv("LLAISYS_CUDNN_PREBUILD_MAX_B"); raw != nullptr) {
-        int64_t parsed = std::atoll(raw);
-        if (parsed > 0) {
-            int64_t p2 = 1;
-            while (p2 < parsed) {
-                p2 <<= 1;
-            }
-            warmup_target = std::max<int64_t>(warmup_target, p2);
-        }
-    }
-    int64_t &built_max = state.prebuilt_max_bucket[sig];
-    if (built_max < warmup_target) {
-        int64_t bb = built_max > 0 ? (built_max << 1) : 1;
-        while (bb <= warmup_target) {
-            auto &pp = state.plan_cache[make_cudnn_plan_key(dtype, shape, block_size, bb)];
-            if (!pp) {
-                pp = std::make_unique<CudnnPagedPlan>();
-            }
-            if (!ensure_cudnn_plan_ready(*pp, state.handle, dtype, shape, block_size, bb, scale)) {
-                return false;
-            }
-            bb <<= 1;
-        }
-        built_max = warmup_target;
-    }
-    return true;
-}
-
-static CudnnMetaPtrs ensure_cudnn_meta_buffer(CudnnRuntimeState &state, const CudnnProblemShape &shape) {
-    CudnnMetaPtrs ptrs{};
-    ptrs.bsz = static_cast<size_t>(shape.b_exec);
-    ptrs.page_n = ptrs.bsz * static_cast<size_t>(shape.table_size);
-    ptrs.meta_n = ptrs.bsz * 2 + ptrs.page_n;
-    if (state.meta_buf.cap < ptrs.meta_n) {
-        if (state.meta_buf.d_meta != nullptr) {
-            cudaFree(state.meta_buf.d_meta);
-            state.meta_buf.d_meta = nullptr;
-        }
-        LLAISYS_CUDA_CHECK(cudaMalloc(&state.meta_buf.d_meta, ptrs.meta_n * sizeof(int32_t)));
-        state.meta_buf.cap = ptrs.meta_n;
-    }
-    ptrs.d_seq_q = state.meta_buf.d_meta;
-    ptrs.d_seq_kv = state.meta_buf.d_meta + static_cast<std::ptrdiff_t>(ptrs.bsz);
-    ptrs.d_page = state.meta_buf.d_meta + static_cast<std::ptrdiff_t>(ptrs.bsz * 2);
-    return ptrs;
-}
-
-static void refresh_cudnn_meta(const CommonAttentionMetadata &prepared,
-                               const CudnnProblemShape &shape,
-                               int32_t block_table_width,
-                               const CudnnMetaPtrs &ptrs,
-                               cudaStream_t stream) {
-    // Step metadata is dynamic and must be rebuilt every step.
-
-    const int32_t *q_seq_rows_dev = prepared.q_seq_rows;
-    const int32_t *q_pos_dev = prepared.q_pos;
-    const int32_t *seq_lens_dev = prepared.seq_lens;
-    const int32_t *block_tables_dev = prepared.block_tables;
-    if (q_seq_rows_dev == nullptr || q_pos_dev == nullptr || seq_lens_dev == nullptr || block_tables_dev == nullptr) {
-        return;
-    }
-    const dim3 grid(static_cast<unsigned int>(shape.b_exec));
-    const dim3 block(256);
-    build_cudnn_meta_kernel<<<grid, block, 0, stream>>>(shape.b_exec,
-                                                         shape.seqlen,
-                                                         shape.block_table_capacity,
-                                                         block_table_width,
-                                                         prepared.nseq,
-                                                         q_seq_rows_dev,
-                                                         q_pos_dev,
-                                                         seq_lens_dev,
-                                                         block_tables_dev,
-                                                         ptrs.d_seq_q,
-                                                         ptrs.d_seq_kv,
-                                                         ptrs.d_page);
-    LLAISYS_CUDA_CHECK(cudaGetLastError());
-
 }
 
 static bool ensure_cudnn_workspace(CudnnPagedPlan &plan) {
+    LLAISYS_NVTX_SCOPE("attn/cudnn/ensure_workspace");
     int64_t workspace_size = 0;
     auto ws_status = plan.graph->get_workspace_size(workspace_size);
     if (ws_status.is_bad()) {
@@ -850,59 +916,132 @@ static bool ensure_cudnn_workspace(CudnnPagedPlan &plan) {
 }
 #endif
 
-bool cudnn_try_paged_attention(tensor_t attn_val,
-                               tensor_t q,
-                               tensor_t k_cache,
-                               tensor_t v_cache,
-                               const CommonAttentionMetadata &prepared,
-                               int32_t block_table_width,
-                               int32_t block_size,
-                               float scale) {
+bool cudnn_try_paged_attention_decode(tensor_t attn_val,
+                                      tensor_t q,
+                                      tensor_t k_cache,
+                                      tensor_t v_cache,
+                                      const CommonAttentionMetadata &prepared,
+                                      int32_t block_table_width,
+                                      int32_t block_size,
+                                      float scale) {
 #ifdef ENABLE_CUDNN_FRONTEND
-    CudnnProblemShape shape{};
-    if (!cudnn_validate_inputs(q, k_cache, v_cache, prepared, block_table_width, block_size, shape)) {
+    LLAISYS_NVTX_SCOPE("attn/cudnn/decode");
+    if (cudnnGetVersion() < 90500) {
+        static bool warned_version = false;
+        if (!warned_version) {
+            warned_version = true;
+            printf("[warn] self_attention_paged: CUDNN paged SDPA requires cuDNN>=9.5.0\n");
+        }
         return false;
     }
+    if (q->dtype() != LLAISYS_DTYPE_F16 && q->dtype() != LLAISYS_DTYPE_BF16) {
+        return false;
+    }
+    if (q->dtype() != k_cache->dtype() || q->dtype() != v_cache->dtype()) {
+        return false;
+    }
+    const int64_t seqlen = static_cast<int64_t>(q->shape()[0]);
+    const int64_t nhead = static_cast<int64_t>(q->shape()[1]);
+    const int64_t head_dim = static_cast<int64_t>(q->shape()[2]);
+    const int64_t nslot = static_cast<int64_t>(k_cache->shape()[0]);
+    const int64_t nkvhead = static_cast<int64_t>(k_cache->shape()[1]);
+    if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
+        return false;
+    }
+    if (block_size <= 0 || block_table_width <= 0 || (nslot % block_size) != 0) {
+        return false;
+    }
+    if (prepared.cudnn_seq_lens_q == nullptr || prepared.cudnn_seq_lens_kv == nullptr ||
+        prepared.cudnn_page_table == nullptr || prepared.cudnn_b_exec <= 0) {
+        return false;
+    }
+
+    const int64_t b_exec = static_cast<int64_t>(prepared.cudnn_b_exec);
+    const int64_t max_seq_len_q = static_cast<int64_t>(prepared.max_seqlen_q);
+    if (max_seq_len_q != 1) {
+        return false;
+    }
+    if (b_exec < seqlen) {
+        return false;
+    }
+    const int32_t table_size = block_table_width;
+    const int64_t num_blocks = nslot / block_size;
+    const int64_t max_seq_len_kv = static_cast<int64_t>(table_size) * static_cast<int64_t>(block_size);
+    if (max_seq_len_kv <= 0) {
+        return false;
+    }
+    if (prepared.max_seqlen_k <= 0 || static_cast<int64_t>(prepared.max_seqlen_k) > max_seq_len_kv) {
+        return false;
+    }
+    // printf(
+    //     "[cudnn] decode_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
+    //     "max_seqlen_k=%d table_size=%d block_size=%d\n",
+    //     static_cast<long long>(seqlen),
+    //     static_cast<long long>(nhead),
+    //     static_cast<long long>(head_dim),
+    //     static_cast<long long>(nslot),
+    //     static_cast<long long>(nkvhead),
+    //     static_cast<long long>(head_dim),
+    //     static_cast<long long>(b_exec),
+    //     static_cast<long long>(max_seq_len_q),
+    //     int(prepared.max_seqlen_k),
+    //     int(table_size),
+    //     int(block_size));
+
     CudnnRuntimeState &state = cudnn_runtime_state();
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
     if (!cudnn_set_stream(state.handle, stream)) {
         return false;
     }
-    if (!prebuild_cudnn_buckets(state, q->dtype(), shape, block_size, scale)) {
-        return false;
-    }
 
-    auto &plan_ptr = state.plan_cache[make_cudnn_plan_key(q->dtype(), shape, block_size, shape.b_exec)];
-    if (!plan_ptr) {
-        plan_ptr = std::make_unique<CudnnPagedPlan>();
-    }
-    auto &plan = *plan_ptr;
-    if (!ensure_cudnn_plan_ready(plan, state.handle, q->dtype(), shape, block_size, shape.b_exec, scale)) {
+    auto &plan = select_cudnn_plan(state, /*is_prefill=*/false);
+    if (!ensure_cudnn_plan_ready(
+            plan, state.handle, q->dtype(), false, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
+            table_size, max_seq_len_kv, block_size, scale)) {
         return false;
     }
-    const CudnnMetaPtrs ptrs = ensure_cudnn_meta_buffer(state, shape);
-    refresh_cudnn_meta(prepared, shape, block_table_width, ptrs, stream);
     if (!ensure_cudnn_workspace(plan)) {
         return false;
     }
 
-    std::unordered_map<int64_t, void *> variant_pack = {
-        {Q_UID, q->data()},
-        {K_UID, k_cache->data()},
-        {V_UID, v_cache->data()},
-        {O_UID, attn_val->data()},
-        {SEQ_LEN_Q_UID, ptrs.d_seq_q},
-        {SEQ_LEN_KV_UID, ptrs.d_seq_kv},
-        {PAGE_TABLE_K_UID, ptrs.d_page},
-        {PAGE_TABLE_V_UID, ptrs.d_page},
-    };
+    std::unordered_map<int64_t, void *> variant_pack;
+    std::vector<int64_t> override_uids;
+    std::vector<std::vector<int64_t>> override_shapes;
+    std::vector<std::vector<int64_t>> override_strides;
+    {
+        LLAISYS_NVTX_SCOPE("attn/cudnn/decode/variant_pack");
+        variant_pack = {
+            {Q_UID, q->data()},
+            {K_UID, k_cache->data()},
+            {V_UID, v_cache->data()},
+            {O_UID, attn_val->data()},
+            {SEQ_LEN_Q_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_q)},
+            {SEQ_LEN_KV_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_kv)},
+            {PAGE_TABLE_K_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
+            {PAGE_TABLE_V_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
+        };
+        build_cudnn_override_tensors(
+            /*is_prefill=*/false,
+            b_exec,
+            /*s_q_exec=*/1,
+            nhead,
+            head_dim,
+            table_size,
+            override_uids,
+            override_shapes,
+            override_strides);
+    }
 
-    auto exec_status = plan.graph->execute(state.handle, variant_pack, plan.workspace);
+    auto exec_status = [&]() {
+        LLAISYS_NVTX_SCOPE("attn/cudnn/decode/execute");
+        return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
+                                   override_strides);
+    }();
     if (exec_status.is_bad()) {
         static bool warned_exec = false;
         if (!warned_exec) {
             warned_exec = true;
-            printf("[warn] self_attention_paged: CUDNN execute failed: %s; fallback to NATIVE\n",
+            printf("[warn] self_attention_paged: CUDNN execute failed: %s\n",
                    exec_status.get_message().c_str());
         }
         return false;
@@ -912,7 +1051,151 @@ bool cudnn_try_paged_attention(tensor_t attn_val,
     static bool warned_no_frontend = false;
     if (!warned_no_frontend) {
         warned_no_frontend = true;
-        printf("[warn] self_attention_paged: CUDNN backend requested but cudnn_frontend headers are missing (expected third_party/cudnn_frontend/include); fallback to NATIVE\n");
+        printf("[warn] self_attention_paged: CUDNN backend requested but cudnn_frontend headers are missing (expected third_party/cudnn_frontend/include)\n");
+    }
+#endif
+    return false;
+}
+
+bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
+                                       tensor_t q,
+                                       tensor_t k_cache,
+                                       tensor_t v_cache,
+                                       const CommonAttentionMetadata &prepared,
+                                       int32_t block_table_width,
+                                       int32_t block_size,
+                                       float scale) {
+#ifdef ENABLE_CUDNN_FRONTEND
+    LLAISYS_NVTX_SCOPE("attn/cudnn/prefill");
+    if (cudnnGetVersion() < 90500) {
+        static bool warned_version = false;
+        if (!warned_version) {
+            warned_version = true;
+            printf("[warn] self_attention_paged: CUDNN paged SDPA requires cuDNN>=9.5.0\n");
+        }
+        return false;
+    }
+    if (q->dtype() != LLAISYS_DTYPE_F16 && q->dtype() != LLAISYS_DTYPE_BF16) {
+        return false;
+    }
+    if (q->dtype() != k_cache->dtype() || q->dtype() != v_cache->dtype()) {
+        return false;
+    }
+    const int64_t seqlen = static_cast<int64_t>(q->shape()[0]);
+    const int64_t nhead = static_cast<int64_t>(q->shape()[1]);
+    const int64_t head_dim = static_cast<int64_t>(q->shape()[2]);
+    const int64_t nslot = static_cast<int64_t>(k_cache->shape()[0]);
+    const int64_t nkvhead = static_cast<int64_t>(k_cache->shape()[1]);
+    if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
+        return false;
+    }
+    if (block_size <= 0 || block_table_width <= 0 || (nslot % block_size) != 0) {
+        return false;
+    }
+    if (prepared.cudnn_seq_lens_q == nullptr || prepared.cudnn_seq_lens_kv == nullptr ||
+        prepared.cudnn_page_table == nullptr || prepared.cudnn_qo_ragged_offset == nullptr || prepared.cudnn_b_exec <= 0) {
+        return false;
+    }
+    if (!is_prefill_phase(prepared)) {
+        return false;
+    }
+    const int64_t b_exec = static_cast<int64_t>(prepared.cudnn_b_exec);
+    const int64_t max_seq_len_q = static_cast<int64_t>(prepared.max_seqlen_q);
+    if (max_seq_len_q <= 0) {
+        return false;
+    }
+    if (b_exec > seqlen) {
+        return false;
+    }
+    const int32_t table_size = block_table_width;
+    const int64_t num_blocks = nslot / block_size;
+    const int64_t max_seq_len_kv = static_cast<int64_t>(table_size) * static_cast<int64_t>(block_size);
+    if (max_seq_len_kv <= 0) {
+        return false;
+    }
+    if (prepared.max_seqlen_k <= 0 || static_cast<int64_t>(prepared.max_seqlen_k) > max_seq_len_kv) {
+        return false;
+    }
+    // printf(
+    //     "[cudnn] prefill_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
+    //     "max_seqlen_k=%d table_size=%d block_size=%d\n",
+    //     static_cast<long long>(seqlen),
+    //     static_cast<long long>(nhead),
+    //     static_cast<long long>(head_dim),
+    //     static_cast<long long>(nslot),
+    //     static_cast<long long>(nkvhead),
+    //     static_cast<long long>(head_dim),
+    //     static_cast<long long>(b_exec),
+    //     static_cast<long long>(max_seq_len_q),
+    //     int(prepared.max_seqlen_k),
+    //     int(table_size),
+    //     int(block_size));
+
+    CudnnRuntimeState &state = cudnn_runtime_state();
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    if (!cudnn_set_stream(state.handle, stream)) {
+        return false;
+    }
+
+    auto &plan = select_cudnn_plan(state, /*is_prefill=*/true);
+    if (!ensure_cudnn_plan_ready(
+            plan, state.handle, q->dtype(), true, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
+            table_size, max_seq_len_kv, block_size, scale)) {
+        return false;
+    }
+    if (!ensure_cudnn_workspace(plan)) {
+        return false;
+    }
+
+    std::unordered_map<int64_t, void *> variant_pack;
+    std::vector<int64_t> override_uids;
+    std::vector<std::vector<int64_t>> override_shapes;
+    std::vector<std::vector<int64_t>> override_strides;
+    {
+        LLAISYS_NVTX_SCOPE("attn/cudnn/prefill/variant_pack");
+        variant_pack = {
+            {Q_UID, q->data()},
+            {K_UID, k_cache->data()},
+            {V_UID, v_cache->data()},
+            {O_UID, attn_val->data()},
+            {SEQ_LEN_Q_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_q)},
+            {SEQ_LEN_KV_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_kv)},
+            {PAGE_TABLE_K_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
+            {PAGE_TABLE_V_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
+            {QO_RAGGED_OFFSET_UID, const_cast<int32_t *>(prepared.cudnn_qo_ragged_offset)},
+        };
+        build_cudnn_override_tensors(
+            /*is_prefill=*/true,
+            b_exec,
+            std::max<int64_t>(1, max_seq_len_q),
+            nhead,
+            head_dim,
+            table_size,
+            override_uids,
+            override_shapes,
+            override_strides);
+    }
+
+    auto exec_status = [&]() {
+        LLAISYS_NVTX_SCOPE("attn/cudnn/prefill/execute");
+        return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
+                                   override_strides);
+    }();
+    if (exec_status.is_bad()) {
+        static bool warned_exec = false;
+        if (!warned_exec) {
+            warned_exec = true;
+            printf("[warn] self_attention_paged: CUDNN prefill execute failed: %s\n",
+                   exec_status.get_message().c_str());
+        }
+        return false;
+    }
+    return true;
+#else
+    static bool warned_no_frontend = false;
+    if (!warned_no_frontend) {
+        warned_no_frontend = true;
+        printf("[warn] self_attention_paged: CUDNN backend requested but cudnn_frontend headers are missing (expected third_party/cudnn_frontend/include)\n");
     }
 #endif
     return false;
@@ -972,6 +1255,286 @@ void reshape_and_cache(tensor_t k_cache,
     }
 }
 
+__global__ void build_slot_mapping_kernel(int32_t *slot_mapping_out,
+                                          int32_t ntoken,
+                                          int32_t nseq,
+                                          const int32_t *query_start_loc,
+                                          const int32_t *seq_lens,
+                                          const int32_t *block_tables,
+                                          int32_t block_table_width,
+                                          int32_t block_size) {
+    const int32_t t = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < 0 || t >= ntoken) {
+        return;
+    }
+
+    int32_t lo = 0;
+    int32_t hi = nseq;
+    while (lo < hi) {
+        const int32_t mid = lo + ((hi - lo) >> 1);
+        if (query_start_loc[mid + 1] <= t) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const int32_t row = lo;
+    if (row < 0 || row >= nseq) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+
+    const int32_t row_start = query_start_loc[row];
+    const int32_t row_end = query_start_loc[row + 1];
+    const int32_t row_scheduled = row_end - row_start;
+    if (row_scheduled <= 0) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+    const int32_t local = t - row_start;
+    if (local < 0 || local >= row_scheduled) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+
+    const int32_t seq_len = seq_lens[row];
+    const int32_t qpos = (seq_len - row_scheduled) + local;
+    if (qpos < 0) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+    const int32_t bidx = qpos / block_size;
+    const int32_t boff = qpos % block_size;
+    if (bidx < 0 || bidx >= block_table_width) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+    const int32_t bid = block_tables[row * block_table_width + bidx];
+    if (bid < 0) {
+        slot_mapping_out[t] = -1;
+        return;
+    }
+    slot_mapping_out[t] = bid * block_size + boff;
+}
+
+__global__ void build_query_start_loc_and_seq_lens_kernel(int32_t *query_start_loc_out,
+                                                           int32_t *seq_lens_out,
+                                                           int32_t nseq,
+                                                           const int32_t *req_num_scheduled_tokens,
+                                                           const int32_t *req_num_computed_tokens) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    int32_t acc = 0;
+    query_start_loc_out[0] = 0;
+    for (int32_t i = 0; i < nseq; ++i) {
+        const int32_t n_scheduled = req_num_scheduled_tokens[i];
+        const int32_t n_computed = req_num_computed_tokens[i];
+        acc += n_scheduled;
+        query_start_loc_out[i + 1] = acc;
+        seq_lens_out[i] = n_scheduled + n_computed;
+    }
+}
+
+void build_query_start_loc_and_seq_lens(tensor_t query_start_loc,
+                                        tensor_t seq_lens,
+                                        tensor_t req_num_scheduled_tokens,
+                                        tensor_t req_num_computed_tokens) {
+    CHECK_ARGUMENT(query_start_loc != nullptr && seq_lens != nullptr && req_num_scheduled_tokens != nullptr &&
+                       req_num_computed_tokens != nullptr,
+                   "build_query_start_loc_and_seq_lens: tensors must be non-null");
+    CHECK_ARGUMENT(query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA && seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       req_num_scheduled_tokens->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       req_num_computed_tokens->deviceType() == LLAISYS_DEVICE_NVIDIA,
+                   "build_query_start_loc_and_seq_lens: tensors must be CUDA");
+    CHECK_ARGUMENT(query_start_loc->dtype() == LLAISYS_DTYPE_I32 && seq_lens->dtype() == LLAISYS_DTYPE_I32 &&
+                       req_num_scheduled_tokens->dtype() == LLAISYS_DTYPE_I32 &&
+                       req_num_computed_tokens->dtype() == LLAISYS_DTYPE_I32,
+                   "build_query_start_loc_and_seq_lens: tensors must be I32");
+    CHECK_ARGUMENT(query_start_loc->ndim() == 1 && seq_lens->ndim() == 1 && req_num_scheduled_tokens->ndim() == 1 &&
+                       req_num_computed_tokens->ndim() == 1,
+                   "build_query_start_loc_and_seq_lens: tensors must be 1D");
+    CHECK_ARGUMENT(query_start_loc->isContiguous() && seq_lens->isContiguous() && req_num_scheduled_tokens->isContiguous() &&
+                       req_num_computed_tokens->isContiguous(),
+                   "build_query_start_loc_and_seq_lens: tensors must be contiguous");
+
+    const int32_t nseq = static_cast<int32_t>(req_num_scheduled_tokens->shape()[0]);
+    CHECK_ARGUMENT(nseq >= 0, "build_query_start_loc_and_seq_lens: invalid nseq");
+    CHECK_ARGUMENT(req_num_computed_tokens->shape()[0] == static_cast<size_t>(nseq),
+                   "build_query_start_loc_and_seq_lens: req_num_computed_tokens size mismatch");
+    CHECK_ARGUMENT(seq_lens->shape()[0] == static_cast<size_t>(nseq),
+                   "build_query_start_loc_and_seq_lens: seq_lens size mismatch");
+    CHECK_ARGUMENT(query_start_loc->shape()[0] == static_cast<size_t>(nseq + 1),
+                   "build_query_start_loc_and_seq_lens: query_start_loc size mismatch");
+
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    build_query_start_loc_and_seq_lens_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<int32_t *>(query_start_loc->data()),
+                                                                    reinterpret_cast<int32_t *>(seq_lens->data()),
+                                                                    nseq,
+                                                                    reinterpret_cast<const int32_t *>(
+                                                                        req_num_scheduled_tokens->data()),
+                                                                    reinterpret_cast<const int32_t *>(
+                                                                        req_num_computed_tokens->data()));
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void build_block_positions_kernel(int64_t *pos_ids_out,
+                                             int32_t ntoken,
+                                             int32_t nseq,
+                                             const int32_t *query_start_loc,
+                                             const int32_t *seq_lens) {
+    const int32_t t = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < 0 || t >= ntoken) {
+        return;
+    }
+
+    int32_t lo = 0;
+    int32_t hi = nseq;
+    while (lo < hi) {
+        const int32_t mid = lo + ((hi - lo) >> 1);
+        if (query_start_loc[mid + 1] <= t) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    const int32_t row = lo;
+    if (row < 0 || row >= nseq) {
+        pos_ids_out[t] = -1;
+        return;
+    }
+    const int32_t row_start = query_start_loc[row];
+    const int32_t row_end = query_start_loc[row + 1];
+    const int32_t row_scheduled = row_end - row_start;
+    if (row_scheduled <= 0) {
+        pos_ids_out[t] = -1;
+        return;
+    }
+    const int32_t local = t - row_start;
+    if (local < 0 || local >= row_scheduled) {
+        pos_ids_out[t] = -1;
+        return;
+    }
+    const int32_t qpos = (seq_lens[row] - row_scheduled) + local;
+    pos_ids_out[t] = static_cast<int64_t>(qpos);
+}
+
+void build_block_positions(tensor_t pos_ids,
+                           tensor_t query_start_loc,
+                           tensor_t seq_lens) {
+    CHECK_ARGUMENT(pos_ids != nullptr && query_start_loc != nullptr && seq_lens != nullptr,
+                   "build_block_positions: tensors must be non-null");
+    CHECK_ARGUMENT(pos_ids->deviceType() == LLAISYS_DEVICE_NVIDIA && query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA,
+                   "build_block_positions: tensors must be CUDA");
+    CHECK_ARGUMENT(pos_ids->dtype() == LLAISYS_DTYPE_I64 && query_start_loc->dtype() == LLAISYS_DTYPE_I32 &&
+                       seq_lens->dtype() == LLAISYS_DTYPE_I32,
+                   "build_block_positions: dtype mismatch");
+    CHECK_ARGUMENT(pos_ids->ndim() == 1 && query_start_loc->ndim() == 1 && seq_lens->ndim() == 1,
+                   "build_block_positions: tensors must be 1D");
+    CHECK_ARGUMENT(pos_ids->isContiguous() && query_start_loc->isContiguous() && seq_lens->isContiguous(),
+                   "build_block_positions: tensors must be contiguous");
+    CHECK_ARGUMENT(query_start_loc->shape()[0] == seq_lens->shape()[0] + 1,
+                   "build_block_positions: query_start_loc size mismatch");
+    const int32_t ntoken = static_cast<int32_t>(pos_ids->shape()[0]);
+    const int32_t nseq = static_cast<int32_t>(seq_lens->shape()[0]);
+    if (ntoken <= 0 || nseq <= 0) {
+        return;
+    }
+    constexpr int32_t kBlock = 256;
+    const int32_t grid = (ntoken + kBlock - 1) / kBlock;
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    build_block_positions_kernel<<<grid, kBlock, 0, stream>>>(reinterpret_cast<int64_t *>(pos_ids->data()),
+                                                               ntoken,
+                                                               nseq,
+                                                               reinterpret_cast<const int32_t *>(query_start_loc->data()),
+                                                               reinterpret_cast<const int32_t *>(seq_lens->data()));
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
+__global__ void build_last_token_logits_indices_kernel(int64_t *logits_indices_out,
+                                                       int32_t nseq,
+                                                       const int32_t *query_start_loc) {
+    const int32_t i = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < 0 || i >= nseq) {
+        return;
+    }
+    logits_indices_out[i] = static_cast<int64_t>(query_start_loc[i + 1] - 1);
+}
+
+void build_last_token_logits_indices(tensor_t logits_indices,
+                                     tensor_t query_start_loc) {
+    CHECK_ARGUMENT(logits_indices != nullptr && query_start_loc != nullptr,
+                   "build_last_token_logits_indices: tensors must be non-null");
+    CHECK_ARGUMENT(logits_indices->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA,
+                   "build_last_token_logits_indices: tensors must be CUDA");
+    CHECK_ARGUMENT(logits_indices->dtype() == LLAISYS_DTYPE_I64 && query_start_loc->dtype() == LLAISYS_DTYPE_I32,
+                   "build_last_token_logits_indices: dtype mismatch");
+    CHECK_ARGUMENT(logits_indices->ndim() == 1 && query_start_loc->ndim() == 1,
+                   "build_last_token_logits_indices: tensors must be 1D");
+    CHECK_ARGUMENT(logits_indices->isContiguous() && query_start_loc->isContiguous(),
+                   "build_last_token_logits_indices: tensors must be contiguous");
+    const int32_t nseq = static_cast<int32_t>(logits_indices->shape()[0]);
+    CHECK_ARGUMENT(query_start_loc->shape()[0] == static_cast<size_t>(nseq + 1),
+                   "build_last_token_logits_indices: query_start_loc size mismatch");
+    if (nseq <= 0) {
+        return;
+    }
+    constexpr int32_t kBlock = 256;
+    const int32_t grid = (nseq + kBlock - 1) / kBlock;
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    build_last_token_logits_indices_kernel<<<grid, kBlock, 0, stream>>>(
+        reinterpret_cast<int64_t *>(logits_indices->data()),
+        nseq,
+        reinterpret_cast<const int32_t *>(query_start_loc->data()));
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
+void build_slot_mapping(tensor_t slot_mapping,
+                        tensor_t query_start_loc,
+                        tensor_t seq_lens,
+                        tensor_t block_tables,
+                        int32_t block_table_width,
+                        int32_t block_size) {
+    CHECK_ARGUMENT(slot_mapping != nullptr && query_start_loc != nullptr && seq_lens != nullptr && block_tables != nullptr,
+                   "build_slot_mapping: metadata tensors must be non-null");
+    CHECK_ARGUMENT(slot_mapping->deviceType() == LLAISYS_DEVICE_NVIDIA && query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA && block_tables->deviceType() == LLAISYS_DEVICE_NVIDIA,
+                   "build_slot_mapping: tensors must be CUDA");
+    CHECK_ARGUMENT(slot_mapping->dtype() == LLAISYS_DTYPE_I32 && query_start_loc->dtype() == LLAISYS_DTYPE_I32 &&
+                       seq_lens->dtype() == LLAISYS_DTYPE_I32 && block_tables->dtype() == LLAISYS_DTYPE_I32,
+                   "build_slot_mapping: tensors must be I32");
+    CHECK_ARGUMENT(slot_mapping->ndim() == 1 && query_start_loc->ndim() == 1 && seq_lens->ndim() == 1 && block_tables->ndim() == 1,
+                   "build_slot_mapping: tensors must be 1D");
+    CHECK_ARGUMENT(slot_mapping->isContiguous() && query_start_loc->isContiguous() && seq_lens->isContiguous() &&
+                       block_tables->isContiguous(),
+                   "build_slot_mapping: tensors must be contiguous");
+    CHECK_ARGUMENT(block_table_width > 0 && block_size > 0, "build_slot_mapping: block params must be > 0");
+    CHECK_ARGUMENT(query_start_loc->shape()[0] == seq_lens->shape()[0] + 1,
+                   "build_slot_mapping: query_start_loc size mismatch");
+    CHECK_ARGUMENT(block_tables->shape()[0] == seq_lens->shape()[0] * static_cast<size_t>(block_table_width),
+                   "build_slot_mapping: block_tables size mismatch");
+
+    const int32_t ntoken = static_cast<int32_t>(slot_mapping->shape()[0]);
+    const int32_t nseq = static_cast<int32_t>(seq_lens->shape()[0]);
+    if (ntoken <= 0 || nseq <= 0) {
+        return;
+    }
+    constexpr int32_t kBlock = 256;
+    const int32_t grid = (ntoken + kBlock - 1) / kBlock;
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    build_slot_mapping_kernel<<<grid, kBlock, 0, stream>>>(reinterpret_cast<int32_t *>(slot_mapping->data()),
+                                                            ntoken,
+                                                            nseq,
+                                                            reinterpret_cast<const int32_t *>(query_start_loc->data()),
+                                                            reinterpret_cast<const int32_t *>(seq_lens->data()),
+                                                            reinterpret_cast<const int32_t *>(block_tables->data()),
+                                                            block_table_width,
+                                                            block_size);
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
     LLAISYS_NVTX_SCOPE("attn/self_attention");
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
@@ -1015,26 +1578,45 @@ void self_attention_paged_prepared(tensor_t attn_val,
     if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0 || prepared.nseq <= 0) {
         return;
     }
-    if (prepared.q_seq_rows == nullptr || prepared.q_pos == nullptr || prepared.block_tables == nullptr ||
-        prepared.seq_lens == nullptr) {
+    if (prepared.cu_seqlens_q == nullptr || prepared.block_tables == nullptr ||
+        prepared.cu_seqlens_k == nullptr) {
         return;
     }
+    const bool is_decode = is_decode_phase(prepared);
 
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
-        launch_paged_attention_prepared<float>(
-            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
-            nhead, nkvhead, head_dim);
+        if (is_decode) {
+            launch_paged_attention_decode_prepared<float>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        } else {
+            launch_paged_attention_prepared<float>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        }
         return;
     case LLAISYS_DTYPE_F16:
-        launch_paged_attention_prepared<llaisys::fp16_t>(
-            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
-            nhead, nkvhead, head_dim);
+        if (is_decode) {
+            launch_paged_attention_decode_prepared<llaisys::fp16_t>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        } else {
+            launch_paged_attention_prepared<llaisys::fp16_t>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        }
         return;
     case LLAISYS_DTYPE_BF16:
-        launch_paged_attention_prepared<llaisys::bf16_t>(
-            attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
-            nhead, nkvhead, head_dim);
+        if (is_decode) {
+            launch_paged_attention_decode_prepared<llaisys::bf16_t>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        } else {
+            launch_paged_attention_prepared<llaisys::bf16_t>(
+                attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
+                nhead, nkvhead, head_dim);
+        }
         return;
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(q->dtype());
@@ -1050,31 +1632,33 @@ void dispatch_attention_with_backend(tensor_t attn_val,
                                      int32_t block_table_width,
                                      int32_t block_size,
                                      float scale) {
-    CHECK_ARGUMENT(metadata.q_seq_rows != nullptr && metadata.q_pos != nullptr && metadata.block_tables != nullptr &&
-                       metadata.seq_lens != nullptr,
-                   "dispatch_attention_with_backend: metadata tensors must be non-null");
     const CommonAttentionMetadata &prepared = metadata;
-    if (backend == PagedAttentionBackend::FLASHINFER) {
-        // Stage-1 FlashInfer migration scaffold: keep behavior stable via native fallback
-        // while preserving a dedicated backend switch point for later real integration.
-        static bool warned_flashinfer = false;
-        if (!warned_flashinfer) {
-            warned_flashinfer = true;
-            printf("[warn] self_attention_paged: FLASHINFER backend requested, fallback to NATIVE\n");
+    const bool is_decode = is_decode_phase(prepared);
+    const bool is_prefill = is_prefill_phase(prepared);
+    CHECK_ARGUMENT(is_decode || is_prefill, "dispatch_attention_with_backend: invalid attention phase");
+    if (backend == PagedAttentionBackend::CUDNN) {
+        CHECK_ARGUMENT(prepared.cudnn_seq_lens_q != nullptr && prepared.cudnn_seq_lens_kv != nullptr &&
+                           prepared.cudnn_page_table != nullptr && prepared.cudnn_b_exec > 0,
+                       "dispatch_attention_with_backend: missing CUDNN metadata");
+        if (is_prefill) {
+            CHECK_ARGUMENT(prepared.cudnn_qo_ragged_offset != nullptr,
+                           "dispatch_attention_with_backend: missing CUDNN prefill ragged metadata");
         }
-    } else if (backend == PagedAttentionBackend::CUDNN) {
 #ifdef ENABLE_CUDNN_API
-        if (cudnn_try_paged_attention(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale)) {
-            return;
-        }
+        const bool ok = is_prefill
+                            ? cudnn_try_paged_attention_prefill(
+                                  attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale)
+                            : cudnn_try_paged_attention_decode(
+                                  attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
+        CHECK_ARGUMENT(ok, "self_attention_paged: CUDNN backend execution failed");
+        return;
 #else
-        static bool warned_cudnn_disabled = false;
-        if (!warned_cudnn_disabled) {
-            warned_cudnn_disabled = true;
-            printf("[warn] self_attention_paged: CUDNN backend requested but ENABLE_CUDNN_API is off; fallback to NATIVE\n");
-        }
+        CHECK_ARGUMENT(false, "self_attention_paged: CUDNN backend requested but ENABLE_CUDNN_API is off");
 #endif
     }
+    CHECK_ARGUMENT(prepared.cu_seqlens_q != nullptr && prepared.block_tables != nullptr &&
+                       prepared.cu_seqlens_k != nullptr,
+                   "dispatch_attention_with_backend: missing native BLOCK metadata");
     self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
 }
 
@@ -1082,10 +1666,12 @@ void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
                           tensor_t v_cache,
-                          tensor_t q_seq_rows,
-                          tensor_t q_pos,
+                          tensor_t cu_seqlens_q,
+                          tensor_t cu_seqlens_k,
                           tensor_t block_tables,
-                          tensor_t seq_lens,
+                          tensor_t slot_mapping,
+                          int32_t max_seqlen_q,
+                          int32_t max_seqlen_k,
                           int32_t block_table_width,
                           int32_t block_size,
                           float scale) {
@@ -1097,19 +1683,31 @@ void self_attention_paged(tensor_t attn_val,
     if (seqlen <= 0 || nhead <= 0 || head_dim <= 0 || nslot <= 0 || nkvhead <= 0) {
         return;
     }
-    if (q_seq_rows == nullptr || q_pos == nullptr || block_tables == nullptr || seq_lens == nullptr) {
+    if (cu_seqlens_q == nullptr || cu_seqlens_k == nullptr || block_tables == nullptr || slot_mapping == nullptr) {
         return;
     }
 
-    CHECK_ARGUMENT(q_seq_rows->deviceType() == LLAISYS_DEVICE_NVIDIA && q_pos->deviceType() == LLAISYS_DEVICE_NVIDIA &&
-                       block_tables->deviceType() == LLAISYS_DEVICE_NVIDIA && seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA,
+    CHECK_ARGUMENT(cu_seqlens_q->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       block_tables->deviceType() == LLAISYS_DEVICE_NVIDIA && cu_seqlens_k->deviceType() == LLAISYS_DEVICE_NVIDIA &&
+                       slot_mapping->deviceType() == LLAISYS_DEVICE_NVIDIA,
                    "self_attention_paged: metadata tensors must be CUDA");
+    CHECK_ARGUMENT(cu_seqlens_q->shape()[0] == cu_seqlens_k->shape()[0], "self_attention_paged: cu_seqlens size mismatch");
+    CHECK_ARGUMENT(slot_mapping->shape()[0] == static_cast<size_t>(seqlen), "self_attention_paged: slot_mapping size mismatch");
+    CHECK_ARGUMENT(max_seqlen_q > 0 && max_seqlen_k > 0, "self_attention_paged: invalid max_seqlen");
     CommonAttentionMetadata prepared{
-        reinterpret_cast<const int32_t *>(q_seq_rows->data()),
-        reinterpret_cast<const int32_t *>(q_pos->data()),
+        reinterpret_cast<const int32_t *>(cu_seqlens_q->data()),
+        reinterpret_cast<const int32_t *>(cu_seqlens_k->data()),
         reinterpret_cast<const int32_t *>(block_tables->data()),
-        reinterpret_cast<const int32_t *>(seq_lens->data()),
-        static_cast<int32_t>(seq_lens->shape()[0])};
+        reinterpret_cast<const int32_t *>(slot_mapping->data()),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        static_cast<int32_t>(cu_seqlens_q->shape()[0]) - 1,
+        max_seqlen_q,
+        max_seqlen_k,
+        (max_seqlen_q == 1 ? AttentionPhase::DECODE : AttentionPhase::PREFILL)};
     self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
 }
 

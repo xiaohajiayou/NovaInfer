@@ -53,6 +53,10 @@ __C {
 
     // Llaisys API for switching device context
     __export void llaisysSetContextRuntime(llaisysDeviceType_t, int);
+
+    // Lightweight NVTX helpers for Python-side timeline instrumentation.
+    __export void llaisysNvtxRangePush(const char *);
+    __export void llaisysNvtxRangePop(void);
 }
 
 #endif // LLAISYS_RUNTIME_H

@@ -18,6 +18,10 @@ class KvCacheLayout(IntEnum):
     SLOT = 0
     BLOCK = 1
 
+class AttentionPhase(IntEnum):
+    PREFILL = 0
+    DECODE = 1
+
 
 class LlaisysModelCreateParams(Structure):
     _fields_ = [
@@ -48,15 +52,21 @@ class LlaisysKvStats(Structure):
 class AttentionMetadata(Structure):
     _fields_ = [
         ("mode", c_int32),
+        ("phase", c_int32),
         ("seq_ids", llaisysTensor_t),
-        ("req_num_scheduled_tokens", llaisysTensor_t),
-        ("req_num_computed_tokens", llaisysTensor_t),
-        ("query_start_loc", llaisysTensor_t),
-        ("seq_lens", llaisysTensor_t),
+        ("pos_ids_host", llaisysTensor_t),
+        ("cu_seqlens_q", llaisysTensor_t),
+        ("cu_seqlens_k", llaisysTensor_t),
+        ("max_seqlen_q", c_int32),
+        ("max_seqlen_k", c_int32),
         ("slot_mapping", llaisysTensor_t),
         ("block_tables", llaisysTensor_t),
-        ("pos_ids_host", llaisysTensor_t),
         ("block_table_width", c_int32),
+        ("cudnn_seq_lens_q", llaisysTensor_t),
+        ("cudnn_seq_lens_kv", llaisysTensor_t),
+        ("cudnn_page_table", llaisysTensor_t),
+        ("cudnn_qo_ragged_offset", llaisysTensor_t),
+        ("cudnn_b_exec", c_int32),
     ]
 
 
@@ -162,6 +172,7 @@ __all__ = [
     "llaisysRuntime_t",
     "ModelType",
     "KvCacheLayout",
+    "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysRuntimeCreateParams",
     "LlaisysKvStats",

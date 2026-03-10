@@ -43,23 +43,35 @@ __C {
         ATTENTION_MODE_BLOCK = 1,
     } AttentionMode;
 
+    typedef enum AttentionPhase {
+        ATTENTION_PHASE_PREFILL = 0,
+        ATTENTION_PHASE_DECODE = 1,
+    } AttentionPhase;
+
     struct AttentionMetadata {
         int32_t mode; // AttentionMode
-        llaisysTensor_t seq_ids;       // [n_tokens], i64, host metadata
-        llaisysTensor_t q_seq_rows;    // [n_tokens], i32, BLOCK metadata (device checked by model)
-        llaisysTensor_t q_pos;         // [n_tokens], i32, BLOCK metadata (device checked by model)
-        llaisysTensor_t slot_mapping;  // [n_tokens], i32, BLOCK metadata (device checked by model)
-        llaisysTensor_t context_lens;  // [n_batch_seq], i32, BLOCK metadata (device checked by model)
-        llaisysTensor_t batch_seq_ids; // [n_batch_seq], i64, host metadata (BLOCK)
-        llaisysTensor_t block_tables;  // [n_batch_seq * block_table_width], i32, BLOCK metadata (device checked by model)
-        llaisysTensor_t pos_ids_host;  // [n_tokens], i64, optional host mirror for pos_ids
+        int32_t phase; // AttentionPhase
+        llaisysTensor_t seq_ids; // [n_tokens], i64, SLOT metadata
+        llaisysTensor_t pos_ids_host;    // [n_tokens], i64, SLOT metadata
+        llaisysTensor_t cu_seqlens_q;    // [n_batch_seq + 1], i32, BLOCK required
+        llaisysTensor_t cu_seqlens_k;    // [n_batch_seq + 1], i32, BLOCK required
+        int32_t max_seqlen_q;            // BLOCK required
+        int32_t max_seqlen_k;            // BLOCK required
+        llaisysTensor_t slot_mapping;    // [n_tokens], i32, BLOCK required
+        llaisysTensor_t block_tables;    // [n_batch_seq * block_table_width], i32, BLOCK metadata
         int32_t block_table_width;
+        // CUDNN-only BLOCK metadata. These fields are ignored by native BLOCK/SLOT paths.
+        llaisysTensor_t cudnn_seq_lens_q;   // [cudnn_b_exec], i32
+        llaisysTensor_t cudnn_seq_lens_kv;  // [cudnn_b_exec], i32
+        llaisysTensor_t cudnn_page_table;   // [cudnn_b_exec * block_table_width], i32
+        llaisysTensor_t cudnn_qo_ragged_offset; // [cudnn_b_exec + 1], i32, prefill-only
+        int32_t cudnn_b_exec;               // rows in cudnn_* metadata
     };
 
     struct ModelForwardInput {
         llaisysTensor_t input_ids;      // [n_tokens], i64
-        llaisysTensor_t pos_ids;        // [n_tokens], i64 (BLOCK required)
-        llaisysTensor_t logits_indices; // [n_logits], i64; rows selected for logits
+        llaisysTensor_t pos_ids;        // [n_tokens], i64, required
+        llaisysTensor_t logits_indices; // [n_logits], i64, required
         struct AttentionMetadata attention;
     };
 
@@ -116,6 +128,18 @@ __C {
                                          struct LlaisysRuntime *runtime,
                                          const struct ModelForwardInput *input,
                                          struct ModelForwardOutput *output);
+    // Build BLOCK attention runtime metadata on target device.
+    // Return: 0 success, -1 invalid input, -2 internal error.
+    __export int32_t llaisysRuntimeBuildBlockAttentionMetadata(
+        struct LlaisysRuntime *runtime,
+        llaisysTensor_t req_num_scheduled_tokens, // [n_batch_seq], i32
+        llaisysTensor_t req_num_computed_tokens,  // [n_batch_seq], i32
+        llaisysTensor_t block_tables,             // [n_batch_seq * block_table_width], i32
+        int32_t block_table_width,
+        int32_t ntoken,
+        llaisysTensor_t query_start_loc, // [n_batch_seq + 1], i32 (out)
+        llaisysTensor_t seq_lens,        // [n_batch_seq], i32 (out)
+        llaisysTensor_t slot_mapping);   // [ntoken], i32 (out)
     __export int32_t llaisysSamplerSample(struct LlaisysRuntime *runtime,
                                           const struct SamplerInput *input,
                                           struct SamplerOutput *output);

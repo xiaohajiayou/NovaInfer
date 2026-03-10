@@ -10,6 +10,7 @@ from llaisys.engine.sampler import Sampler
 from llaisys.libllaisys import LIB_LLAISYS, DataType, DeviceType
 from llaisys.libllaisys.model import (
     AttentionMetadata,
+    AttentionPhase,
     KvCacheLayout,
     LlaisysModelCreateParams,
     LlaisysRuntimeCreateParams,
@@ -196,12 +197,13 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
 
     attn = AttentionMetadata()
     attn.mode = int(batch.mode)
+    attn.phase = int(AttentionPhase.PREFILL)
     attn.seq_ids = seq_ids_t.lib_tensor()
     attn.pos_ids_host = pos_ids_host_t.lib_tensor()
-    attn.req_num_scheduled_tokens = None
-    attn.req_num_computed_tokens = None
-    attn.query_start_loc = None
-    attn.seq_lens = None
+    attn.cu_seqlens_q = None
+    attn.cu_seqlens_k = None
+    attn.max_seqlen_q = 0
+    attn.max_seqlen_k = 0
     attn.slot_mapping = None
     attn.block_tables = None
     attn.block_table_width = 0
@@ -217,6 +219,20 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
         req_comp_t = _make_tensor_1d(batch.req_num_computed_tokens, DataType.I32, device)
         block_tables_t = _make_tensor_1d(batch.block_tables, DataType.I32, device)
         n_batch_seq = len(batch.req_num_scheduled_tokens)
+        cu_q_vals = [0]
+        cu_k_vals = [0]
+        max_q = 0
+        max_k = 0
+        for n_sched, n_comp in zip(batch.req_num_scheduled_tokens, batch.req_num_computed_tokens):
+            seqlen_q = int(n_sched)
+            seqlen_k = int(n_sched) + int(n_comp)
+            cu_q_vals.append(int(cu_q_vals[-1]) + seqlen_q)
+            cu_k_vals.append(int(cu_k_vals[-1]) + seqlen_k)
+            max_q = max(max_q, seqlen_q)
+            max_k = max(max_k, seqlen_k)
+        cu_seqlens_q_t = _make_tensor_1d(cu_q_vals, DataType.I32, device)
+        cu_seqlens_k_t = _make_tensor_1d(cu_k_vals, DataType.I32, device)
+
         query_start_loc_t = Tensor((n_batch_seq + 1,), DataType.I32, device, 0)
         seq_lens_t = Tensor((n_batch_seq,), DataType.I32, device, 0)
         slot_mapping_t = Tensor((ntoken,), DataType.I32, device, 0)
@@ -235,13 +251,18 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
         )
         if rc != 0:
             raise RuntimeError(f"RuntimeBuildBlockAttentionMetadata failed with status={rc}")
-        attn.req_num_scheduled_tokens = req_sched_t.lib_tensor()
-        attn.req_num_computed_tokens = req_comp_t.lib_tensor()
-        attn.query_start_loc = query_start_loc_t.lib_tensor()
-        attn.seq_lens = seq_lens_t.lib_tensor()
+        attn.cu_seqlens_q = cu_seqlens_q_t.lib_tensor()
+        attn.cu_seqlens_k = cu_seqlens_k_t.lib_tensor()
+        attn.max_seqlen_q = int(max_q)
+        attn.max_seqlen_k = int(max_k)
         attn.slot_mapping = slot_mapping_t.lib_tensor()
         attn.block_tables = block_tables_t.lib_tensor()
         attn.block_table_width = int(batch.block_table_width)
+        is_decode = (
+            len(batch.req_num_scheduled_tokens) == ntoken
+            and all(int(v) == 1 for v in batch.req_num_scheduled_tokens)
+        )
+        attn.phase = int(AttentionPhase.DECODE if is_decode else AttentionPhase.PREFILL)
 
     logits_holder_t = Tensor((1,), DataType.F32, device, 0)
 

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from ..libllaisys import DeviceType
+from ..nvtx import nvtx_range
 from .config import EngineConfig
 from .cpu_model_runner import CPUModelRunner
 from .gpu_model_runner import GPUModelRunner
@@ -56,10 +57,12 @@ class Worker:
             close_fn()
 
     def execute_model(self, scheduler_outputs):
-        return self._model_runner.execute_model(scheduler_outputs)
+        with nvtx_range("py/worker/execute_model"):
+            return self._model_runner.execute_model(scheduler_outputs)
 
     def sample_tokens(self):
-        return self._model_runner.sample_tokens()
+        with nvtx_range("py/worker/sample_tokens"):
+            return self._model_runner.sample_tokens()
 
     def free_request(self, seq_id: int) -> None:
         fn = getattr(self._model_runner, "request_free", None)
