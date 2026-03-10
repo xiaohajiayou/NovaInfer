@@ -422,7 +422,6 @@ class GPUModelRunner:
         cu_seqlens_k: list[int],
         block_table_rows: list[list[int]],
         block_table_width: int,
-        ntoken: int,
     ) -> tuple[list[int], list[int], list[int], int]:
         nseq = len(block_table_rows)
         if nseq <= 0:
@@ -434,12 +433,12 @@ class GPUModelRunner:
         cu_k = np.asarray(cu_seqlens_k, dtype=np.int32)
         row_scheduled = np.diff(cu_q)
         row_seq_lens = np.diff(cu_k)
-        if np.any(row_scheduled < 0) or np.any(row_seq_lens < 0):
+        if np.any(row_seq_lens <= 0):
             raise RuntimeError("cudnn decode metadata has invalid negative lengths")
-        if int(row_scheduled.sum(dtype=np.int64)) != int(ntoken):
-            raise RuntimeError("cudnn metadata row count mismatch")
+        if int(cu_q[-1]) != int(nseq):
+            raise RuntimeError("cudnn decode metadata row count mismatch")
         # Decode-only contract: scheduler emits exactly one token per sequence.
-        if int(ntoken) != int(nseq) or not np.all(row_scheduled == 1):
+        if not np.all(row_scheduled == 1):
             raise RuntimeError(
                 "cudnn decode fast-path requires one scheduled token per sequence"
             )
@@ -626,35 +625,27 @@ class GPUModelRunner:
         if block_rows_np.shape != (n_outputs, int(block_table_width)):
             raise RuntimeError("block_tables flattened size mismatch")
 
-        block_rows_flat = block_rows_np.reshape(-1)
-        block_tables_host_t = self._block_tables_buf.cpu.slice(0, 0, n_block_elems)
         block_tables_t = self._block_tables_buf.gpu.slice(0, 0, n_block_elems)
         if not incremental_update:
+            block_rows_flat = block_rows_np.reshape(-1)
+            block_tables_host_t = self._block_tables_buf.cpu.slice(0, 0, n_block_elems)
             block_tables_host_t.copy_from_numpy(block_rows_flat)
             block_tables_t.copy_(block_tables_host_t, non_blocking=True, stream=h2d_stream)
             self._decode_block_table_cache = None
         else:
             cache = self._decode_block_table_cache
-            full_copy = cache is None or cache.shape != block_rows_np.shape
-            if full_copy:
-                block_tables_host_t.copy_from_numpy(block_rows_flat)
-                block_tables_t.copy_(block_tables_host_t, non_blocking=True, stream=h2d_stream)
+            if cache is None or cache.shape != block_rows_np.shape:
+                changed_rows = range(n_outputs)
             else:
-                changed_mask = np.any(block_rows_np != cache, axis=1)
-                changed_rows = np.flatnonzero(changed_mask)
-                n_changed = int(changed_rows.size)
-                # Row-by-row update is only worthwhile when a small subset changes.
-                if n_changed <= 0:
-                    pass
-                else:
-                    row_width = int(block_table_width)
-                    for row_idx in changed_rows.tolist():
-                        start = int(row_idx) * row_width
-                        end = start + row_width
-                        host_row_t = self._block_tables_buf.cpu.slice(0, start, end)
-                        dev_row_t = self._block_tables_buf.gpu.slice(0, start, end)
-                        host_row_t.copy_from_numpy(block_rows_np[int(row_idx)])
-                        dev_row_t.copy_(host_row_t, non_blocking=True, stream=h2d_stream)
+                changed_rows = np.flatnonzero(np.any(block_rows_np != cache, axis=1))
+            row_width = int(block_table_width)
+            for row_idx in changed_rows:
+                start = int(row_idx) * row_width
+                end = start + row_width
+                host_row_t = self._block_tables_buf.cpu.slice(0, start, end)
+                dev_row_t = self._block_tables_buf.gpu.slice(0, start, end)
+                host_row_t.copy_from_numpy(block_rows_np[row_idx])
+                dev_row_t.copy_(host_row_t, non_blocking=True, stream=h2d_stream)
             self._decode_block_table_cache = block_rows_np.copy()
 
         prepared.keepalive.append(block_tables_t)
@@ -768,7 +759,6 @@ class GPUModelRunner:
                 cu_seqlens_k=cu_seqlens_k,
                 block_table_rows=block_table_rows,
                 block_table_width=int(block_table_width),
-                ntoken=int(ntoken),
             )
             qo_ragged_offsets = None
         else:
@@ -1023,8 +1013,6 @@ class GPUModelRunner:
                 positions[i] = max(0, seqlen - 1)
                 seqlens_k[i] = int(seqlen)
             scheduled_token_counts = np.ones((nseq,), dtype=np.int64)
-            if len(input_ids) <= 0:
-                return None
 
             if not is_block_layout:
                 prepared = self._build_slot_tensors(
@@ -1054,10 +1042,6 @@ class GPUModelRunner:
                     + int(seq.last_block_num_tokens)
                     - 1
                 )
-            if int(cu_seqlens_q[-1]) != int(len(input_ids)):
-                raise ValueError("sum(seqlen_q) must equal ntoken")
-            if int(slot_mapping.shape[0]) != int(len(input_ids)):
-                raise ValueError("slot_mapping length must equal ntoken")
 
             block_table_rows, block_table_width = self._build_packed_block_table_rows(
                 seqs,
@@ -1071,8 +1055,8 @@ class GPUModelRunner:
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
-                cu_seqlens_q=cu_seqlens_q.tolist(),
-                cu_seqlens_k=cu_seqlens_k.tolist(),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=int(max_seqlen_k),
                 slot_mapping=slot_mapping,
