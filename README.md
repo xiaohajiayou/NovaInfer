@@ -184,10 +184,41 @@ NVIDIA CUDA + cuDNN frontend (for `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`):
 ```bash
 git submodule update --init --recursive
 xmake f --mode=release --nv-gpu=y --nv-cudnn=y
-xmake -j1
+xmake -j8
 xmake install
 ```
+```
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+python scripts/bench_compare_vllm.py \
+  --model-path /home/liwenxiao/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --backend vllm \
+  --num-seqs 20 \
+  --min-input-len 100 --max-input-len 150 \
+  --min-output-len 100 --max-output-len 150 \
+  --max-model-len 4096 \
+  --seed 0 \
+  --max-num-seqs 20 \
+  --max-num-batched-tokens 500 \
+  --kv-cache-memory-utilization 0.7 \
+  --vllm-fair-mode
 
+
+
+CUDA_LAUNCH_BLOCKING=1 \
+LLAISYS_CUDNN_DEBUG=1 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+python scripts/bench_compare_vllm.py \
+  --model-path /home/liwenxiao/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --backend novainfer \
+  --num-seqs 20 \
+  --min-input-len 100 --max-input-len 150 \
+  --min-output-len 1 --max-output-len 1 \
+  --max-model-len 4096 \
+  --seed 0 \
+  --max-num-seqs 20 \
+  --max-num-batched-tokens 500 \
+  --kv-cache-memory-utilization 0.7
+```
 Notes:
 
 - `xmake f ...` configures build mode/options; rerun it when switching CPU/GPU/cudnn.

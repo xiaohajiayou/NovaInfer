@@ -1,4 +1,5 @@
 from typing import Sequence, Tuple
+import numpy as np
 
 from .libllaisys import (
     LIB_LLAISYS,
@@ -108,8 +109,8 @@ class Tensor:
         n = len(values)
         if n <= 0:
             return
-        if n > self.numel():
-            raise RuntimeError(f"copy_from_sequence() overflow: values={n} > tensor.numel={self.numel()}")
+        if n != self.numel():
+            raise RuntimeError(f"copy_from_sequence() overflow: values={n} != tensor.numel={self.numel()}")
         dtype = self.dtype()
         if dtype == DataType.I64:
             buf = (c_int64 * n)(*[int(x) for x in values])
@@ -124,6 +125,31 @@ class Tensor:
         else:
             raise RuntimeError(f"copy_from_sequence() unsupported dtype: {dtype}")
         self.load(cast(buf, c_void_p))
+
+    def copy_from_numpy(self, values: np.ndarray) -> None:
+        arr = np.asarray(values)
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        n = int(arr.size)
+        if n <= 0:
+            return
+        if n > self.numel():
+            raise RuntimeError(f"copy_from_numpy() overflow: values={n} > tensor.numel={self.numel()}")
+        dtype = self.dtype()
+        if dtype == DataType.I64:
+            target_dtype = np.int64
+        elif dtype == DataType.I32:
+            target_dtype = np.int32
+        elif dtype == DataType.I8:
+            target_dtype = np.int8
+        elif dtype == DataType.F32:
+            target_dtype = np.float32
+        elif dtype == DataType.F64:
+            target_dtype = np.float64
+        else:
+            raise RuntimeError(f"copy_from_numpy() unsupported dtype: {dtype}")
+        arr = np.ascontiguousarray(arr, dtype=target_dtype)
+        self.load(c_void_p(arr.ctypes.data))
 
     def is_contiguous(self) -> bool:
         return bool(LIB_LLAISYS.tensorIsContiguous(self._tensor))

@@ -742,6 +742,66 @@ static bool cudnn_set_stream(cudnnHandle_t &handle, cudaStream_t stream) {
 }
 
 #ifdef ENABLE_CUDNN_FRONTEND
+static bool cudnn_debug_enabled() {
+    static int enabled = -1;
+    if (enabled >= 0) {
+        return enabled != 0;
+    }
+    const char *raw = std::getenv("LLAISYS_CUDNN_DEBUG");
+    if (raw == nullptr || raw[0] == '\0' || (raw[0] == '0' && raw[1] == '\0')) {
+        enabled = 0;
+    } else {
+        enabled = 1;
+    }
+    return enabled != 0;
+}
+
+static void cudnn_debug_dump_i32(const char *tag, const int32_t *dev_ptr, int64_t n, int64_t limit = 16) {
+    if (!cudnn_debug_enabled()) {
+        return;
+    }
+    if (dev_ptr == nullptr || n <= 0) {
+        printf("[cudnn][dbg] %s ptr=%p n=%lld\n", tag, static_cast<const void *>(dev_ptr), static_cast<long long>(n));
+        return;
+    }
+    const int64_t m = std::max<int64_t>(0, std::min<int64_t>(n, limit));
+    std::vector<int32_t> host(static_cast<size_t>(m), 0);
+    const cudaError_t rc = cudaMemcpy(host.data(), dev_ptr, static_cast<size_t>(m) * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (rc != cudaSuccess) {
+        printf("[cudnn][dbg] %s memcpy failed: %s\n", tag, cudaGetErrorString(rc));
+        return;
+    }
+    printf("[cudnn][dbg] %s n=%lld first=%lld vals=", tag, static_cast<long long>(n), static_cast<long long>(m));
+    for (int64_t i = 0; i < m; ++i) {
+        printf("%d%s", host[static_cast<size_t>(i)], (i + 1 == m ? "" : ","));
+    }
+    printf("\n");
+}
+
+static void cudnn_debug_dump_override(const std::vector<int64_t> &override_uids,
+                                      const std::vector<std::vector<int64_t>> &override_shapes,
+                                      const std::vector<std::vector<int64_t>> &override_strides) {
+    if (!cudnn_debug_enabled()) {
+        return;
+    }
+    const size_t n = std::min(override_uids.size(), std::min(override_shapes.size(), override_strides.size()));
+    printf("[cudnn][dbg] override_count=%lld\n", static_cast<long long>(n));
+    for (size_t i = 0; i < n; ++i) {
+        auto print_vec = [](const std::vector<int64_t> &v) {
+            printf("[");
+            for (size_t j = 0; j < v.size(); ++j) {
+                printf("%lld%s", static_cast<long long>(v[j]), (j + 1 == v.size() ? "" : ","));
+            }
+            printf("]");
+        };
+        printf("[cudnn][dbg] uid=%lld shape=", static_cast<long long>(override_uids[i]));
+        print_vec(override_shapes[i]);
+        printf(" stride=");
+        print_vec(override_strides[i]);
+        printf("\n");
+    }
+}
+
 static void build_cudnn_override_tensors(bool is_prefill,
                                          int64_t b_exec,
                                          int64_t s_q_exec,
@@ -762,8 +822,10 @@ static void build_cudnn_override_tensors(bool is_prefill,
     };
 
     // Runtime q/attn_val buffers are token-major contiguous: [sum_q, nhead, head_dim].
-    // Map SDPA logical axes [b, h, s, d] onto that storage with s-major traversal.
-    const int64_t q_stride_b = s_q_exec * nhead * head_dim;
+    // For ragged THD, both logical axes `b` and `s` advance by one token in
+    // flattened storage; offsets across requests are provided by ragged_offset.
+    // This matches cuDNN chunked-prefill examples.
+    const int64_t q_stride_b = nhead * head_dim;
     const int64_t q_stride_h = head_dim;
     const int64_t q_stride_s = nhead * head_dim;
     push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
@@ -864,7 +926,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                        .set_name("Q")
                        .set_uid(Q_UID)
                        .set_dim({b_plan, nhead, s_q_plan, head_dim})
-                       .set_stride({s_q_plan * nhead * head_dim, head_dim, nhead * head_dim, 1});
+                       .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
     if (qo_ragged_offset != nullptr) {
         q_attrs.set_ragged_offset(qo_ragged_offset);
     }
@@ -931,9 +993,12 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     O->set_output(true)
         .set_uid(O_UID)
         .set_dim({b_plan, nhead, s_q_plan, head_dim})
-        .set_stride({s_q_plan * nhead * head_dim, head_dim, nhead * head_dim, 1});
-    // NOTE: cuDNN paged SDPA sample attaches ragged offset to Q only.
-    // Keep O dense to maximize engine availability in prefill.
+        .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
+    if (qo_ragged_offset != nullptr) {
+        // Emit packed prefill output directly so runtime output layout stays
+        // consistent with native path ([sum_q, nhead, head_dim]).
+        O->set_ragged_offset(qo_ragged_offset);
+    }
 
     auto build_status = [&]() {
         LLAISYS_NVTX_SCOPE(is_prefill ? "attn/cudnn/prefill/graph_build" : "attn/cudnn/decode/graph_build");
@@ -1195,20 +1260,22 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
     if (prepared.max_seqlen_k <= 0 || static_cast<int64_t>(prepared.max_seqlen_k) > max_seq_len_kv) {
         return false;
     }
-    // printf(
-    //     "[cudnn] prefill_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
-    //     "max_seqlen_k=%d table_size=%d block_size=%d\n",
-    //     static_cast<long long>(seqlen),
-    //     static_cast<long long>(nhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(nslot),
-    //     static_cast<long long>(nkvhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(b_exec),
-    //     static_cast<long long>(max_seq_len_q),
-    //     int(prepared.max_seqlen_k),
-    //     int(table_size),
-    //     int(block_size));
+    if (cudnn_debug_enabled()) {
+        printf(
+            "[cudnn][dbg] prefill_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
+            "max_seqlen_k=%d table_size=%d block_size=%d\n",
+            static_cast<long long>(seqlen),
+            static_cast<long long>(nhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(nslot),
+            static_cast<long long>(nkvhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(b_exec),
+            static_cast<long long>(max_seq_len_q),
+            int(prepared.max_seqlen_k),
+            int(table_size),
+            int(block_size));
+    }
 
     CudnnRuntimeState &state = cudnn_runtime_state();
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
@@ -1226,19 +1293,6 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
         return false;
     }
 
-    const int64_t dense_tokens = b_exec * std::max<int64_t>(1, max_seq_len_q);
-    const bool need_compact_output = (dense_tokens != seqlen);
-    tensor_t dense_attn_out = nullptr;
-    void *cudnn_out_ptr = attn_val->data();
-    if (need_compact_output) {
-        dense_attn_out = Tensor::create(
-            {static_cast<size_t>(dense_tokens), static_cast<size_t>(nhead), static_cast<size_t>(head_dim)},
-            q->dtype(),
-            q->deviceType(),
-            q->deviceId());
-        cudnn_out_ptr = dense_attn_out->data();
-    }
-
     std::unordered_map<int64_t, void *> variant_pack;
     std::vector<int64_t> override_uids;
     std::vector<std::vector<int64_t>> override_shapes;
@@ -1249,7 +1303,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
             {Q_UID, q->data()},
             {K_UID, k_cache->data()},
             {V_UID, v_cache->data()},
-            {O_UID, cudnn_out_ptr},
+            {O_UID, attn_val->data()},
             {SEQ_LEN_Q_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_q)},
             {SEQ_LEN_KV_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_kv)},
             {PAGE_TABLE_K_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
@@ -1266,6 +1320,11 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
             override_uids,
             override_shapes,
             override_strides);
+        cudnn_debug_dump_override(override_uids, override_shapes, override_strides);
+        cudnn_debug_dump_i32("prefill.seq_lens_q", prepared.cudnn_seq_lens_q, b_exec, 32);
+        cudnn_debug_dump_i32("prefill.seq_lens_kv", prepared.cudnn_seq_lens_kv, b_exec, 32);
+        cudnn_debug_dump_i32("prefill.ragged_qo", prepared.cudnn_qo_ragged_offset, b_exec + 1, 33);
+        cudnn_debug_dump_i32("prefill.page_table", prepared.cudnn_page_table, b_exec * table_size, 64);
     }
 
     auto exec_status = [&]() {
@@ -1281,34 +1340,6 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
                    exec_status.get_message().c_str());
         }
         return false;
-    }
-    if (need_compact_output) {
-        switch (q->dtype()) {
-        case LLAISYS_DTYPE_F16:
-            launch_compact_prefill_output<llaisys::fp16_t>(
-                attn_val,
-                dense_attn_out,
-                prepared.cudnn_qo_ragged_offset,
-                static_cast<int32_t>(b_exec),
-                static_cast<int32_t>(max_seq_len_q),
-                static_cast<int32_t>(nhead),
-                static_cast<int32_t>(head_dim),
-                stream);
-            break;
-        case LLAISYS_DTYPE_BF16:
-            launch_compact_prefill_output<llaisys::bf16_t>(
-                attn_val,
-                dense_attn_out,
-                prepared.cudnn_qo_ragged_offset,
-                static_cast<int32_t>(b_exec),
-                static_cast<int32_t>(max_seq_len_q),
-                static_cast<int32_t>(nhead),
-                static_cast<int32_t>(head_dim),
-                stream);
-            break;
-        default:
-            return false;
-        }
     }
     return true;
 #else

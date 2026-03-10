@@ -4,6 +4,7 @@ import os
 from ctypes import byref, c_int32, c_int64
 from dataclasses import dataclass
 from pathlib import Path
+import numpy as np
 
 from .buffers import CpuGpuBuffer
 from .config import EngineConfig
@@ -351,13 +352,13 @@ class GPUModelRunner:
         self._compute_streams[int(device_id)] = stream
         return stream
 
-    def _build_output_rows(self, scheduled_token_counts: list[int], n_outputs: int) -> list[int]:
-        output_rows: list[int] = []
-        running = 0
-        for n_sched in scheduled_token_counts:
-            running += int(n_sched)
-            output_rows.append(int(running - 1))
-        if len(output_rows) != n_outputs:
+    def _build_output_rows(self, scheduled_token_counts: list[int], n_outputs: int) -> np.ndarray:
+        counts = np.asarray(scheduled_token_counts, dtype=np.int64)
+        if counts.size == 0:
+            output_rows = np.empty((0,), dtype=np.int64)
+        else:
+            output_rows = np.cumsum(counts, dtype=np.int64) - 1
+        if int(output_rows.size) != int(n_outputs):
             raise RuntimeError("output_rows size mismatch")
         return output_rows
 
@@ -381,6 +382,24 @@ class GPUModelRunner:
             out <<= 1
         return out
 
+    def _build_packed_block_table_rows(self, seqs: list) -> tuple[list[list[int]], int]:
+        if not seqs:
+            raise RuntimeError("BLOCK layout requires non-empty seq list")
+        widths = [len(getattr(seq, "block_table", [])) for seq in seqs]
+        if any(w <= 0 for w in widths):
+            raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
+        block_table_width = int(max(widths))
+        rows: list[list[int]] = []
+        for seq in seqs:
+            row = [int(b) for b in seq.block_table]
+            if any(v < 0 for v in row):
+                raise RuntimeError("block_table contains invalid negative block id")
+            if len(row) < block_table_width:
+                # Packed semantics: pad tail with a valid block id instead of sentinel.
+                row.extend([int(row[-1])] * (block_table_width - len(row)))
+            rows.append(row)
+        return rows, block_table_width
+
     def _build_cudnn_decode_rows(
         self,
         *,
@@ -393,7 +412,7 @@ class GPUModelRunner:
         b_exec = int(ntoken)
         seq_q_rows: list[int] = [1] * b_exec
         seq_kv_rows: list[int] = [0] * b_exec
-        page_rows: list[int] = [-1] * (b_exec * int(block_table_width))
+        page_rows: list[int] = [0] * (b_exec * int(block_table_width))
 
         row_idx = 0
         for seq_row in range(len(block_table_rows)):
@@ -411,6 +430,8 @@ class GPUModelRunner:
                 row_idx += 1
         if row_idx != int(ntoken):
             raise RuntimeError("cudnn metadata row count mismatch")
+        if any(int(v) < 0 for v in page_rows):
+            raise RuntimeError("cudnn decode page_table contains invalid negative block id")
         return seq_q_rows, seq_kv_rows, page_rows, int(b_exec)
 
     def _build_cudnn_prefill_rows(
@@ -441,6 +462,8 @@ class GPUModelRunner:
         page_rows = [int(v) for row in block_table_rows for v in row]
         if len(page_rows) != int(b_exec) * int(block_table_width):
             raise RuntimeError("cudnn prefill page_table size mismatch")
+        if any(int(v) < 0 for v in page_rows):
+            raise RuntimeError("cudnn prefill page_table contains invalid negative block id")
 
         hd = int(self._num_heads) * int(self._head_dim)
         if hd <= 0:
@@ -485,8 +508,8 @@ class GPUModelRunner:
         pos_ids_t = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
         dev_id = int(input_ids_t.device_id())
         h2d_stream = self._get_runtime_compute_stream(dev_id)
-        input_ids_host_t.copy_from_sequence(input_ids)
-        pos_ids_host_t.copy_from_sequence(positions)
+        input_ids_host_t.copy_from_numpy(np.asarray(input_ids, dtype=np.int64))
+        pos_ids_host_t.copy_from_numpy(np.asarray(positions, dtype=np.int64))
         input_ids_t.copy_(input_ids_host_t, non_blocking=True, stream=h2d_stream)
         pos_ids_t.copy_(pos_ids_host_t, non_blocking=True, stream=h2d_stream)
         keepalive.extend([input_ids_t, pos_ids_t])
@@ -494,7 +517,7 @@ class GPUModelRunner:
         logits_indices_host_t = self._output_ids_buf.cpu.slice(0, 0, n_outputs)
         logits_indices_t = self._output_ids_buf.gpu.slice(0, 0, n_outputs)
         if n_outputs > 0:
-            logits_indices_host_t.copy_from_sequence(output_rows)
+            logits_indices_host_t.copy_from_numpy(output_rows)
             logits_indices_t.copy_(logits_indices_host_t, non_blocking=True, stream=h2d_stream)
         keepalive.append(logits_indices_t)
 
@@ -549,7 +572,7 @@ class GPUModelRunner:
         ):
             raise RuntimeError("GPU block native builder requires CpuGpuBuffer tensors")
 
-        block_rows_flat = [int(v) for row in block_table_rows for v in row]
+        block_rows_flat = np.asarray(block_table_rows, dtype=np.int32).reshape(-1)
         cu_seqlens_q_host_t = self._cu_seqlens_q_buf.cpu.slice(0, 0, len(cu_seqlens_q))
         cu_seqlens_q_t = self._cu_seqlens_q_buf.gpu.slice(0, 0, len(cu_seqlens_q))
         cu_seqlens_k_host_t = self._cu_seqlens_k_buf.cpu.slice(0, 0, len(cu_seqlens_k))
@@ -559,10 +582,10 @@ class GPUModelRunner:
         block_tables_host_t = self._block_tables_buf.cpu.slice(0, 0, n_block_elems)
         block_tables_t = self._block_tables_buf.gpu.slice(0, 0, n_block_elems)
 
-        cu_seqlens_q_host_t.copy_from_sequence(cu_seqlens_q)
-        cu_seqlens_k_host_t.copy_from_sequence(cu_seqlens_k)
-        slot_mapping_host_t.copy_from_sequence(slot_mapping)
-        block_tables_host_t.copy_from_sequence(block_rows_flat)
+        cu_seqlens_q_host_t.copy_from_numpy(np.asarray(cu_seqlens_q, dtype=np.int32))
+        cu_seqlens_k_host_t.copy_from_numpy(np.asarray(cu_seqlens_k, dtype=np.int32))
+        slot_mapping_host_t.copy_from_numpy(np.asarray(slot_mapping, dtype=np.int32))
+        block_tables_host_t.copy_from_numpy(block_rows_flat)
         cu_seqlens_q_t.copy_(cu_seqlens_q_host_t, non_blocking=True, stream=h2d_stream)
         cu_seqlens_k_t.copy_(cu_seqlens_k_host_t, non_blocking=True, stream=h2d_stream)
         slot_mapping_t.copy_(slot_mapping_host_t, non_blocking=True, stream=h2d_stream)
@@ -616,13 +639,13 @@ class GPUModelRunner:
         ):
             raise RuntimeError("GPU block cudnn builder requires CpuGpuBuffer tensors")
 
-        block_rows_flat = [int(v) for row in block_table_rows for v in row]
+        block_rows_flat = np.asarray(block_table_rows, dtype=np.int32).reshape(-1)
         slot_mapping_host_t = self._slot_mapping_buf.cpu.slice(0, 0, ntoken)
         slot_mapping_t = self._slot_mapping_buf.gpu.slice(0, 0, ntoken)
         block_tables_host_t = self._block_tables_buf.cpu.slice(0, 0, n_block_elems)
         block_tables_t = self._block_tables_buf.gpu.slice(0, 0, n_block_elems)
-        slot_mapping_host_t.copy_from_sequence(slot_mapping)
-        block_tables_host_t.copy_from_sequence(block_rows_flat)
+        slot_mapping_host_t.copy_from_numpy(np.asarray(slot_mapping, dtype=np.int32))
+        block_tables_host_t.copy_from_numpy(block_rows_flat)
         slot_mapping_t.copy_(slot_mapping_host_t, non_blocking=True, stream=h2d_stream)
         block_tables_t.copy_(block_tables_host_t, non_blocking=True, stream=h2d_stream)
         prepared.keepalive.extend([slot_mapping_t, block_tables_t])
@@ -663,9 +686,9 @@ class GPUModelRunner:
         cudnn_page_table_host_t = self._cudnn_page_table_buf.cpu.slice(0, 0, len(page_rows))
         cudnn_page_table_t = self._cudnn_page_table_buf.gpu.slice(0, 0, len(page_rows))
 
-        cudnn_seq_lens_q_host_t.copy_from_sequence(seq_q_rows)
-        cudnn_seq_lens_kv_host_t.copy_from_sequence(seq_kv_rows)
-        cudnn_page_table_host_t.copy_from_sequence(page_rows)
+        cudnn_seq_lens_q_host_t.copy_from_numpy(np.asarray(seq_q_rows, dtype=np.int32))
+        cudnn_seq_lens_kv_host_t.copy_from_numpy(np.asarray(seq_kv_rows, dtype=np.int32))
+        cudnn_page_table_host_t.copy_from_numpy(np.asarray(page_rows, dtype=np.int32))
         cudnn_seq_lens_q_t.copy_(cudnn_seq_lens_q_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_seq_lens_kv_t.copy_(cudnn_seq_lens_kv_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_page_table_t.copy_(cudnn_page_table_host_t, non_blocking=True, stream=h2d_stream)
@@ -678,7 +701,7 @@ class GPUModelRunner:
         if qo_ragged_offsets is not None:
             ragged_host_t = self._cudnn_qo_ragged_offset_buf.cpu.slice(0, 0, int(b_exec) + 1)
             ragged_t = self._cudnn_qo_ragged_offset_buf.gpu.slice(0, 0, int(b_exec) + 1)
-            ragged_host_t.copy_from_sequence(qo_ragged_offsets)
+            ragged_host_t.copy_from_numpy(np.asarray(qo_ragged_offsets, dtype=np.int32))
             ragged_t.copy_(ragged_host_t, non_blocking=True, stream=h2d_stream)
             prepared.keepalive.append(ragged_t)
             prepared.cudnn_qo_ragged_offset = ragged_t
@@ -722,25 +745,25 @@ class GPUModelRunner:
             dev_id = int(input_ids_t.device_id())
             h2d_stream = self._get_runtime_compute_stream(dev_id)
 
-            input_ids_host_t.copy_from_sequence(input_ids)
-            pos_ids_host_t.copy_from_sequence(positions)
+            input_ids_host_t.copy_from_numpy(np.asarray(input_ids, dtype=np.int64))
+            pos_ids_host_t.copy_from_numpy(np.asarray(positions, dtype=np.int64))
             input_ids_t.copy_(input_ids_host_t, non_blocking=True, stream=h2d_stream)
             pos_ids_t.copy_(pos_ids_host_t, non_blocking=True, stream=h2d_stream)
             keepalive.extend([input_ids_t, pos_ids_t])
 
-            seq_token_ids: list[int] = []
-            for seq_obj, n_sched in zip(seqs, scheduled_token_counts):
-                seq_token_ids.extend([int(seq_obj.seq_id)] * int(n_sched))
+            seq_ids_per_req = np.asarray([int(seq_obj.seq_id) for seq_obj in seqs], dtype=np.int64)
+            sched_counts = np.asarray(scheduled_token_counts, dtype=np.int64)
+            seq_token_ids = np.repeat(seq_ids_per_req, sched_counts)
             seq_ids_host_t = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
             seq_ids_t = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
-            seq_ids_host_t.copy_from_sequence(seq_token_ids)
+            seq_ids_host_t.copy_from_numpy(seq_token_ids)
             seq_ids_t.copy_(seq_ids_host_t, non_blocking=True, stream=h2d_stream)
             keepalive.extend([seq_ids_t, pos_ids_host_t])
 
             logits_indices_host_t = self._output_ids_buf.cpu.slice(0, 0, n_outputs)
             logits_indices_t = self._output_ids_buf.gpu.slice(0, 0, n_outputs)
             if n_outputs > 0:
-                logits_indices_host_t.copy_from_sequence(output_rows)
+                logits_indices_host_t.copy_from_numpy(output_rows)
                 logits_indices_t.copy_(logits_indices_host_t, non_blocking=True, stream=h2d_stream)
             keepalive.append(logits_indices_t)
 
@@ -865,11 +888,7 @@ class GPUModelRunner:
             if len(slot_mapping) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_width = max(len(seq.block_table) for seq in seqs)
-            block_table_rows = [
-                [int(b) for b in seq.block_table] + [-1] * (block_table_width - len(seq.block_table))
-                for seq in seqs
-            ]
+            block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
             prepared = self._build_block_tensors(
                 seqs=seqs,
                 attention_phase=int(AttentionPhase.PREFILL),
@@ -931,11 +950,7 @@ class GPUModelRunner:
             if len(slot_mapping) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_width = max(len(seq.block_table) for seq in seqs)
-            block_table_rows = [
-                [int(b) for b in seq.block_table] + [-1] * (block_table_width - len(seq.block_table))
-                for seq in seqs
-            ]
+            block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
             prepared = self._build_block_tensors(
                 seqs=seqs,
                 attention_phase=int(AttentionPhase.DECODE),
