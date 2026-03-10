@@ -333,7 +333,7 @@ class GPUModelRunner:
                 if callable(sync_fn):
                     sync_fn(compute_stream)
             with nvtx_range("py/runner/sample_tokens/to_list"):
-                return [int(token_id) for token_id in sampled_host.tolist()]
+                return sampled_host.tolist()
 
     def _make_buffer(self, shape: tuple[int, ...], dtype: DataType, pin_memory: bool = True) -> Buffer:
         if self._device == DeviceType.CPU:
@@ -422,7 +422,7 @@ class GPUModelRunner:
         cu_seqlens_k: list[int],
         block_table_rows: list[list[int]],
         block_table_width: int,
-    ) -> tuple[list[int], list[int], list[int], int]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
         nseq = len(block_table_rows)
         if nseq <= 0:
             raise RuntimeError("cudnn decode metadata requires non-empty batch")
@@ -450,13 +450,9 @@ class GPUModelRunner:
         seq_q_rows_np = np.ones((b_exec,), dtype=np.int32)
         seq_kv_rows_np = row_seq_lens.astype(np.int32, copy=False)
         page_rows_np = block_rows_np.reshape(-1)
-
-        seq_q_rows = seq_q_rows_np.tolist()
-        seq_kv_rows = seq_kv_rows_np.tolist()
-        page_rows = page_rows_np.tolist()
-        if any(int(v) < 0 for v in page_rows):
+        if np.any(page_rows_np < 0):
             raise RuntimeError("cudnn decode page_table contains invalid negative block id")
-        return seq_q_rows, seq_kv_rows, page_rows, int(b_exec)
+        return seq_q_rows_np, seq_kv_rows_np, page_rows_np, int(b_exec)
 
     def _build_cudnn_prefill_rows(
         self,
@@ -466,7 +462,7 @@ class GPUModelRunner:
         block_table_rows: list[list[int]],
         block_table_width: int,
         ntoken: int,
-    ) -> tuple[list[int], list[int], list[int], int, list[int]]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
         nseq = len(block_table_rows)
         if nseq <= 0:
             raise RuntimeError("cudnn prefill metadata requires non-empty batch")
@@ -490,12 +486,9 @@ class GPUModelRunner:
 
         b_exec = int(nseq)
         page_rows_np = block_rows_np.reshape(-1)
-        seq_q_rows = seq_q_rows_np.tolist()
-        seq_kv_rows = seq_kv_rows_np.tolist()
-        page_rows = page_rows_np.tolist()
-        if len(page_rows) != int(b_exec) * int(block_table_width):
+        if int(page_rows_np.size) != int(b_exec) * int(block_table_width):
             raise RuntimeError("cudnn prefill page_table size mismatch")
-        if any(int(v) < 0 for v in page_rows):
+        if np.any(page_rows_np < 0):
             raise RuntimeError("cudnn prefill page_table contains invalid negative block id")
 
         hd = int(self._num_heads) * int(self._head_dim)
@@ -507,8 +500,8 @@ class GPUModelRunner:
                 np.cumsum(seq_q_rows_np, dtype=np.int64),
             )
         )
-        ragged_offsets = (token_prefix * np.int64(hd)).astype(np.int64, copy=False).tolist()
-        return seq_q_rows, seq_kv_rows, page_rows, b_exec, ragged_offsets
+        ragged_offsets_np = (token_prefix * np.int64(hd)).astype(np.int32, copy=False)
+        return seq_q_rows_np, seq_kv_rows_np, page_rows_np, b_exec, ragged_offsets_np
 
     def _build_common_io_tensors(
         self,
@@ -778,9 +771,9 @@ class GPUModelRunner:
         cudnn_page_table_t = self._cudnn_page_table_buf.gpu.slice(0, 0, len(page_rows))
 
         slot_mapping_host_t.copy_from_numpy(np.asarray(slot_mapping, dtype=np.int32))
-        cudnn_seq_lens_q_host_t.copy_from_numpy(np.asarray(seq_q_rows, dtype=np.int32))
-        cudnn_seq_lens_kv_host_t.copy_from_numpy(np.asarray(seq_kv_rows, dtype=np.int32))
-        cudnn_page_table_host_t.copy_from_numpy(np.asarray(page_rows, dtype=np.int32))
+        cudnn_seq_lens_q_host_t.copy_from_numpy(seq_q_rows)
+        cudnn_seq_lens_kv_host_t.copy_from_numpy(seq_kv_rows)
+        cudnn_page_table_host_t.copy_from_numpy(page_rows)
         slot_mapping_t.copy_(slot_mapping_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_seq_lens_q_t.copy_(cudnn_seq_lens_q_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_seq_lens_kv_t.copy_(cudnn_seq_lens_kv_host_t, non_blocking=True, stream=h2d_stream)
@@ -798,7 +791,7 @@ class GPUModelRunner:
         if qo_ragged_offsets is not None:
             ragged_host_t = self._cudnn_qo_ragged_offset_buf.cpu.slice(0, 0, int(b_exec) + 1)
             ragged_t = self._cudnn_qo_ragged_offset_buf.gpu.slice(0, 0, int(b_exec) + 1)
-            ragged_host_t.copy_from_numpy(np.asarray(qo_ragged_offsets, dtype=np.int32))
+            ragged_host_t.copy_from_numpy(qo_ragged_offsets)
             ragged_t.copy_(ragged_host_t, non_blocking=True, stream=h2d_stream)
             prepared.keepalive.append(ragged_t)
             prepared.cudnn_qo_ragged_offset = ragged_t
@@ -983,8 +976,8 @@ class GPUModelRunner:
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
-                cu_seqlens_q=cu_seqlens_q.tolist(),
-                cu_seqlens_k=cu_seqlens_k.tolist(),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=int(max_seqlen_q),
                 max_seqlen_k=int(max_seqlen_k),
                 slot_mapping=slot_mapping,
