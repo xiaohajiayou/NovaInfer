@@ -865,11 +865,7 @@ class GPUModelRunner:
             if len(slot_mapping) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_width = (
-                int(self._max_block_table_width)
-                if self._use_cudnn_block_builder()
-                else max(len(seq.block_table) for seq in seqs)
-            )
+            block_table_width = max(len(seq.block_table) for seq in seqs)
             block_table_rows = [
                 [int(b) for b in seq.block_table] + [-1] * (block_table_width - len(seq.block_table))
                 for seq in seqs
@@ -935,11 +931,7 @@ class GPUModelRunner:
             if len(slot_mapping) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_width = (
-                int(self._max_block_table_width)
-                if self._use_cudnn_block_builder()
-                else max(len(seq.block_table) for seq in seqs)
-            )
+            block_table_width = max(len(seq.block_table) for seq in seqs)
             block_table_rows = [
                 [int(b) for b in seq.block_table] + [-1] * (block_table_width - len(seq.block_table))
                 for seq in seqs

@@ -494,10 +494,8 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
                 int(attn_state.max_seqlen_k),
                 static_cast<ops::cuda::AttentionPhase>(attn_state.attention_phase),
             };
-            const bool use_cudnn_decode =
-                attn_state.use_cudnn_backend && attn_state.attention_phase == ATTENTION_PHASE_DECODE;
             const auto backend =
-                use_cudnn_decode ? paged_attn_backend_ : ops::cuda::PagedAttentionBackend::NATIVE;
+                attn_state.use_cudnn_backend ? paged_attn_backend_ : ops::cuda::PagedAttentionBackend::NATIVE;
             ops::cuda::dispatch_attention_with_backend(
                 attn_out,
                 rope_q,
@@ -642,7 +640,10 @@ int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMe
         has_tensor(attn.cudnn_seq_lens_kv) &&
         has_tensor(attn.cudnn_page_table) &&
         (attn.phase != ATTENTION_PHASE_PREFILL || has_tensor(attn.cudnn_qo_ragged_offset));
-    const bool use_cudnn_backend = want_cudnn_backend && has_cudnn_meta;
+    if (want_cudnn_backend) {
+        CHECK_ARGUMENT(has_cudnn_meta, "Qwen2: CUDNN backend requested but missing CUDNN BLOCK metadata");
+    }
+    const bool use_cudnn_backend = want_cudnn_backend;
     state->use_cudnn_backend = use_cudnn_backend;
 
     state->max_seqlen_q = int(attn.max_seqlen_q);

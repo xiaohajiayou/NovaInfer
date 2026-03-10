@@ -205,6 +205,79 @@ void launch_scatter_cache_by_slots(tensor_t dst_cache, tensor_t src_tokens, cons
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename T>
+__global__ void compact_prefill_output_kernel(T *dst_packed,
+                                              const T *src_dense,
+                                              const int32_t *qo_ragged_offset,
+                                              int32_t seqlen,
+                                              int32_t b_exec,
+                                              int32_t s_q_exec,
+                                              int32_t nhead,
+                                              int32_t head_dim) {
+    const int64_t per_token = static_cast<int64_t>(nhead) * static_cast<int64_t>(head_dim);
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * static_cast<int64_t>(blockDim.x) + static_cast<int64_t>(threadIdx.x);
+    const int64_t total = static_cast<int64_t>(seqlen) * per_token;
+    if (idx >= total || qo_ragged_offset == nullptr || b_exec <= 0 || s_q_exec <= 0 || nhead <= 0 || head_dim <= 0) {
+        return;
+    }
+
+    const int64_t tok = idx / per_token;
+    const int64_t rem = idx - tok * per_token;
+    const int32_t h = static_cast<int32_t>(rem / static_cast<int64_t>(head_dim));
+    const int32_t d = static_cast<int32_t>(rem - static_cast<int64_t>(h) * static_cast<int64_t>(head_dim));
+
+    int32_t row = 0;
+    for (; row < b_exec; ++row) {
+        const int64_t row_tok_end =
+            static_cast<int64_t>(qo_ragged_offset[row + 1]) / per_token;
+        if (tok < row_tok_end) {
+            break;
+        }
+    }
+    if (row >= b_exec) {
+        return;
+    }
+    const int64_t row_tok_begin =
+        static_cast<int64_t>(qo_ragged_offset[row]) / per_token;
+    const int64_t local = tok - row_tok_begin;
+    if (local < 0 || local >= static_cast<int64_t>(s_q_exec)) {
+        return;
+    }
+    const int64_t src_tok = static_cast<int64_t>(row) * static_cast<int64_t>(s_q_exec) + local;
+    const int64_t src_off = (src_tok * static_cast<int64_t>(nhead) + static_cast<int64_t>(h)) * static_cast<int64_t>(head_dim)
+                            + static_cast<int64_t>(d);
+    dst_packed[idx] = src_dense[src_off];
+}
+
+template <typename T>
+void launch_compact_prefill_output(tensor_t dst_packed,
+                                   tensor_t src_dense,
+                                   const int32_t *qo_ragged_offset,
+                                   int32_t b_exec,
+                                   int32_t s_q_exec,
+                                   int32_t nhead,
+                                   int32_t head_dim,
+                                   cudaStream_t stream) {
+    const int32_t seqlen = static_cast<int32_t>(dst_packed->shape()[0]);
+    if (seqlen <= 0 || b_exec <= 0 || s_q_exec <= 0 || nhead <= 0 || head_dim <= 0 || qo_ragged_offset == nullptr) {
+        return;
+    }
+    const int64_t total =
+        static_cast<int64_t>(seqlen) * static_cast<int64_t>(nhead) * static_cast<int64_t>(head_dim);
+    constexpr int kBlock = 256;
+    const int grid = static_cast<int>((total + kBlock - 1) / kBlock);
+    compact_prefill_output_kernel<T><<<grid, kBlock, 0, stream>>>(
+        reinterpret_cast<T *>(dst_packed->data()),
+        reinterpret_cast<const T *>(src_dense->data()),
+        qo_ragged_offset,
+        seqlen,
+        b_exec,
+        s_q_exec,
+        nhead,
+        head_dim);
+    LLAISYS_CUDA_CHECK(cudaGetLastError());
+}
+
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
     for (int mask = 16; mask >= 1; mask >>= 1) {
@@ -688,11 +761,13 @@ static void build_cudnn_override_tensors(bool is_prefill,
         override_strides.push_back(std::move(stride));
     };
 
-    const int64_t q0 = nhead * s_q_exec * head_dim;
-    const int64_t q1 = s_q_exec * head_dim;
-    const int64_t q2 = head_dim;
-    push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q0, q1, q2, 1});
-    push(O_UID, {b_exec, nhead, s_q_exec, head_dim}, {q0, q1, q2, 1});
+    // Runtime q/attn_val buffers are token-major contiguous: [sum_q, nhead, head_dim].
+    // Map SDPA logical axes [b, h, s, d] onto that storage with s-major traversal.
+    const int64_t q_stride_b = s_q_exec * nhead * head_dim;
+    const int64_t q_stride_h = head_dim;
+    const int64_t q_stride_s = nhead * head_dim;
+    push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
+    push(O_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
 
     push(SEQ_LEN_Q_UID, {b_exec, 1, 1, 1}, {1, 1, 1, 1});
     push(SEQ_LEN_KV_UID, {b_exec, 1, 1, 1}, {1, 1, 1, 1});
@@ -724,6 +799,8 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     namespace fe = cudnn_frontend;
     const int64_t b_exec_safe = std::max<int64_t>(1, b_exec);
     const int64_t s_q_exec = is_prefill ? std::max<int64_t>(1, max_seq_len_q) : 1;
+    // Dynamic-shape mode with bounded templates: runtime shapes can shrink via override_*.
+    // Rebuild when any runtime bound grows beyond built template, or cache geometry changes.
     bool need_rebuild = !plan.graph_ready;
     if (!need_rebuild) {
         if (plan.built_num_blocks != num_blocks || plan.built_block_size != block_size) {
@@ -762,6 +839,8 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     auto io_dtype = dtype == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
     const int64_t b_plan = b_exec_safe;
     const int64_t s_q_plan = s_q_exec;
+    const int32_t table_size_plan = table_size;
+    const int64_t max_seq_len_kv_plan = max_seq_len_kv;
     if (is_prefill && cudnnGetVersion() < 90700) {
         return false;
     }
@@ -785,7 +864,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                        .set_name("Q")
                        .set_uid(Q_UID)
                        .set_dim({b_plan, nhead, s_q_plan, head_dim})
-                       .set_stride({nhead * s_q_plan * head_dim, s_q_plan * head_dim, head_dim, 1});
+                       .set_stride({s_q_plan * nhead * head_dim, head_dim, nhead * head_dim, 1});
     if (qo_ragged_offset != nullptr) {
         q_attrs.set_ragged_offset(qo_ragged_offset);
     }
@@ -797,8 +876,8 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                      .set_uid(K_UID)
                                      .set_dim({num_blocks, nkvhead, static_cast<int64_t>(block_size), head_dim})
                                      .set_stride({static_cast<int64_t>(block_size) * nkvhead * head_dim,
-                                                  static_cast<int64_t>(block_size) * head_dim,
                                                   head_dim,
+                                                  nkvhead * head_dim,
                                                   1}));
 
     auto V = plan.graph->tensor(fe::graph::Tensor_attributes()
@@ -806,8 +885,8 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                      .set_uid(V_UID)
                                      .set_dim({num_blocks, nkvhead, static_cast<int64_t>(block_size), head_dim})
                                      .set_stride({static_cast<int64_t>(block_size) * nkvhead * head_dim,
-                                                  static_cast<int64_t>(block_size) * head_dim,
                                                   head_dim,
+                                                  nkvhead * head_dim,
                                                   1}));
 
     auto seq_q = plan.graph->tensor(fe::graph::Tensor_attributes()
@@ -825,14 +904,14 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     auto page_table_k = plan.graph->tensor(fe::graph::Tensor_attributes()
                                                 .set_name("page_table_k")
                                                 .set_uid(PAGE_TABLE_K_UID)
-                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size), 1})
-                                                .set_stride({static_cast<int64_t>(table_size), static_cast<int64_t>(table_size), 1, 1})
+                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size_plan), 1})
+                                                .set_stride({static_cast<int64_t>(table_size_plan), static_cast<int64_t>(table_size_plan), 1, 1})
                                                 .set_data_type(fe::DataType_t::INT32));
     auto page_table_v = plan.graph->tensor(fe::graph::Tensor_attributes()
                                                 .set_name("page_table_v")
                                                 .set_uid(PAGE_TABLE_V_UID)
-                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size), 1})
-                                                .set_stride({static_cast<int64_t>(table_size), static_cast<int64_t>(table_size), 1, 1})
+                                                .set_dim({b_plan, 1, static_cast<int64_t>(table_size_plan), 1})
+                                                .set_stride({static_cast<int64_t>(table_size_plan), static_cast<int64_t>(table_size_plan), 1, 1})
                                                 .set_data_type(fe::DataType_t::INT32));
 
     auto sdpa_options =
@@ -845,14 +924,14 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     sdpa_options.set_padding_mask(true).set_seq_len_q(seq_q).set_seq_len_kv(seq_kv);
     sdpa_options.set_paged_attention_k_table(page_table_k);
     sdpa_options.set_paged_attention_v_table(page_table_v);
-    sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(max_seq_len_kv));
+    sdpa_options.set_paged_attention_max_seq_len_kv(static_cast<int>(max_seq_len_kv_plan));
 
     auto [O, Stats] = plan.graph->sdpa(Q, K, V, sdpa_options);
     (void)Stats;
     O->set_output(true)
         .set_uid(O_UID)
         .set_dim({b_plan, nhead, s_q_plan, head_dim})
-        .set_stride({nhead * s_q_plan * head_dim, s_q_plan * head_dim, head_dim, 1});
+        .set_stride({s_q_plan * nhead * head_dim, head_dim, nhead * head_dim, 1});
     // NOTE: cuDNN paged SDPA sample attaches ragged offset to Q only.
     // Keep O dense to maximize engine availability in prefill.
 
@@ -888,8 +967,8 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     plan.graph_ready = true;
     plan.built_b = b_plan;
     plan.built_s_q = s_q_plan;
-    plan.built_table_size = table_size;
-    plan.built_max_seq_len_kv = max_seq_len_kv;
+    plan.built_table_size = table_size_plan;
+    plan.built_max_seq_len_kv = max_seq_len_kv_plan;
     plan.built_num_blocks = num_blocks;
     plan.built_block_size = block_size;
     return true;
@@ -1147,6 +1226,19 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
         return false;
     }
 
+    const int64_t dense_tokens = b_exec * std::max<int64_t>(1, max_seq_len_q);
+    const bool need_compact_output = (dense_tokens != seqlen);
+    tensor_t dense_attn_out = nullptr;
+    void *cudnn_out_ptr = attn_val->data();
+    if (need_compact_output) {
+        dense_attn_out = Tensor::create(
+            {static_cast<size_t>(dense_tokens), static_cast<size_t>(nhead), static_cast<size_t>(head_dim)},
+            q->dtype(),
+            q->deviceType(),
+            q->deviceId());
+        cudnn_out_ptr = dense_attn_out->data();
+    }
+
     std::unordered_map<int64_t, void *> variant_pack;
     std::vector<int64_t> override_uids;
     std::vector<std::vector<int64_t>> override_shapes;
@@ -1157,7 +1249,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
             {Q_UID, q->data()},
             {K_UID, k_cache->data()},
             {V_UID, v_cache->data()},
-            {O_UID, attn_val->data()},
+            {O_UID, cudnn_out_ptr},
             {SEQ_LEN_Q_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_q)},
             {SEQ_LEN_KV_UID, const_cast<int32_t *>(prepared.cudnn_seq_lens_kv)},
             {PAGE_TABLE_K_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
@@ -1189,6 +1281,34 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
                    exec_status.get_message().c_str());
         }
         return false;
+    }
+    if (need_compact_output) {
+        switch (q->dtype()) {
+        case LLAISYS_DTYPE_F16:
+            launch_compact_prefill_output<llaisys::fp16_t>(
+                attn_val,
+                dense_attn_out,
+                prepared.cudnn_qo_ragged_offset,
+                static_cast<int32_t>(b_exec),
+                static_cast<int32_t>(max_seq_len_q),
+                static_cast<int32_t>(nhead),
+                static_cast<int32_t>(head_dim),
+                stream);
+            break;
+        case LLAISYS_DTYPE_BF16:
+            launch_compact_prefill_output<llaisys::bf16_t>(
+                attn_val,
+                dense_attn_out,
+                prepared.cudnn_qo_ragged_offset,
+                static_cast<int32_t>(b_exec),
+                static_cast<int32_t>(max_seq_len_q),
+                static_cast<int32_t>(nhead),
+                static_cast<int32_t>(head_dim),
+                stream);
+            break;
+        default:
+            return false;
+        }
     }
     return true;
 #else
