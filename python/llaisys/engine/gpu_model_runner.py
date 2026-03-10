@@ -382,13 +382,26 @@ class GPUModelRunner:
             out <<= 1
         return out
 
-    def _build_packed_block_table_rows(self, seqs: list) -> tuple[list[list[int]], int]:
+    def _build_packed_block_table_rows(
+        self,
+        seqs: list,
+        *,
+        target_width: int | None = None,
+    ) -> tuple[list[list[int]], int]:
         if not seqs:
             raise RuntimeError("BLOCK layout requires non-empty seq list")
         widths = [len(getattr(seq, "block_table", [])) for seq in seqs]
         if any(w <= 0 for w in widths):
             raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
-        block_table_width = int(max(widths))
+        max_width = int(max(widths))
+        if target_width is None:
+            block_table_width = max_width
+        else:
+            block_table_width = int(target_width)
+            if block_table_width <= 0:
+                raise RuntimeError("target_width must be positive")
+            if max_width > block_table_width:
+                raise RuntimeError("target_width is smaller than required block table width")
         rows: list[list[int]] = []
         for seq in seqs:
             row = [int(b) for b in seq.block_table]
@@ -939,7 +952,12 @@ class GPUModelRunner:
             if int(slot_off) != int(ntoken):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
+            block_table_rows, block_table_width = self._build_packed_block_table_rows(
+                seqs,
+                target_width=(
+                    int(self._max_block_table_width) if self._use_cudnn_block_builder() else None
+                ),
+            )
             prepared = self._build_block_tensors(
                 seqs=seqs,
                 attention_phase=int(AttentionPhase.PREFILL),
@@ -1011,7 +1029,12 @@ class GPUModelRunner:
             if int(slot_mapping.shape[0]) != int(len(input_ids)):
                 raise ValueError("slot_mapping length must equal ntoken")
 
-            block_table_rows, block_table_width = self._build_packed_block_table_rows(seqs)
+            block_table_rows, block_table_width = self._build_packed_block_table_rows(
+                seqs,
+                target_width=(
+                    int(self._max_block_table_width) if self._use_cudnn_block_builder() else None
+                ),
+            )
             prepared = self._build_block_tensors(
                 seqs=seqs,
                 attention_phase=int(AttentionPhase.DECODE),

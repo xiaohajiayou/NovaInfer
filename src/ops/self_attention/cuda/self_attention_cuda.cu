@@ -856,22 +856,25 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                     int32_t table_size,
                                     int64_t max_seq_len_kv,
                                     int32_t block_size,
-                                    float scale) {
+                                    float scale,
+                                    bool force_rebuild = false) {
     LLAISYS_NVTX_SCOPE(is_prefill ? "attn/cudnn/prefill/ensure_plan" : "attn/cudnn/decode/ensure_plan");
     namespace fe = cudnn_frontend;
     const int64_t b_exec_safe = std::max<int64_t>(1, b_exec);
     const int64_t s_q_exec = is_prefill ? std::max<int64_t>(1, max_seq_len_q) : 1;
     // Dynamic-shape mode with bounded templates: runtime shapes can shrink via override_*.
     // Rebuild when any runtime bound grows beyond built template, or cache geometry changes.
-    bool need_rebuild = !plan.graph_ready;
+    bool need_rebuild = force_rebuild || !plan.graph_ready;
     if (!need_rebuild) {
         if (plan.built_num_blocks != num_blocks || plan.built_block_size != block_size) {
             need_rebuild = true;
         }
     }
+    // For dynamic-shape graphs (cuDNN >= 9.18), runtime b/s_q growth can be
+    // handled via override shapes without mandatory rebuild. Keep rebuild checks
+    // for cache geometry and paged-KV capacity semantics.
     if (!need_rebuild) {
-        if (b_exec_safe > plan.built_b || s_q_exec > plan.built_s_q || table_size > plan.built_table_size ||
-            max_seq_len_kv > plan.built_max_seq_len_kv) {
+        if (table_size > plan.built_table_size || max_seq_len_kv > plan.built_max_seq_len_kv) {
             need_rebuild = true;
         }
     }
@@ -978,6 +981,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
 
     auto sdpa_options =
         fe::graph::SDPA_attributes().set_name("novainfer_paged_sdpa").set_generate_stats(false).set_attn_scale(scale);
+    sdpa_options.set_implementation(fe::AttentionImplementation_t::COMPOSITE);
     if (is_prefill) {
         // Paged prefill uses Q=suffix, KV=full context (q_len <= kv_len).
         // Causal masking must align query's right edge to kv right edge.
@@ -1176,11 +1180,34 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
             override_strides);
     }
 
-    auto exec_status = [&]() {
+    auto run_decode_execute = [&]() {
         LLAISYS_NVTX_SCOPE("attn/cudnn/decode/execute");
         return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
                                    override_strides);
-    }();
+    };
+    auto exec_status = run_decode_execute();
+    if (exec_status.is_bad()) {
+        // Dynamic-shape execution may fail for a plan that was built with a
+        // smaller template. Force a one-shot rebuild and retry once.
+        if (ensure_cudnn_plan_ready(plan,
+                                    state.handle,
+                                    q->dtype(),
+                                    false,
+                                    b_exec,
+                                    max_seq_len_q,
+                                    nhead,
+                                    nkvhead,
+                                    head_dim,
+                                    num_blocks,
+                                    table_size,
+                                    max_seq_len_kv,
+                                    block_size,
+                                    scale,
+                                    /*force_rebuild=*/true) &&
+            ensure_cudnn_workspace(plan)) {
+            exec_status = run_decode_execute();
+        }
+    }
     if (exec_status.is_bad()) {
         static bool warned_exec = false;
         if (!warned_exec) {
@@ -1327,11 +1354,34 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
         cudnn_debug_dump_i32("prefill.page_table", prepared.cudnn_page_table, b_exec * table_size, 64);
     }
 
-    auto exec_status = [&]() {
+    auto run_prefill_execute = [&]() {
         LLAISYS_NVTX_SCOPE("attn/cudnn/prefill/execute");
         return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
                                    override_strides);
-    }();
+    };
+    auto exec_status = run_prefill_execute();
+    if (exec_status.is_bad()) {
+        // Dynamic-shape execution may fail for a plan that was built with a
+        // smaller template. Force a one-shot rebuild and retry once.
+        if (ensure_cudnn_plan_ready(plan,
+                                    state.handle,
+                                    q->dtype(),
+                                    true,
+                                    b_exec,
+                                    max_seq_len_q,
+                                    nhead,
+                                    nkvhead,
+                                    head_dim,
+                                    num_blocks,
+                                    table_size,
+                                    max_seq_len_kv,
+                                    block_size,
+                                    scale,
+                                    /*force_rebuild=*/true) &&
+            ensure_cudnn_workspace(plan)) {
+            exec_status = run_prefill_execute();
+        }
+    }
     if (exec_status.is_bad()) {
         static bool warned_exec = false;
         if (!warned_exec) {
