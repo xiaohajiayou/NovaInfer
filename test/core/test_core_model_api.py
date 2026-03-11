@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from ctypes import byref, c_int64
+from ctypes import byref, c_char_p, c_int, c_int64
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysKvStats, ModelType
+from llaisys.libllaisys.model import KvCacheLayout, LlaisysKvStats, LlaisysParallelInitParams, ModelType
 from test.utils.batch_builders import build_decode_batch
 from test.utils.forward_api import (
     TinyMeta,
+    create_runtime,
     create_tiny_qwen2_model,
     destroy_model_runtime,
     run_model_forward,
@@ -104,3 +105,58 @@ def test_model_forward_reports_oom_when_exceeding_maxseq():
             assert out.status == 1
     finally:
         destroy_model_runtime(model, runtime)
+
+
+def test_runtime_parallel_init_tp1_success():
+    runtime = create_runtime(layout=KvCacheLayout(TEST_KV_LAYOUT), block_size=TEST_KV_BLOCK_SIZE)
+    try:
+        params = LlaisysParallelInitParams(
+            1,  # tensor_parallel_size
+            1,  # pipeline_parallel_size
+            1,  # world_size
+            0,  # rank
+            0,  # local_rank
+            c_char_p(b"uni"),
+            c_char_p(b"nccl"),
+            c_char_p(b""),
+            0,  # master_port
+            0,  # node_rank
+            1,  # nnodes
+            c_char_p(b""),
+            c_char_p(b"tp"),
+            1,  # use_single_process_tp
+            None,  # device_ids
+            0,  # ndevice
+        )
+        rc = int(LIB_LLAISYS.llaisysRuntimeParallelInit(runtime, byref(params)))
+        assert rc == 0
+    finally:
+        destroy_model_runtime(None, runtime)
+
+
+def test_runtime_parallel_init_invalid_device_ids_for_tp():
+    runtime = create_runtime(layout=KvCacheLayout(TEST_KV_LAYOUT), block_size=TEST_KV_BLOCK_SIZE)
+    try:
+        dev_ids = (c_int * 1)(0)
+        params = LlaisysParallelInitParams(
+            2,  # tensor_parallel_size
+            1,  # pipeline_parallel_size
+            2,  # world_size
+            0,  # rank
+            0,  # local_rank
+            c_char_p(b"uni"),
+            c_char_p(b"nccl"),
+            c_char_p(b""),
+            0,  # master_port
+            0,  # node_rank
+            1,  # nnodes
+            c_char_p(b""),
+            c_char_p(b"tp"),
+            1,  # use_single_process_tp
+            dev_ids,
+            1,  # ndevice (invalid, expected 2)
+        )
+        rc = int(LIB_LLAISYS.llaisysRuntimeParallelInit(runtime, byref(params)))
+        assert rc == -1
+    finally:
+        destroy_model_runtime(None, runtime)

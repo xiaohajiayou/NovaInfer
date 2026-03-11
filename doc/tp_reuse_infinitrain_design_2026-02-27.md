@@ -300,36 +300,42 @@ def normalize_parallel_config(cfg: ParallelConfig) -> ParallelConfig:
 1. `include/llaisys/models/model.h`
 2. `python/llaisys/libllaisys/model.py`
 
-`LlaisysModelCreateParams` 扩展字段顺序（固定）：
+`LlaisysModelCreateParams` 仅保留模型创建字段（不承载并行控制面）：
 
 1. `model_type`
 2. `meta`
 3. `device`
 4. `device_ids`
 5. `ndevice`
-6. `kv_cache_layout`
-7. `kv_cache_block_size`
-8. `max_model_len`
-9. `kv_cache_capacity_tokens`
-10. `tensor_parallel_size`
-11. `pipeline_parallel_size`
-12. `world_size`
-13. `rank`
-14. `local_rank`
-15. `distributed_executor_backend`
-16. `distributed_backend`
-17. `master_addr`
-18. `master_port`
-19. `node_rank`
-20. `nnodes`
-21. `init_method`
-22. `tp_group_name`
-23. `use_single_process_tp`
+
+并行初始化使用独立结构体（建议名）`LlaisysParallelInitParams`，绑定到 runtime：
+
+1. `tensor_parallel_size`
+2. `pipeline_parallel_size`
+3. `world_size`
+4. `rank`
+5. `local_rank`
+6. `distributed_executor_backend`
+7. `distributed_backend`
+8. `master_addr`
+9. `master_port`
+10. `node_rank`
+11. `nnodes`
+12. `init_method`
+13. `tp_group_name`
+14. `use_single_process_tp`
+15. `device_ids`
+16. `ndevice`
+
+建议新增 C API：
+
+1. `llaisysRuntimeParallelInit(runtime, parallel_params)`
+2. `llaisysRuntimeParallelDestroy(runtime)`（可选，或在 runtime destroy 内隐式清理）
 
 要求：
 
-1. C 与 ctypes 字段顺序必须一致。
-2. 本次即使只用 `uni`，也必须下发并保存这些字段。
+1. `ModelCreateParams` 与 `ParallelInitParams` 各自 C/ctypes 字段顺序必须一致。
+2. 并行字段必须走 runtime 并行初始化通道，不得回流到 model create params。
 
 ---
 
@@ -500,8 +506,8 @@ MLP 子层：
 初始化并行维度：
 
 ```cpp
-tp_size_ = std::max<int>(1, create_params.tensor_parallel_size);
-tp_rank_ = create_params.rank;
+tp_size_ = std::max<int>(1, runtime_parallel_.tensor_parallel_size);
+tp_rank_ = runtime_parallel_.rank;
 CHECK_ARGUMENT(tp_rank_ >= 0 && tp_rank_ < tp_size_, "invalid tp rank");
 
 local_nh_ = meta_.nh / tp_size_;
@@ -566,18 +572,20 @@ v = v.view({T, local_nkvh_, dh});
 ### 7.1.7 代码落地顺序（按函数拆分）
 
 1. `Qwen2Model::Qwen2Model(...)`  
-读取并保存 `tp_size_/tp_rank_/local_rank_`，基于 `local_rank_` 选择 `device_id_`。
-2. `Qwen2Model::check_meta_invariants_()`  
+只做模型本体初始化，不读取并行控制面参数。
+2. `Qwen2Model::bind_parallel_context_(...)`（新增）  
+从 runtime 并行上下文读取 `tp_size_/tp_rank_/local_rank_/device_ids`，并完成设备映射。
+3. `Qwen2Model::check_meta_invariants_()`  
 新增 `nh/nkvh/di` 整除校验。
-3. `Qwen2Model::init_kv_cache_()`  
+4. `Qwen2Model::init_kv_cache_()`  
 `init_storage(..., local_nkvh_, ...)`。
-4. 权重注册与校验路径（`set_weights`/`check_weights_`）  
+5. 权重注册与校验路径（`set_weights`/`check_weights_`）  
 将全量输入权重切分为本地 shard，校验本地形状。
-5. `Qwen2Model::run_layers_and_collect_()`  
+6. `Qwen2Model::run_layers_and_collect_()`  
 所有 Q/K/V 与 MLP 的 view/linear 形状切到 local 维；`attn_o/mlp_down` 后接 `AllReduce(sum)`。
-6. `ops::parallel` 封装  
+7. `ops::parallel` 封装  
 提供 `allreduce_sum(tensor_t)`，`tp_size==1` 走 no-op。
-7. 回归  
+8. 回归  
 先打通 `tp_size=1` 等价，再验证 `tp_size=2/4`。
 
 ### 7.1.8 与 InfiniTrain 对齐审计（分片策略重点）
@@ -805,9 +813,9 @@ v = v.view({T, local_nkvh_, dh});
 3. `local_nkvh = global_nkvh / tp_size`。  
 4. 不实现 `global_nkvh < tp_size` 的 KV 复制路径。
 
-### 7.4.3 C API 与模型入参（必须新增/使用）
+### 7.4.3 C API 与 runtime 并行初始化（必须新增/使用）
 
-以下字段必须下发到 C++ 并实际生效：
+以下字段必须通过 `LlaisysParallelInitParams` 下发到 C++ 并实际生效：
 
 1. `tensor_parallel_size`
 2. `world_size`
@@ -880,14 +888,18 @@ sequenceDiagram
     Client->>Engine: create(config)
     Engine->>Engine: normalize_parallel_config()
     Engine->>Worker: init(config, dist=uni)
+    Worker->>CAPI: llaisysRuntimeCreate(runtime_params)
+    Worker->>CAPI: llaisysRuntimeParallelInit(parallel_params)
+    CAPI->>PG: init TP process group from runtime parallel context
+    PG->>RT: ncclCommInitAll(...)
+    RT-->>PG: comm handles ready
     Worker->>Qwen2Py: create model runner
     Qwen2Py->>Qwen2Py: build LlaisysModelCreateParams
     Qwen2Py->>CAPI: llaisysModelCreate(params)
     CAPI->>Model: Qwen2Model::Qwen2Model(...)
-    Model->>Model: validate meta / init KV / init workspace
-    Model->>PG: init single-process NCCL group
-    PG->>RT: ncclCommInitAll(...)
-    RT-->>PG: comm handles ready
+    Model->>Model: validate meta / init weight slots (no TP/KV/workspace)
+    Model->>Model: bind_parallel_context_(runtime_parallel_ctx)
+    Model->>Model: init KV / workspace with local TP dims
     Model-->>CAPI: model handle
     CAPI-->>Qwen2Py: opaque pointer
     Qwen2Py-->>Worker: runner ready
@@ -1135,26 +1147,27 @@ sequenceDiagram
 ### 9.3.2 P0：C API 与 ctypes 对齐（Python <-> C++）
 
 1. 文件：`include/llaisys/models/model.h`
-- 结构：`LlaisysModelCreateParams`
+- 结构：`LlaisysModelCreateParams` + `LlaisysParallelInitParams`
 - 必做：
-1. 字段顺序严格按第 6 节定义。
-2. 新增字段保持 ABI 兼容策略（仅追加，不重排旧字段语义）。
+1. `LlaisysModelCreateParams` 保持模型创建最小字段，不承载并行控制面。
+2. 新增 `LlaisysParallelInitParams`，并新增 `llaisysRuntimeParallelInit(...)` 接口。
+3. 新增字段保持 ABI 兼容策略（仅追加，不重排旧字段语义）。
 - 完成判定：
-1. `sizeof` 与 Python 侧一致。
+1. 两个结构体 `sizeof` 与 Python 侧一致。
 
 2. 文件：`python/llaisys/libllaisys/model.py`
-- 结构：`class LlaisysModelCreateParams(Structure)`
+- 结构：`class LlaisysModelCreateParams(Structure)` + `class LlaisysParallelInitParams(Structure)`
 - 必做：
-1. `_fields_` 顺序与 C 完全一致。
-2. `lib.llaisysModelCreate.argtypes` 保持 `POINTER(LlaisysModelCreateParams)`。
+1. 两个 `_fields_` 顺序与 C 完全一致。
+2. `lib.llaisysRuntimeParallelInit.argtypes` 增加 `POINTER(LlaisysParallelInitParams)`。
 - 完成判定：
-1. 构造参数 round-trip（Python->C）字段值不串位。
+1. 模型参数与并行参数 round-trip（Python->C）字段值不串位。
 
 ### 9.3.3 P0：权重加载机制（对齐 vLLM worker/model-runner 风格）
 
 1. 文件：`python/llaisys/models/qwen2.py`
 - 函数：`Qwen2._load_safetensors(...)`
-- 函数：`Qwen2.__init__(...)` 中 `LlaisysModelCreateParams(...)` 构造段
+- 函数：`Qwen2.__init__(...)`（模型创建）与 runtime 并行初始化调用段
 - 必做：
 1. 在 Python 侧完成分片选择（按 `tp_rank/tp_size` 对目标维 slice）。
 2. 分片后张量上传到本 rank 对应 device（不是只做 host slice）。
@@ -1182,8 +1195,8 @@ sequenceDiagram
 2. 文件：`src/llaisys/qwen2/qwen2_model.cpp`
 - 函数：`Qwen2Model::Qwen2Model(...)`
 - 必做：
-1. 从 create params 读取 `tp_size/rank/local_rank/device_ids`。
-2. 绑定本 rank device，初始化 TP 运行时上下文。
+1. 构造函数只处理模型内在参数与基础 device 绑定。
+2. TP 运行时上下文从 runtime 并行初始化结果读取（不直接从 model create params 读取）。
 
 3. 文件：`src/llaisys/qwen2/qwen2_model.cpp`
 - 函数：`Qwen2Model::check_meta_invariants_()`
@@ -1317,5 +1330,411 @@ sequenceDiagram
 
 1. Python 层新增 `MultiprocExecutor`，不改 TP 算法接口。
 2. C++ 仅替换/补充多进程 NCCL 初始化入口。
-3. `ParallelConfig`/`LlaisysModelCreateParams` 字段不破兼容。
+3. `ParallelConfig`/`LlaisysParallelInitParams` 字段不破兼容。
 4. `ColumnParallelLinear/RowParallelLinear` 名称与语义保持不变。
+
+---
+
+## 13. 基于 `bca70da` 的最终落地方案（审阅版）
+
+本节覆盖上文中“可选/预留”部分，给出一个可以直接编码、且与当前仓库状态一致的实现口径。
+
+### 13.1 当前基线（以仓库代码为准）
+
+1. Python 仍是单 `Worker`、单 `GPUModelRunner` 主路径。
+2. `LlaisysModelCreateParams` 已有 `device_ids/ndevice`，但 `Qwen2Model` 当前只用 `device_ids[0]`。
+3. `Qwen2Model` 的权重/KV/workspace/runtime 都是单设备实例。
+4. 构建系统已有 CUDA/cuDNN 开关，但未链接 NCCL。
+
+因此，TP 实现必须满足两条：
+
+1. `tp_size=1` 路径完全不回归。
+2. 在 `tp_size>1` 时，新增路径不依赖 Python 侧复制一套 TP 算法。
+
+### 13.2 一晚交付范围（Freeze）
+
+交付范围：
+
+1. 只支持 `distributed_executor_backend="uni"`。
+2. 只支持 NVIDIA（`DeviceType.NVIDIA`）TP。
+3. 只支持 BLOCK KV 布局的 TP（SLOT 保持原样或显式拒绝）。
+4. Qwen2 dense TP：`q/k/v/o + gate/up/down`。
+5. 每层仅两次 collective：`attn_o` 后一次，`mlp_down` 后一次。
+
+不在本次交付范围：
+
+1. `mp/ray` 执行器。
+2. vocab parallel（`in_embed/out_embed` 继续 replicated）。
+3. sequence parallel / reduce-scatter / all-gather 输出拼接路径。
+
+### 13.3 统一架构决策（本次采用）
+
+采用“**单模型对象管理多 rank shard（同进程多 GPU）**”：
+
+1. `Qwen2Model` 内部新增 `tp_size_` 与 `rank_shards_`（每个 shard 绑定一个 GPU）。
+2. 每个 shard 维护：
+- `device_id`
+- 本地分片权重
+- 本地 KV runtime/workspace
+- 本地隐藏态与中间 buffer
+3. 输入从主设备（rank0）进入，按 step 广播到各 shard（设备内复制）。
+4. 层内各 shard 做本地线性/attention；到通信点做 NCCL all-reduce（sum）。
+
+理由：
+
+1. 不需要在 Python 引入多 worker 并发编排。
+2. TP 算法保持一套 C++ 实现，后续 `mp` 仅替换控制面与 PG 初始化。
+
+### 13.4 C++ 结构改造（精确到字段）
+
+文件：`src/llaisys/qwen2/qwen2_model.hpp`
+
+新增结构与字段：
+
+```cpp
+struct TpShardState {
+    int device_id{0};
+    RuntimeState runtime{};
+    runtime::workspace::qwen2_workspace_t workspace{};
+    LlaisysQwen2Weights weights{};   // shard-local weights
+    tensor_t step_logits{};          // shard-local临时logits（通常仅rank0使用）
+};
+
+int tp_size_{1};
+int tp_rank_primary_{0};             // uni 下固定0，仅保留扩展位
+std::vector<int> tp_device_ids_{};
+std::vector<TpShardState> tp_shards_{};
+size_t local_nh_{0};
+size_t local_nkvh_{0};
+size_t local_di_{0};
+```
+
+保留并明确：
+
+1. 原单卡字段作为 `tp_size==1` 快路径继续使用。
+2. `tp_size>1` 时只走新 TP 路径，避免混用状态。
+
+### 13.5 权重加载与切分（严格规则）
+
+文件：`python/llaisys/models/qwen2.py`
+
+实现规则：
+
+1. `parallel_init.ndevice == parallel_init.tensor_parallel_size`（uni 下直接等价）。
+2. `q/k/v/gate/up`：按 dim0 切分。
+3. `o/down`：按 dim1 切分。
+4. replicated：`in_embed/out_embed/out_norm_w` 全量加载到每个 shard。
+5. 校验 `nh/nkvh/di` 可被 `tp_size` 整除，失败即抛错。
+
+关键实现点：
+
+1. `_device_ids(...)` 改成接受 `list[int]`。
+2. `_load_safetensors()` 内按 `tp_rank` 生成 shard 张量并上传对应 device。
+3. 日志打印 `weight_name/global_shape/local_shape/tp_rank/tp_size/device_id`。
+
+### 13.6 前向主链路（Qwen2）
+
+文件：`src/llaisys/qwen2/qwen2_model.cpp`
+
+新增主入口分流：
+
+1. `if (tp_size_ == 1)`: 走现有路径（不改语义）。
+2. `else`: 走 `forward_tp_(...)`。
+
+`forward_tp_` 核心流程：
+
+1. 将输入 token/pos 与 BLOCK metadata 从 rank0 复制到各 shard 设备。
+2. 每层执行：
+- 每个 shard：`q/k/v` 本地线性，RoPE，本地 paged attention。
+- 每个 shard：`attn_o` 本地线性后得到 `y_local`。
+- 全 shard：`allreduce_sum(y_local)`。
+- 每个 shard：MLP `gate/up/swiglu/down` 得 `mlp_local`。
+- 全 shard：`allreduce_sum(mlp_local)`。
+3. 只在 rank0 进行 `logits_select + logits_proj + sampler input` 输出。
+4. KV API（cp/rm/add/keep/free）在所有 shard 上执行一致操作。
+
+### 13.7 KV 与 metadata 规则（TP 下）
+
+1. 每 shard KV 头维必须是 `local_nkvh`。
+2. BLOCK metadata（`slot_mapping/block_tables/...`）在逻辑上所有 shard 相同；物理上每 shard 各有一份设备拷贝。
+3. `request_free/kv_seq_*` 必须对所有 shard 成功才返回成功；否则返回错误并打印首个失败 shard。
+
+### 13.8 NCCL 接入与接口
+
+新增目录建议：`src/llaisys/runtime/parallel/`
+
+最小接口：
+
+1. `ReduceOpType`（对齐 InfiniTrain 命名）
+2. `Work`（同步等待即可，异步接口先留）
+3. `ProcessGroup`
+4. `ProcessGroupNCCL`
+5. `ProcessGroupFactory`
+
+首版必须可用能力：
+
+1. `AllReduce(tensor, kSum, async=false)`。
+2. `tp_size==1` no-op 快路径。
+3. `ProcessGroupNCCL::InitSingleProcess(device_ids)`。
+
+构建改造：
+
+1. `xmake.lua` 增加 `nv-nccl` 开关。
+2. `xmake/nvidia.lua` 在 `nv-gpu && nv-nccl` 时链接 `nccl`。
+
+### 13.9 Python 控制面最小改造
+
+文件：`python/llaisys/engine/config.py`
+
+新增字段（最小集）：
+
+1. `tensor_parallel_size: int = 1`
+2. `distributed_executor_backend: str = "uni"`
+3. `tensor_parallel_device_ids: list[int] | None = None`
+
+约束：
+
+1. `backend != "uni"` 直接 `NotImplementedError`。
+2. `tp_size > 1` 但 `device != NVIDIA` 直接报错。
+3. `tensor_parallel_device_ids` 若显式配置，则严格按配置使用；数量必须等于 `tp_size`，否则 fail-fast。
+4. `tensor_parallel_device_ids` 为空时，自动从可见卡中选择空闲卡（见 13.9.1），选择失败直接报错。
+
+透传链路：
+
+1. `Worker/GPUModelRunner` 先创建 runtime，再调用 `llaisysRuntimeParallelInit(parallel_params)`。
+2. `Qwen2.__init__` 只构建 `LlaisysModelCreateParams`（模型本体参数，不传并行控制面）。
+3. runtime 与 model 绑定时调用 `bind_parallel_context_`，若未绑定则 forward 直接 fail-fast。
+
+### 13.9.1 设备选择策略（未显式配置 `tensor_parallel_device_ids`）
+
+目标：默认可跑，同时保证 TP 路径尽量拿到最佳互联与空闲资源。
+
+规则（固定）：
+
+1. 候选卡集合来源于 `CUDA_VISIBLE_DEVICES`；若未设置，则为机器全部 NVIDIA GPU。
+2. 优先级一：两两 `cudaDeviceCanAccessPeer==1`（优先 NVLink/P2P 可达组合）。
+3. 优先级二：按 `free_bytes` 从高到低排序（NVML 或 `cudaMemGetInfo`）。
+4. 在同优先级下按设备 ID 升序，保证选择稳定可复现。
+5. 选择出的 `device_ids` 数量必须等于 `tp_size`；不足则 fail-fast，不降级。
+
+日志要求：
+
+1. 初始化打印：`tp_size/candidates/selected/free_bytes/p2p_matrix`。
+2. 失败打印：`tp_size/candidates/reason`。
+
+### 13.9.2 生命周期硬约束（对齐 InfiniTrain 语义）
+
+1. `Qwen2Model::Qwen2Model` 禁止触发 TP 初始化（不建 PG、不读 tp rank、不分片、不建 TP KV/workspace）。
+2. TP 信息唯一来源是 runtime 并行上下文（`LlaisysParallelInitParams`）。
+3. `bind_parallel_context_` 必须在首个 forward 前完成；未完成则报错退出。
+4. KV/workspace 初始化必须在并行上下文绑定之后，且使用 local 维度（`local_nh/local_nkvh/local_di`）。
+
+### 13.10 关键伪代码（实现对照）
+
+bind parallel context：
+
+```cpp
+tp_size_ = std::max(1, runtime_parallel_.tensor_parallel_size);
+tp_device_ids_ = runtime_parallel_.device_ids;
+CHECK_ARGUMENT(meta_.nh % tp_size_ == 0, "nh % tp_size != 0");
+CHECK_ARGUMENT(meta_.nkvh % tp_size_ == 0, "nkvh % tp_size != 0");
+CHECK_ARGUMENT(meta_.di % tp_size_ == 0, "di % tp_size != 0");
+local_nh_ = meta_.nh / tp_size_;
+local_nkvh_ = meta_.nkvh / tp_size_;
+local_di_ = meta_.di / tp_size_;
+parallel_bound_ = true;
+```
+
+forward guard：
+
+```cpp
+CHECK_ARGUMENT(parallel_bound_ || tp_size_ == 1,
+               "TP context is not bound before forward");
+```
+
+每层两次通信：
+
+```cpp
+// attention row-parallel
+for r in [0..tp_size): y_local[r] = linear_o(local_attn[r], w_o_shard[r]);
+pg_->AllReduce(y_local, kSum, false);
+
+// mlp row-parallel
+for r in [0..tp_size): m_local[r] = linear_down(swiglu(local_gate[r], local_up[r]), w_down_shard[r]);
+pg_->AllReduce(m_local, kSum, false);
+```
+
+### 13.11 回归与验收（本次必须过）
+
+功能：
+
+1. `tp=1`：`test/core`、`test/parity` 现有用例不回归。
+2. `tp=2`：新增 smoke（短 prompt，prefill+decode，BLOCK+NVIDIA）。
+3. `kv_seq_*`：`tp=2` 下行为与 `tp=1` 一致。
+
+性能：
+
+1. 基准：`bench_compare_vllm.py` 你当前参数集（256 seq）。
+2. 门槛：`tp=2` 吞吐高于 `tp=1`。
+3. 观测：NVTX 中每层恰好 2 次 TP collective，且无额外全量 gather。
+
+### 13.12 性能优先硬约束（禁止 fallback）
+
+本项目 TP 首版按“最高性能优先”执行，不引入保守降级路径。
+
+1. 不做任何 backend fallback：TP 路径固定 `BLOCK + CUDNN`，初始化或执行失败直接报错退出。
+2. 不做任何 TP 降级：当 `tensor_parallel_size > 1` 时必须走 TP 主链路，不回退单卡逻辑。
+3. 不做 `tp_size` 人工上限：按配置值执行（只保留整除与资源约束校验）。
+4. allreduce 采用异步执行与流重叠（compute/comm overlap），不以同步版本作为默认实现。
+5. attention 前向采用融合 `QKV` 路径作为默认实现，不保留长期并行的非融合慢路径。
+6. 采样输出仍由 rank0 产生（接口语义），但这不是 fallback；其余 rank 不重复导出结果。
+
+实现要求：
+
+1. 失败一律 fail-fast，并在日志打印 `tp_size/rank/device/backend/op`。
+2. 不新增第二套 TP 算法代码；性能优化必须在同一主链路内完成。
+3. 以吞吐和 NVTX/NSYS 指标作为是否合并的唯一标准，不以“先跑通”替代性能目标。
+
+### 13.13 审阅后实现顺序（建议）
+
+1. `P0-A` 构建与 PG：NCCL 初始化 + 异步 allreduce 接口 + NVTX 标记。
+2. `P0-B` Qwen2 TP 结构改造：多 shard 运行态、local 维度、KV local_nkvh 分配。
+3. `P0-C` 权重加载：默认融合 `QKV` 分片上传；`o/down` row-parallel 分片上传。
+4. `P0-D` 前向主链：compute/comm overlap（attn_o 与 mlp_down 后异步 allreduce）。
+5. `P0-E` KV API 多 shard 一致性与 fail-fast 错误语义。
+6. `P0-F` 性能验收：`bench + nsys`，未达目标不合并。
+
+### 13.14 结果对比与验收报表（必须提交）
+
+本节是本次 TP 分支合并前必须补齐的“结果证明”，用于避免只看主观体感。
+
+#### 13.14.1 对比对象（固定）
+
+1. `NovaInfer TP=1`（同一分支、同一代码、关闭 TP）。
+2. `NovaInfer TP=2/4`（目标实现）。
+3. `vLLM`（同模型、同输入分布、`--vllm-fair-mode`）。
+4. `HF`（正确性参考，不做性能基线）。
+
+说明：
+
+1. 对比必须同机、同 GPU 型号、同驱动、同 cudnn 版本。
+2. 所有对比项必须固定随机种子与输入集。
+
+#### 13.14.2 正确性对比（必须）
+
+必测配置：
+
+1. `top_k=1, top_p=1.0, temperature=1.0, seed=0`（确定性路径）。
+2. `prefill-only`、`decode-only`、`prefill+decode mixed`。
+3. `tp_size=1/2/4`（若机器有 4 卡）。
+
+判定规则：
+
+1. `NovaInfer TP=1` 与 `HF`：token ids 全量一致（确定性配置）。
+2. `NovaInfer TP=2/4` 与 `NovaInfer TP=1`：token ids 全量一致（确定性配置）。
+3. 任一请求不一致即判定失败，不允许“整体相近”。
+
+必须提交表：
+
+| Case | Prompt Set | TP Size | Ref | Match(%) | First Diff Pos | Result |
+|---|---|---|---|---|---|---|
+| det-prefill | fixed_32 | 2 | TP1 | 100 | - | PASS/FAIL |
+| det-mixed | fixed_256 | 2 | TP1 | 100 | - | PASS/FAIL |
+| det-mixed | fixed_256 | 4 | TP1 | 100 | - | PASS/FAIL |
+
+#### 13.14.3 性能对比（必须）
+
+基准命令（NovaInfer）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+python scripts/bench_compare_vllm.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --backend novainfer \
+  --num-seqs 256 \
+  --min-input-len 100 \
+  --max-input-len 1024 \
+  --min-output-len 100 \
+  --max-output-len 1024 \
+  --max-model-len 4096 \
+  --seed 0 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 16384
+```
+
+同参数跑：
+
+1. `tp_size=1`
+2. `tp_size=2`
+3. `tp_size=4`（可用时）
+4. `backend=vllm --vllm-fair-mode`
+
+模型集建议（必须至少两档）：
+
+1. 小模型：`DeepSeek-R1-Distill-Qwen-1.5B`（快速回归，验证功能与稳定性）。
+2. 大模型：`Qwen2.5-7B-Instruct` 或 `DeepSeek-R1-Distill-Qwen-7B`（验证 TP 缩放收益）。
+
+说明：
+
+1. 1.5B 容易受 Python/调度开销影响，TP 提升上限偏低；不能单独作为 TP 性能结论。
+2. 若只跑 1.5B，PR 只能标注“功能通过”，不能标注“TP 性能达标”。
+
+核心指标：
+
+1. `throughput_actual (tok/s)`。
+2. `run_seconds`。
+3. `cudaStreamSynchronize` 占比（越低越好）。
+4. NVTX 中 `model_forward / prepare_inputs / sample_tokens` 占比。
+5. TP collective 总时间占比（allreduce 聚合）。
+
+#### 13.14.4 NSYS 对比（必须）
+
+每个配置至少一份 NSYS：
+
+1. `TP=1`
+2. `TP=2`
+
+必须提交三张对比表：
+
+1. API 级（`cuda_api_sum`）：
+- `cudaStreamSynchronize`
+- `cudaLaunchKernel`
+- `cudaMemcpy/cudaMemcpyAsync`
+2. Kernel 级（`cuda_gpu_kern_sum`）：
+- attention kernel
+- gemm kernel
+- collective kernel（NCCL）
+3. NVTX 级（`nvtx_sum`）：
+- `prepare_inputs`
+- `model_forward`
+- `sample_tokens`
+- TP 通信段
+
+#### 13.14.5 合并门槛（硬性）
+
+1. 正确性：13.14.2 所有 case 必须 `100% match`。
+2. 性能：`TP=2` 吞吐必须显著高于 `TP=1`（建议门槛 `>=1.7x`；达不到视为未完成）。
+3. 稳定性：连续 3 次 benchmark 波动在 `±5%` 以内。
+4. 结构：不得出现 TP fallback 分支；失败必须 fail-fast。
+
+#### 13.14.6 提交物（PR 必带）
+
+1. `bench` 原始日志（含命令行）。
+2. `nsys` 原始报告与 `nvtx_sum/cuda_api_sum/cuda_gpu_kern_sum` 文本。
+3. 本节三类结果表（正确性、性能、nsys）。
+4. 与上一版本对比结论（提升点/退化点/未解决项）。
+
+### 13.15 C API 命名冻结与变更记录
+
+命名冻结（当前生效）：
+
+1. 并行初始化结构体名固定为：`LlaisysParallelInitParams`。
+2. 并行初始化接口名固定为：`llaisysRuntimeParallelInit`。
+3. Python ctypes 名称与 C API 必须完全同名，不允许别名并存。
+
+变更规则：
+
+1. 仅当实现存在硬阻塞时允许改名。
+2. 改名必须在本文末尾追加“API 变更记录”（日期、旧名、新名、原因、迁移影响）。
+3. 改名 PR 必须同时修改 C 头文件、ctypes 绑定、调用链与测试基线。

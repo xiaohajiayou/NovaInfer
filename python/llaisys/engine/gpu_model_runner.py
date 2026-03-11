@@ -144,6 +144,14 @@ class GPUModelRunner:
             max_model_len=self._config.max_model_len,
             max_num_seqs=int(self._config.max_num_seqs),
             kv_cache_memory_utilization=self._config.kv_cache_memory_utilization,
+            # tp setting
+            tensor_parallel_size=int(getattr(self._config, "tensor_parallel_size", 1)),
+            pipeline_parallel_size=int(getattr(self._config, "pipeline_parallel_size", 1)),
+            distributed_executor_backend=str(getattr(self._config, "distributed_executor_backend", "uni")),
+            distributed_backend=str(getattr(self._config, "distributed_backend", "nccl")),
+            tensor_parallel_device_ids=getattr(self._config, "tensor_parallel_device_ids", None),
+            tp_rank=int(getattr(self._config, "tp_rank", 0)),
+            tp_local_rank=int(getattr(self._config, "tp_local_rank", 0)),
         )
         if runtime_handle is None:
             raise RuntimeError("runtime allocation failed")

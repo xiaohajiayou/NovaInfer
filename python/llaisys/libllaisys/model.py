@@ -41,6 +41,26 @@ class LlaisysRuntimeCreateParams(Structure):
         ("kv_cache_capacity_tokens", c_int32),
     ]
 
+class LlaisysParallelInitParams(Structure):
+    _fields_ = [
+        ("tensor_parallel_size", c_int32),
+        ("pipeline_parallel_size", c_int32),
+        ("world_size", c_int32),
+        ("rank", c_int32),
+        ("local_rank", c_int32),
+        ("distributed_executor_backend", c_char_p),
+        ("distributed_backend", c_char_p),
+        ("master_addr", c_char_p),
+        ("master_port", c_int32),
+        ("node_rank", c_int32),
+        ("nnodes", c_int32),
+        ("init_method", c_char_p),
+        ("tp_group_name", c_char_p),
+        ("use_single_process_tp", c_int32),
+        ("device_ids", POINTER(c_int)),
+        ("ndevice", c_int32),
+    ]
+
 class LlaisysKvStats(Structure):
     _fields_ = [
         ("capacity_tokens", c_int64),
@@ -108,6 +128,8 @@ def load_model(lib):
 
     lib.llaisysRuntimeDestroy.argtypes = [llaisysRuntime_t]
     lib.llaisysRuntimeDestroy.restype = None
+    lib.llaisysRuntimeParallelInit.argtypes = [llaisysRuntime_t, POINTER(LlaisysParallelInitParams)]
+    lib.llaisysRuntimeParallelInit.restype = c_int32
     lib.llaisysRuntimeGetComputeStream.argtypes = [llaisysRuntime_t, llaisysDeviceType_t, c_int]
     lib.llaisysRuntimeGetComputeStream.restype = llaisysStream_t
 
@@ -175,6 +197,7 @@ __all__ = [
     "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysRuntimeCreateParams",
+    "LlaisysParallelInitParams",
     "LlaisysKvStats",
     "AttentionMetadata",
     "ModelForwardInput",

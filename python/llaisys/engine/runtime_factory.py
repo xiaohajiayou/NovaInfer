@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import ctypes
 import os
-from ctypes import byref
+from ctypes import byref, c_char_p, c_int
 from ctypes.util import find_library
 from dataclasses import dataclass
 from pathlib import Path
+from itertools import combinations
 from typing import Optional
 
 from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.model import KvCacheLayout, LlaisysRuntimeCreateParams
+from ..libllaisys.model import KvCacheLayout, LlaisysParallelInitParams, LlaisysRuntimeCreateParams
 from ..models import qwen2 as qwen2_impl
 
 
@@ -62,21 +63,7 @@ def _available_memory_bytes(device: DeviceType) -> int:
         return 0
 
     if device == DeviceType.NVIDIA:
-        cudart = None
-        candidates = [
-            find_library("cudart"),
-            "libcudart.so",
-            "libcudart.so.12",
-            "libcudart.so.11.0",
-        ]
-        for name in candidates:
-            if not name:
-                continue
-            try:
-                cudart = ctypes.CDLL(name)
-                break
-            except OSError:
-                continue
+        cudart = _load_cudart()
         if cudart is None:
             print("[error] runtime_factory: failed to load CUDA runtime (libcudart)")
             return 0
@@ -100,6 +87,123 @@ def _available_memory_bytes(device: DeviceType) -> int:
             return 0
         return int(free_b.value)
     return 0
+
+
+def _load_cudart() -> ctypes.CDLL | None:
+    candidates = [
+        find_library("cudart"),
+        "libcudart.so",
+        "libcudart.so.12",
+        "libcudart.so.11.0",
+    ]
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _cuda_visible_device_count(cudart: ctypes.CDLL) -> int:
+    fn = cudart.cudaGetDeviceCount
+    fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    fn.restype = ctypes.c_int
+    n = ctypes.c_int(0)
+    rc = int(fn(ctypes.byref(n)))
+    if rc != 0:
+        raise RuntimeError(f"cudaGetDeviceCount failed, rc={rc}")
+    return int(n.value)
+
+
+def _cuda_set_device(cudart: ctypes.CDLL, device_id: int) -> None:
+    fn = cudart.cudaSetDevice
+    fn.argtypes = [ctypes.c_int]
+    fn.restype = ctypes.c_int
+    rc = int(fn(int(device_id)))
+    if rc != 0:
+        raise RuntimeError(f"cudaSetDevice({device_id}) failed, rc={rc}")
+
+
+def _cuda_mem_free_bytes(cudart: ctypes.CDLL, device_id: int) -> int:
+    _cuda_set_device(cudart, int(device_id))
+    fn = cudart.cudaMemGetInfo
+    fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    fn.restype = ctypes.c_int
+    free_b = ctypes.c_size_t(0)
+    total_b = ctypes.c_size_t(0)
+    rc = int(fn(ctypes.byref(free_b), ctypes.byref(total_b)))
+    if rc != 0:
+        raise RuntimeError(f"cudaMemGetInfo(device={device_id}) failed, rc={rc}")
+    return int(free_b.value)
+
+
+def _cuda_p2p_access(cudart: ctypes.CDLL, dev_a: int, dev_b: int) -> bool:
+    fn = cudart.cudaDeviceCanAccessPeer
+    fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    out = ctypes.c_int(0)
+    rc = int(fn(ctypes.byref(out), int(dev_a), int(dev_b)))
+    if rc != 0:
+        return False
+    return int(out.value) != 0
+
+
+def _pick_tp_device_ids(tp_size: int, explicit_ids: tuple[int, ...] | None) -> tuple[int, ...]:
+    tp = max(1, int(tp_size))
+    if explicit_ids is not None:
+        ids = tuple(int(v) for v in explicit_ids)
+        if len(ids) != tp:
+            raise RuntimeError(f"tensor_parallel_device_ids length mismatch: tp_size={tp} ndevice={len(ids)}")
+        if len(set(ids)) != len(ids):
+            raise RuntimeError("tensor_parallel_device_ids contains duplicates")
+        if any(v < 0 for v in ids):
+            raise RuntimeError("tensor_parallel_device_ids contains negative id")
+        return ids
+
+    if tp == 1:
+        return (0,)
+
+    cudart = _load_cudart()
+    if cudart is None:
+        raise RuntimeError("failed to load CUDA runtime (libcudart) for TP auto device selection")
+
+    ndev = _cuda_visible_device_count(cudart)
+    if tp > ndev:
+        raise RuntimeError(f"not enough visible GPUs for TP: tp_size={tp} visible={ndev}")
+
+    candidates = tuple(range(ndev))
+    free_bytes = {d: _cuda_mem_free_bytes(cudart, d) for d in candidates}
+
+    best: tuple[int, ...] | None = None
+    best_score: tuple[int, int] | None = None
+    for combo in combinations(candidates, tp):
+        p2p_ok = 1
+        for i in range(len(combo)):
+            for j in range(i + 1, len(combo)):
+                a = int(combo[i])
+                b = int(combo[j])
+                if not (_cuda_p2p_access(cudart, a, b) and _cuda_p2p_access(cudart, b, a)):
+                    p2p_ok = 0
+                    break
+            if p2p_ok == 0:
+                break
+        score = (p2p_ok, int(sum(free_bytes[int(v)] for v in combo)))
+        if best is None or score > best_score or (score == best_score and combo < best):
+            best = combo
+            best_score = score
+
+    if best is None:
+        raise RuntimeError("failed to select TP device ids")
+
+    p2p_matrix = [[int(_cuda_p2p_access(cudart, a, b)) for b in candidates] for a in candidates]
+    print(
+        "[tp] auto_select "
+        f"tp_size={tp} candidates={list(candidates)} selected={list(best)} "
+        f"free_bytes={ {k: int(v) for k, v in free_bytes.items()} } p2p_matrix={p2p_matrix}"
+    )
+    return tuple(int(v) for v in best)
 
 
 def _kv_token_bytes(meta) -> int:
@@ -141,9 +245,17 @@ def _estimate_cuda_kv_capacity_tokens(
 
 def create_runtime(
     *,
+    device: DeviceType,
     kv_cache_layout: KvCacheLayout,
     kv_cache_block_size: int,
     plan: RuntimePlan,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    distributed_executor_backend: str = "uni",
+    distributed_backend: str = "nccl",
+    tensor_parallel_device_ids: tuple[int, ...] | None = None,
+    tp_rank: int = 0,
+    tp_local_rank: int = 0,
 ):
     params = LlaisysRuntimeCreateParams(
         int(kv_cache_layout),
@@ -154,6 +266,67 @@ def create_runtime(
     runtime = LIB_LLAISYS.llaisysRuntimeCreate(byref(params))
     if not runtime:
         raise RuntimeError("Failed to create runtime state")
+
+    tp_size = max(1, int(tensor_parallel_size))
+    pp_size = max(1, int(pipeline_parallel_size))
+    rank = max(0, int(tp_rank))
+    local_rank = max(0, int(tp_local_rank))
+    exec_backend = str(distributed_executor_backend or "uni").strip().lower()
+    dist_backend = str(distributed_backend or "nccl").strip().lower()
+
+    if tp_size > 1 and device != DeviceType.NVIDIA:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise RuntimeError("tensor parallel currently supports NVIDIA device only")
+    if exec_backend != "uni":
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise NotImplementedError(f"distributed_executor_backend={exec_backend} is not supported yet")
+
+    try:
+        if device == DeviceType.NVIDIA:
+            selected_ids = _pick_tp_device_ids(tp_size, tensor_parallel_device_ids)
+        else:
+            if tensor_parallel_device_ids is not None and len(tuple(tensor_parallel_device_ids)) > 0:
+                raise RuntimeError("tensor_parallel_device_ids is only valid on NVIDIA device")
+            selected_ids = tuple()
+    except Exception:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise
+
+    if device == DeviceType.NVIDIA and len(selected_ids) != tp_size:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise RuntimeError(f"parallel device ids mismatch: tp_size={tp_size} selected={len(selected_ids)}")
+
+    ids_arr = (c_int * len(selected_ids))(*[int(v) for v in selected_ids])
+    dist_exec_b = str(exec_backend).encode("utf-8")
+    dist_b = str(dist_backend).encode("utf-8")
+    master_addr_b = b""
+    init_method_b = b""
+    tp_group_name_b = b"tp"
+    par = LlaisysParallelInitParams(
+        int(tp_size),
+        int(pp_size),
+        int(tp_size * pp_size),
+        int(rank),
+        int(local_rank),
+        c_char_p(dist_exec_b),
+        c_char_p(dist_b),
+        c_char_p(master_addr_b),
+        int(0),
+        int(0),
+        int(1),
+        c_char_p(init_method_b),
+        c_char_p(tp_group_name_b),
+        int(1),
+        ids_arr,
+        int(len(selected_ids)),
+    )
+    rc = int(LIB_LLAISYS.llaisysRuntimeParallelInit(runtime, byref(par)))
+    if rc != 0:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise RuntimeError(
+            "llaisysRuntimeParallelInit failed "
+            f"(rc={rc}, tp_size={tp_size}, rank={rank}, local_rank={local_rank}, device_ids={list(selected_ids)})"
+        )
     return runtime
 
 

@@ -74,6 +74,14 @@ def _create_qwen2_runtime(
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
     kv_cache_memory_utilization: float = 0.9,
+    # tp setting
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    distributed_executor_backend: str = "uni",
+    distributed_backend: str = "nccl",
+    tensor_parallel_device_ids: tuple[int, ...] | None = None,
+    tp_rank: int = 0,
+    tp_local_rank: int = 0,
 ) -> tuple[object, dict]:
     from .runtime_factory import create_runtime, plan_qwen2_runtime
 
@@ -86,9 +94,17 @@ def _create_qwen2_runtime(
         kv_cache_memory_utilization=kv_cache_memory_utilization,
     )
     runtime_handle = create_runtime(
+        device=device,
         kv_cache_layout=kv_cache_layout,
         kv_cache_block_size=kv_cache_block_size,
         plan=plan,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        distributed_executor_backend=distributed_executor_backend,
+        distributed_backend=distributed_backend,
+        tensor_parallel_device_ids=tensor_parallel_device_ids,
+        tp_rank=tp_rank,
+        tp_local_rank=tp_local_rank,
     )
     return runtime_handle, {
         "max_model_len": int(plan.max_model_len),

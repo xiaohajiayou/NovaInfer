@@ -14,10 +14,12 @@
 #include "../utils.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -70,6 +72,10 @@ llaisys::tensor_t require_i32_1d_tensor(llaisysTensor_t handle) {
 
 bool check_same_device(const llaisys::tensor_t &a, const llaisys::tensor_t &b) {
     return a != nullptr && b != nullptr && a->deviceType() == b->deviceType() && a->deviceId() == b->deviceId();
+}
+
+std::string str_or_empty(const char *s) {
+    return s == nullptr ? std::string{} : std::string{s};
 }
 
 class MockModel {
@@ -339,6 +345,25 @@ struct LlaisysModelImpl {
 };
 
 struct LlaisysRuntimeImpl {
+    struct RuntimeParallelConfig {
+        int32_t tensor_parallel_size{1};
+        int32_t pipeline_parallel_size{1};
+        int32_t world_size{1};
+        int32_t rank{0};
+        int32_t local_rank{0};
+        std::string distributed_executor_backend{};
+        std::string distributed_backend{};
+        std::string master_addr{};
+        int32_t master_port{0};
+        int32_t node_rank{0};
+        int32_t nnodes{1};
+        std::string init_method{};
+        std::string tp_group_name{};
+        bool use_single_process_tp{false};
+        std::vector<int> device_ids{};
+        bool initialized{false};
+    };
+
     struct SamplerScratchState {
         llaisys::tensor_t max_val_buf{};
         size_t max_val_capacity{0};
@@ -374,6 +399,7 @@ struct LlaisysRuntimeImpl {
     };
 
     LlaisysRuntimeCreateParams params{};
+    RuntimeParallelConfig parallel{};
     std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
     std::weak_ptr<LlaisysModelImpl> bound_model{};
     SamplerScratchState sampler_scratch{};
@@ -394,6 +420,16 @@ struct LlaisysRuntimeImpl {
         switch (impl->type) {
         case LLAISYS_MODEL_TYPE_QWEN2: {
             if (!impl->qwen2) {
+                return false;
+            }
+            if (parallel.initialized && parallel.tensor_parallel_size > 1) {
+                std::fprintf(stderr,
+                             "[ERROR] runtime parallel init tp_size=%d is set but TP execution path is not wired yet "
+                             "(rank=%d local_rank=%d backend=%s)\n",
+                             parallel.tensor_parallel_size,
+                             parallel.rank,
+                             parallel.local_rank,
+                             parallel.distributed_backend.c_str());
                 return false;
             }
 
@@ -574,6 +610,82 @@ __export void llaisysModelDestroy(struct LlaisysModel *model) {
 
 __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime) {
     delete runtime;
+}
+
+__export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
+                                            const struct LlaisysParallelInitParams *params) {
+    if (runtime == nullptr || runtime->impl == nullptr || params == nullptr) {
+        return -1;
+    }
+
+    auto &parallel = runtime->impl->parallel;
+    const int32_t tp_size = params->tensor_parallel_size > 0 ? params->tensor_parallel_size : int32_t{1};
+    const int32_t pp_size = params->pipeline_parallel_size > 0 ? params->pipeline_parallel_size : int32_t{1};
+    const int32_t world_size = params->world_size > 0 ? params->world_size : tp_size;
+    const int32_t rank = params->rank >= 0 ? params->rank : int32_t{0};
+    const int32_t local_rank = params->local_rank >= 0 ? params->local_rank : int32_t{0};
+    const int32_t ndevice = params->ndevice;
+
+    if (tp_size < 1 || pp_size < 1 || world_size < 1) {
+        return -1;
+    }
+    if (rank < 0 || rank >= world_size) {
+        return -1;
+    }
+    if (local_rank < 0) {
+        return -1;
+    }
+    if (ndevice < 0) {
+        return -1;
+    }
+    if (ndevice > 0 && params->device_ids == nullptr) {
+        return -1;
+    }
+
+    if (tp_size > 1) {
+        // No fallback: enforce explicit device list for TP mode.
+        if (ndevice != tp_size) {
+            std::fprintf(stderr,
+                         "[ERROR] runtime parallel init invalid device_ids: tp_size=%d ndevice=%d\n",
+                         tp_size,
+                         ndevice);
+            return -1;
+        }
+    }
+
+    parallel.tensor_parallel_size = tp_size;
+    parallel.pipeline_parallel_size = pp_size;
+    parallel.world_size = world_size;
+    parallel.rank = rank;
+    parallel.local_rank = local_rank;
+    parallel.distributed_executor_backend = str_or_empty(params->distributed_executor_backend);
+    parallel.distributed_backend = str_or_empty(params->distributed_backend);
+    parallel.master_addr = str_or_empty(params->master_addr);
+    parallel.master_port = params->master_port;
+    parallel.node_rank = params->node_rank;
+    parallel.nnodes = params->nnodes > 0 ? params->nnodes : int32_t{1};
+    parallel.init_method = str_or_empty(params->init_method);
+    parallel.tp_group_name = str_or_empty(params->tp_group_name);
+    parallel.use_single_process_tp = (params->use_single_process_tp != 0);
+    parallel.device_ids.clear();
+    parallel.device_ids.reserve(static_cast<size_t>(std::max(0, ndevice)));
+    for (int32_t i = 0; i < ndevice; ++i) {
+        parallel.device_ids.push_back(params->device_ids[i]);
+    }
+    parallel.initialized = true;
+
+    std::fprintf(stderr,
+                 "[runtime.parallel] initialized tp_size=%d pp_size=%d world_size=%d rank=%d local_rank=%d "
+                 "ndevice=%d backend=%s exec_backend=%s\n",
+                 parallel.tensor_parallel_size,
+                 parallel.pipeline_parallel_size,
+                 parallel.world_size,
+                 parallel.rank,
+                 parallel.local_rank,
+                 static_cast<int>(parallel.device_ids.size()),
+                 parallel.distributed_backend.c_str(),
+                 parallel.distributed_executor_backend.c_str());
+    return 0;
 }
 
 __export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,

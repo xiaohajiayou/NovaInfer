@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from ..libllaisys import DeviceType
 from ..libllaisys.model import KvCacheLayout
@@ -21,6 +22,14 @@ class EngineConfig:
     kv_cache_memory_utilization: float = 0.9
     num_kvcache_blocks: int = 0
     kv_cache_block_size: int = 256
+
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    distributed_executor_backend: str = "uni"
+    distributed_backend: str = "nccl"
+    tensor_parallel_device_ids: Sequence[int] | None = None
+    tp_rank: int = 0
+    tp_local_rank: int = 0
     
     device: DeviceType = DeviceType.CPU
     enable_prefix_caching: bool = True
@@ -39,5 +48,13 @@ class EngineConfig:
             self.num_kvcache_blocks = max(0, int(self.num_kvcache_blocks))
         self.enable_prefix_caching = bool(self.enable_prefix_caching)
         self.kv_cache_memory_utilization = float(min(0.98, max(0.01, self.kv_cache_memory_utilization)))
+        self.tensor_parallel_size = max(1, int(self.tensor_parallel_size))
+        self.pipeline_parallel_size = max(1, int(self.pipeline_parallel_size))
+        self.tp_rank = max(0, int(self.tp_rank))
+        self.tp_local_rank = max(0, int(self.tp_local_rank))
+        self.distributed_executor_backend = str(self.distributed_executor_backend or "uni").strip().lower()
+        self.distributed_backend = str(self.distributed_backend or "nccl").strip().lower()
+        if self.tensor_parallel_device_ids is not None:
+            self.tensor_parallel_device_ids = tuple(int(v) for v in self.tensor_parallel_device_ids)
         if self.kv_cache_layout != KvCacheLayout.BLOCK:
             assert self.num_kvcache_blocks == 0

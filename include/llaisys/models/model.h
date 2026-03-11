@@ -31,6 +31,25 @@ __C {
         int32_t kv_cache_capacity_tokens; // <=0 means use max_model_len
     };
 
+    struct LlaisysParallelInitParams {
+        int32_t tensor_parallel_size;     // >=1
+        int32_t pipeline_parallel_size;   // >=1
+        int32_t world_size;               // >=1
+        int32_t rank;                     // [0, world_size)
+        int32_t local_rank;               // >=0
+        const char *distributed_executor_backend; // optional, e.g. "uni"
+        const char *distributed_backend;          // optional, e.g. "nccl"
+        const char *master_addr;                  // optional
+        int32_t master_port;                      // optional
+        int32_t node_rank;                        // optional
+        int32_t nnodes;                           // optional
+        const char *init_method;                  // optional
+        const char *tp_group_name;                // optional
+        int32_t use_single_process_tp;            // bool(0/1)
+        int *device_ids;                          // logical CUDA device ids
+        int32_t ndevice;                          // number of device_ids
+    };
+
     struct LlaisysKvStats {
         int64_t capacity_tokens;
         int64_t used_tokens;
@@ -100,6 +119,9 @@ __C {
     __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
     __export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntimeCreateParams *params);
     __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime);
+    // Return: 0 success, -1 invalid input, -2 unsupported config.
+    __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
+                                                const struct LlaisysParallelInitParams *params);
     // Return the runtime compute stream bound to (device_type, device_id) in current thread.
     // nullptr on invalid input or failure.
     __export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,
