@@ -309,7 +309,7 @@ def create_runtime(
         init_method = "file:///tmp/llaisys_tp_nccl.id"
     init_method_b = init_method.encode("utf-8")
     tp_group_name_b = b"tp"
-    single_process_tp = int(os.getenv("LLAISYS_TP_SINGLE_PROCESS", "0"))
+    single_process_tp = int(os.getenv("LLAISYS_TP_SINGLE_PROCESS", "1"))
     par = LlaisysParallelInitParams(
         int(tp_size),
         int(pp_size),
