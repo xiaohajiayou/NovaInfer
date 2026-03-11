@@ -83,6 +83,26 @@ class GPUModelRunner:
 
         self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._paged_attn_backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
+        self._tp_size = int(getattr(self._config, "tensor_parallel_size", 1))
+        self._tp_rank = int(getattr(self._config, "tp_rank", 0))
+        self._local_device_id = 0
+        if self._tp_size > 1:
+            if self._device != DeviceType.NVIDIA:
+                raise RuntimeError("tensor parallel requires NVIDIA device")
+            if int(self._config.kv_cache_layout) != int(KvCacheLayout.BLOCK):
+                raise RuntimeError("tensor parallel requires BLOCK kv cache layout")
+            if self._paged_attn_backend != "cudnn":
+                raise RuntimeError(
+                    "tensor parallel requires LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn"
+                )
+            tp_dev_ids = tuple(int(v) for v in (getattr(self._config, "tensor_parallel_device_ids", None) or ()))
+            if not tp_dev_ids:
+                raise RuntimeError("tensor parallel requires tensor_parallel_device_ids")
+            if self._tp_rank < 0 or self._tp_rank >= len(tp_dev_ids):
+                raise RuntimeError(
+                    f"tp_rank out of range: rank={self._tp_rank} ndevice={len(tp_dev_ids)}"
+                )
+            self._local_device_id = int(tp_dev_ids[self._tp_rank])
 
         self._compute_streams: dict[int, object] = {}
         # Decode+CUDNN block-table cache for incremental row updates.
@@ -126,7 +146,7 @@ class GPUModelRunner:
                 pin_memory=True,
             )
 
-        self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, 0)
+        self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, int(self._local_device_id))
         self._execute_model_state: ExecuteState | None = None
         self._closed = False
 
@@ -346,7 +366,13 @@ class GPUModelRunner:
     def _make_buffer(self, shape: tuple[int, ...], dtype: DataType, pin_memory: bool = True) -> Buffer:
         if self._device == DeviceType.CPU:
             raise RuntimeError("GPUModelRunner cannot allocate CPU-only buffers; use CPUModelRunner")
-        return CpuGpuBuffer(shape=shape, dtype=dtype, device=self._device, pin_memory=pin_memory)
+        return CpuGpuBuffer(
+            shape=shape,
+            dtype=dtype,
+            device=self._device,
+            device_id=int(self._local_device_id),
+            pin_memory=pin_memory,
+        )
 
     def _get_runtime_compute_stream(self, device_id: int):
         stream = self._compute_streams.get(int(device_id))

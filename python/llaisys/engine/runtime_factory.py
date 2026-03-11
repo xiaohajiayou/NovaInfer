@@ -150,7 +150,7 @@ def _cuda_p2p_access(cudart: ctypes.CDLL, dev_a: int, dev_b: int) -> bool:
     return int(out.value) != 0
 
 
-def _pick_tp_device_ids(tp_size: int, explicit_ids: tuple[int, ...] | None) -> tuple[int, ...]:
+def select_tp_device_ids(tp_size: int, explicit_ids: tuple[int, ...] | None) -> tuple[int, ...]:
     tp = max(1, int(tp_size))
     if explicit_ids is not None:
         ids = tuple(int(v) for v in explicit_ids)
@@ -271,6 +271,9 @@ def create_runtime(
     pp_size = max(1, int(pipeline_parallel_size))
     rank = max(0, int(tp_rank))
     local_rank = max(0, int(tp_local_rank))
+    if rank >= tp_size:
+        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        raise RuntimeError(f"tp_rank out of range: rank={rank} tp_size={tp_size}")
     exec_backend = str(distributed_executor_backend or "uni").strip().lower()
     dist_backend = str(distributed_backend or "nccl").strip().lower()
 
@@ -283,7 +286,7 @@ def create_runtime(
 
     try:
         if device == DeviceType.NVIDIA:
-            selected_ids = _pick_tp_device_ids(tp_size, tensor_parallel_device_ids)
+            selected_ids = select_tp_device_ids(tp_size, tensor_parallel_device_ids)
         else:
             if tensor_parallel_device_ids is not None and len(tuple(tensor_parallel_device_ids)) > 0:
                 raise RuntimeError("tensor_parallel_device_ids is only valid on NVIDIA device")
@@ -299,9 +302,14 @@ def create_runtime(
     ids_arr = (c_int * len(selected_ids))(*[int(v) for v in selected_ids])
     dist_exec_b = str(exec_backend).encode("utf-8")
     dist_b = str(dist_backend).encode("utf-8")
-    master_addr_b = b""
-    init_method_b = b""
+    master_addr_b = str(os.getenv("LLAISYS_TP_MASTER_ADDR", "")).encode("utf-8")
+    master_port = int(os.getenv("LLAISYS_TP_MASTER_PORT", "0"))
+    init_method = str(os.getenv("LLAISYS_TP_INIT_METHOD", "")).strip()
+    if tp_size > 1 and not init_method:
+        init_method = "file:///tmp/llaisys_tp_nccl.id"
+    init_method_b = init_method.encode("utf-8")
     tp_group_name_b = b"tp"
+    single_process_tp = int(os.getenv("LLAISYS_TP_SINGLE_PROCESS", "0"))
     par = LlaisysParallelInitParams(
         int(tp_size),
         int(pp_size),
@@ -311,12 +319,12 @@ def create_runtime(
         c_char_p(dist_exec_b),
         c_char_p(dist_b),
         c_char_p(master_addr_b),
-        int(0),
+        int(master_port),
         int(0),
         int(1),
         c_char_p(init_method_b),
         c_char_p(tp_group_name_b),
-        int(1),
+        int(single_process_tp),
         ids_arr,
         int(len(selected_ids)),
     )

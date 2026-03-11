@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import json
 import os
@@ -53,6 +53,17 @@ _GLOBAL_NAMES: Dict[str, str] = {
     "model.embed_tokens.weight": "in_embed",
     "lm_head.weight": "out_embed",
     "model.norm.weight": "out_norm_w",
+}
+
+_TP_SHARD_DIM_BY_FIELD: Dict[str, int] = {
+    # Column-parallel (split output dim).
+    "attn_q_w": 0,
+    "attn_q_b": 0,
+    "mlp_gate_w": 0,
+    "mlp_up_w": 0,
+    # Row-parallel (split input dim).
+    "attn_o_w": 1,
+    "mlp_down_w": 1,
 }
 
 
@@ -188,9 +199,13 @@ def _build_meta_struct(meta: _MetaInfo) -> LlaisysQwen2Meta:
     )
 
 
-def _device_ids(device_id: int = 0):
-    arr = (c_int * 1)(device_id)
-    return arr, 1
+def _device_ids(device_ids: Optional[Sequence[int]] = None):
+    if device_ids is None or len(device_ids) == 0:
+        arr = (c_int * 1)(0)
+        return arr, 1
+    ids = [int(v) for v in device_ids]
+    arr = (c_int * len(ids))(*ids)
+    return arr, len(ids)
 
 
 class Qwen2:
@@ -201,6 +216,9 @@ class Qwen2:
         model_path: Path | str,
         device: DeviceType = DeviceType.CPU,
         max_model_len: Optional[int] = None,
+        device_ids: Optional[Sequence[int]] = None,
+        tensor_parallel_size: int = 1,
+        tensor_parallel_rank: int = 0,
     ):
         self._model_path = Path(model_path)
         self._device = device
@@ -210,8 +228,20 @@ class Qwen2:
         self._meta_info = meta
         self._meta_struct = _build_meta_struct(meta)
         self._max_model_len = int(meta.maxseq)
+        self._tp_size = max(1, int(tensor_parallel_size))
+        self._tp_rank = max(0, int(tensor_parallel_rank))
+        if self._tp_rank >= self._tp_size:
+            raise ValueError(f"invalid tensor_parallel_rank={self._tp_rank} for tensor_parallel_size={self._tp_size}")
+        self._local_device_id = 0
+        if device_ids is not None and len(device_ids) > 0:
+            local_ids = [int(v) for v in device_ids]
+            if self._tp_rank >= len(local_ids):
+                raise ValueError(
+                    f"tensor_parallel_rank out of range for device_ids: rank={self._tp_rank} ndevice={len(local_ids)}"
+                )
+            self._local_device_id = int(local_ids[self._tp_rank])
 
-        dev_ids, ndev = _device_ids(0)
+        dev_ids, ndev = _device_ids(device_ids)
         create_params = LlaisysModelCreateParams(
             int(ModelType.QWEN2),
             cast(byref(self._meta_struct), c_void_p),
@@ -273,7 +303,7 @@ class Qwen2:
             shape=array.shape,
             dtype=self._meta_info.dtype,
             device=self._device,
-            device_id=0,
+            device_id=int(self._local_device_id),
         )
         tensor.load(array.ctypes.data_as(c_void_p))
         handle = _detach_tensor_handle(tensor)
@@ -284,7 +314,7 @@ class Qwen2:
             shape=array.shape,
             dtype=self._meta_info.dtype,
             device=self._device,
-            device_id=0,
+            device_id=int(self._local_device_id),
         )
         tensor.load(array.ctypes.data_as(c_void_p))
         handle = _detach_tensor_handle(tensor)
@@ -292,7 +322,8 @@ class Qwen2:
 
     def _map_and_assign(self, name: str, array: np.ndarray) -> bool:
         if name in _GLOBAL_NAMES:
-            self._assign_global(_GLOBAL_NAMES[name], array)
+            field = _GLOBAL_NAMES[name]
+            self._assign_global(field, self._maybe_shard_array(field, array))
             return True
 
         for pattern, field in _LAYER_PATTERNS:
@@ -302,10 +333,31 @@ class Qwen2:
             layer_idx = int(m.group(1))
             if layer_idx < 0 or layer_idx >= self._meta_info.nlayer:
                 raise ValueError(f"Layer index out of range for {name}: {layer_idx}")
-            self._assign_layer(field, layer_idx, array)
+            self._assign_layer(field, layer_idx, self._maybe_shard_array(field, array))
             return True
 
         return False
+
+    def _maybe_shard_array(self, field: str, array: np.ndarray) -> np.ndarray:
+        if self._tp_size <= 1:
+            return array
+        shard_dim = _TP_SHARD_DIM_BY_FIELD.get(field)
+        if shard_dim is None:
+            # Replicated weights in TP mode.
+            return array
+        if shard_dim < 0 or shard_dim >= array.ndim:
+            raise ValueError(f"invalid shard dim for field={field}: dim={shard_dim}, ndim={array.ndim}")
+        dim_size = int(array.shape[shard_dim])
+        if dim_size % self._tp_size != 0:
+            raise ValueError(
+                f"TP shard requires divisible dim: field={field} dim_size={dim_size} tp_size={self._tp_size}"
+            )
+        chunk = dim_size // self._tp_size
+        start = int(self._tp_rank) * chunk
+        end = start + chunk
+        slicer = [slice(None)] * array.ndim
+        slicer[shard_dim] = slice(start, end)
+        return _as_contiguous(array[tuple(slicer)], self._np_dtype)
 
     def _load_safetensors(self) -> None:
         safetensor_files = sorted(self._model_path.glob("*.safetensors"))

@@ -422,16 +422,6 @@ struct LlaisysRuntimeImpl {
             if (!impl->qwen2) {
                 return false;
             }
-            if (parallel.initialized && parallel.tensor_parallel_size > 1) {
-                std::fprintf(stderr,
-                             "[ERROR] runtime parallel init tp_size=%d is set but TP execution path is not wired yet "
-                             "(rank=%d local_rank=%d backend=%s)\n",
-                             parallel.tensor_parallel_size,
-                             parallel.rank,
-                             parallel.local_rank,
-                             parallel.distributed_backend.c_str());
-                return false;
-            }
 
             llaisys::runtime::kv_cache::KvCacheLayout kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
             if (params.kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
@@ -439,6 +429,20 @@ struct LlaisysRuntimeImpl {
             } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
                 return false;
             }
+
+            const int32_t tp_size = parallel.initialized ? std::max<int32_t>(1, parallel.tensor_parallel_size) : int32_t{1};
+            const int32_t tp_rank = parallel.initialized ? std::max<int32_t>(0, parallel.rank) : int32_t{0};
+            const int32_t local_rank = parallel.initialized ? std::max<int32_t>(0, parallel.local_rank) : int32_t{0};
+            const int *tp_device_ids = parallel.device_ids.empty() ? nullptr : parallel.device_ids.data();
+            const int32_t tp_ndevice = static_cast<int32_t>(parallel.device_ids.size());
+            const char *dist_backend = parallel.distributed_backend.empty() ? nullptr : parallel.distributed_backend.c_str();
+            const char *init_method = parallel.init_method.empty() ? nullptr : parallel.init_method.c_str();
+            const int32_t use_single_process_tp = parallel.use_single_process_tp ? int32_t{1} : int32_t{0};
+            if (impl->qwen2->bind_parallel_context(
+                    tp_size, tp_rank, local_rank, tp_device_ids, tp_ndevice, dist_backend, init_method, use_single_process_tp) != 0) {
+                return false;
+            }
+
             const size_t kv_block_size =
                 params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
             const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
@@ -646,8 +650,12 @@ __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
         // No fallback: enforce explicit device list for TP mode.
         if (ndevice != tp_size) {
             std::fprintf(stderr,
-                         "[ERROR] runtime parallel init invalid device_ids: tp_size=%d ndevice=%d\n",
+                         "[ERROR] runtime parallel init invalid device_ids: tp_size=%d rank=%d local_rank=%d "
+                         "backend=%s op=runtime_parallel_init ndevice=%d\n",
                          tp_size,
+                         rank,
+                         local_rank,
+                         str_or_empty(params->distributed_backend).c_str(),
                          ndevice);
             return -1;
         }

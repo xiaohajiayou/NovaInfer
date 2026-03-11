@@ -4,7 +4,16 @@
 #include "../runtime/kv_cache/unified_kv.hpp"
 #include "../../core/llaisys_core.hpp"
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <thread>
+#include <chrono>
+#ifdef ENABLE_NCCL_API
+#include <cuda_runtime_api.h>
+#include <nccl.h>
+#endif
 
 namespace llaisys::models::qwen2 {
 
@@ -98,7 +107,88 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
     init_weight_slots_();
 }
 
+int Qwen2Model::bind_parallel_context(int32_t tp_size,
+                                      int32_t tp_rank,
+                                      int32_t local_rank,
+                                      const int *device_ids,
+                                      int32_t ndevice,
+                                      const char *distributed_backend,
+                                      const char *init_method,
+                                      int32_t use_single_process_tp) {
+    const int32_t resolved_tp_size = std::max<int32_t>(1, tp_size);
+    const int32_t resolved_tp_rank = std::max<int32_t>(0, tp_rank);
+    const int32_t resolved_local_rank = std::max<int32_t>(0, local_rank);
+    if (resolved_tp_rank >= resolved_tp_size) {
+        std::fprintf(stderr,
+                     "[ERROR] Qwen2 bind_parallel_context invalid rank: tp_size=%d tp_rank=%d\n",
+                     resolved_tp_size,
+                     resolved_tp_rank);
+        return -1;
+    }
+    if (resolved_tp_size > 1 && (ndevice != resolved_tp_size || device_ids == nullptr)) {
+        std::fprintf(stderr,
+                     "[ERROR] Qwen2 bind_parallel_context invalid devices: tp_size=%d ndevice=%d\n",
+                     resolved_tp_size,
+                     ndevice);
+        return -1;
+    }
+
+    tp_size_ = resolved_tp_size;
+    tp_rank_ = resolved_tp_rank;
+    local_rank_ = resolved_local_rank;
+    use_single_process_tp_ = use_single_process_tp != 0 ? int32_t{1} : int32_t{0};
+    distributed_backend_ = distributed_backend == nullptr ? std::string{} : std::string(distributed_backend);
+    tp_init_method_ = init_method == nullptr ? std::string{} : std::string(init_method);
+    tp_device_ids_.clear();
+    if (device_ids != nullptr && ndevice > 0) {
+        tp_device_ids_.reserve(static_cast<size_t>(ndevice));
+        for (int32_t i = 0; i < ndevice; ++i) {
+            tp_device_ids_.push_back(device_ids[i]);
+        }
+    }
+    if (tp_size_ > 1) {
+        device_id_ = tp_device_ids_[static_cast<size_t>(tp_rank_)];
+    }
+    tp_nh_local_ = (tp_size_ > 1) ? (meta_.nh / static_cast<size_t>(tp_size_)) : meta_.nh;
+    tp_di_local_ = (tp_size_ > 1) ? (meta_.di / static_cast<size_t>(tp_size_)) : meta_.di;
+    parallel_bound_ = true;
+
+    check_meta_invariants_();
+#ifdef ENABLE_NCCL_API
+    if (tp_size_ > 1) {
+        if (device_type_ != LLAISYS_DEVICE_NVIDIA) {
+            std::fprintf(stderr, "[ERROR] Qwen2 TP requires NVIDIA device\n");
+            return -1;
+        }
+        if (init_nccl_comm_() != 0) {
+            return -1;
+        }
+    }
+#else
+    if (tp_size_ > 1) {
+        std::fprintf(stderr, "[ERROR] Qwen2 TP requires ENABLE_NCCL_API build\n");
+        return -1;
+    }
+#endif
+
+    std::fprintf(stderr,
+                 "[qwen2.parallel] bound tp_size=%d tp_rank=%d local_rank=%d ndevice=%d nh_local=%zu di_local=%zu\n",
+                 tp_size_,
+                 tp_rank_,
+                 local_rank_,
+                 static_cast<int>(tp_device_ids_.size()),
+                 tp_nh_local_,
+                 tp_di_local_);
+    return 0;
+}
+
 Qwen2Model::~Qwen2Model() {
+#ifdef ENABLE_NCCL_API
+    if (tp_nccl_comm_ != nullptr) {
+        ncclCommDestroy(reinterpret_cast<ncclComm_t>(tp_nccl_comm_));
+        tp_nccl_comm_ = nullptr;
+    }
+#endif
     destroy_weights_();
 
     delete[] weights_.attn_norm_w;
@@ -176,6 +266,145 @@ int Qwen2Model::configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
     return 0;
 }
 
+#ifdef ENABLE_NCCL_API
+int Qwen2Model::init_nccl_comm_() {
+    if (tp_size_ <= 1) {
+        return 0;
+    }
+    if (tp_nccl_comm_ != nullptr) {
+        return 0;
+    }
+    if (!distributed_backend_.empty() && distributed_backend_ != "nccl") {
+        std::fprintf(stderr,
+                     "[ERROR] Qwen2 TP unsupported distributed_backend=%s\n",
+                     distributed_backend_.c_str());
+        return -1;
+    }
+    if (use_single_process_tp_ != 0) {
+        std::fprintf(stderr,
+                     "[ERROR] Qwen2 TP single-process mode is not implemented yet\n");
+        return -1;
+    }
+    if (device_type_ != LLAISYS_DEVICE_NVIDIA) {
+        std::fprintf(stderr, "[ERROR] Qwen2 TP requires NVIDIA device\n");
+        return -1;
+    }
+
+    std::string id_file;
+    if (!tp_init_method_.empty() && tp_init_method_.rfind("file://", 0) == 0) {
+        id_file = tp_init_method_.substr(7);
+    } else {
+        const char *env_path = std::getenv("LLAISYS_TP_NCCL_ID_FILE");
+        id_file = (env_path != nullptr && std::strlen(env_path) > 0) ? std::string(env_path) : std::string("/tmp/llaisys_tp_nccl.id");
+    }
+    if (id_file.empty()) {
+        std::fprintf(stderr, "[ERROR] Qwen2 TP invalid NCCL id file path\n");
+        return -1;
+    }
+
+    llaisys::core::context().setDevice(device_type_, device_id_);
+
+    ncclUniqueId uid{};
+    if (tp_rank_ == 0) {
+        const ncclResult_t uid_rc = ncclGetUniqueId(&uid);
+        if (uid_rc != ncclSuccess) {
+            std::fprintf(stderr, "[ERROR] ncclGetUniqueId failed: %s\n", ncclGetErrorString(uid_rc));
+            return -1;
+        }
+        std::ofstream ofs(id_file, std::ios::binary | std::ios::trunc);
+        if (!ofs.good()) {
+            std::fprintf(stderr, "[ERROR] open NCCL id file failed: %s\n", id_file.c_str());
+            return -1;
+        }
+        ofs.write(reinterpret_cast<const char *>(&uid), sizeof(uid));
+        ofs.flush();
+        if (!ofs.good()) {
+            std::fprintf(stderr, "[ERROR] write NCCL id file failed: %s\n", id_file.c_str());
+            return -1;
+        }
+    } else {
+        bool ok = false;
+        constexpr int kMaxRetry = 2000;
+        for (int i = 0; i < kMaxRetry; ++i) {
+            std::ifstream ifs(id_file, std::ios::binary);
+            if (ifs.good()) {
+                ifs.read(reinterpret_cast<char *>(&uid), sizeof(uid));
+                if (ifs.gcount() == static_cast<std::streamsize>(sizeof(uid))) {
+                    ok = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!ok) {
+            std::fprintf(stderr,
+                         "[ERROR] read NCCL id file timeout: path=%s tp_rank=%d\n",
+                         id_file.c_str(),
+                         tp_rank_);
+            return -1;
+        }
+    }
+
+    ncclComm_t comm = nullptr;
+    const ncclResult_t init_rc = ncclCommInitRank(&comm, tp_size_, uid, tp_rank_);
+    if (init_rc != ncclSuccess || comm == nullptr) {
+        std::fprintf(stderr,
+                     "[ERROR] ncclCommInitRank failed: %s tp_size=%d rank=%d dev=%d\n",
+                     ncclGetErrorString(init_rc),
+                     tp_size_,
+                     tp_rank_,
+                     device_id_);
+        return -1;
+    }
+    tp_nccl_comm_ = reinterpret_cast<void *>(comm);
+    return 0;
+}
+
+int Qwen2Model::tp_allreduce_sum_(const tensor_t &tensor) const {
+    if (tp_size_ <= 1) {
+        return 0;
+    }
+    if (tensor == nullptr || tp_nccl_comm_ == nullptr) {
+        return -1;
+    }
+    if (tensor->deviceType() != LLAISYS_DEVICE_NVIDIA || tensor->deviceId() != device_id_ || !tensor->isContiguous()) {
+        return -1;
+    }
+    ncclDataType_t nccl_dtype{};
+    switch (tensor->dtype()) {
+    case LLAISYS_DTYPE_F16:
+        nccl_dtype = ncclHalf;
+        break;
+    case LLAISYS_DTYPE_BF16:
+        nccl_dtype = ncclBfloat16;
+        break;
+    case LLAISYS_DTYPE_F32:
+        nccl_dtype = ncclFloat32;
+        break;
+    default:
+        std::fprintf(stderr, "[ERROR] TP allreduce unsupported dtype=%d\n", static_cast<int>(tensor->dtype()));
+        return -1;
+    }
+    llaisys::core::context().setDevice(tensor->deviceType(), tensor->deviceId());
+    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
+    const size_t count = tensor->numel();
+    const ncclResult_t rc =
+        ncclAllReduce(tensor->data(), tensor->data(), count, nccl_dtype, ncclSum, reinterpret_cast<ncclComm_t>(tp_nccl_comm_), stream);
+    if (rc != ncclSuccess) {
+        std::fprintf(stderr, "[ERROR] ncclAllReduce failed: %s\n", ncclGetErrorString(rc));
+        return -1;
+    }
+    return 0;
+}
+#else
+int Qwen2Model::init_nccl_comm_() {
+    return -1;
+}
+int Qwen2Model::tp_allreduce_sum_(const tensor_t &) const {
+    return -1;
+}
+#endif
+
 void Qwen2Model::check_meta_invariants_() const {
     CHECK_ARGUMENT(meta_.nlayer > 0, "Qwen2: nlayer must be > 0");
     CHECK_ARGUMENT(meta_.hs > 0, "Qwen2: hs must be > 0");
@@ -188,6 +417,11 @@ void Qwen2Model::check_meta_invariants_() const {
 
     CHECK_ARGUMENT(meta_.hs == meta_.nh * meta_.dh, "Qwen2: hs must equal nh * dh");
     CHECK_ARGUMENT(meta_.nkvh <= meta_.nh, "Qwen2: nkvh must be <= nh");
+    CHECK_ARGUMENT(tp_size_ >= 1, "Qwen2: tp_size must be >= 1");
+    if (tp_size_ > 1) {
+        CHECK_ARGUMENT((meta_.nh % static_cast<size_t>(tp_size_)) == 0, "Qwen2: nh must be divisible by tp_size");
+        CHECK_ARGUMENT((meta_.di % static_cast<size_t>(tp_size_)) == 0, "Qwen2: di must be divisible by tp_size");
+    }
 
     CHECK_ARGUMENT(meta_.dtype == LLAISYS_DTYPE_F32 ||
                        meta_.dtype == LLAISYS_DTYPE_F16 ||
@@ -240,10 +474,10 @@ void Qwen2Model::validate_or_die_() {
     check_meta_invariants_();
 
     const size_t hs = meta_.hs;
-    const size_t nh = meta_.nh;
+    const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
     const size_t nkvh = meta_.nkvh;
     const size_t dh = meta_.dh;
-    const size_t di = meta_.di;
+    const size_t di = tp_di_local_ > 0 ? tp_di_local_ : meta_.di;
     const size_t voc = meta_.voc;
 
     // Zero biases used where the model does not expose bias slots.
@@ -297,12 +531,14 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
     if (!workspace_) {
         const size_t kv_capacity =
             runtime_.kv_cache_capacity_tokens > 0 ? runtime_.kv_cache_capacity_tokens : meta_.maxseq;
+        const size_t nh_local = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
+        const size_t di_local = tp_di_local_ > 0 ? tp_di_local_ : meta_.di;
         workspace_ = std::make_unique<runtime::workspace::Qwen2Workspace>(
             meta_.hs,
-            meta_.nh,
+            nh_local,
             meta_.nkvh,
             meta_.dh,
-            meta_.di,
+            di_local,
             meta_.voc,
             kv_capacity,
             meta_.dtype,
@@ -367,7 +603,7 @@ tensor_t Qwen2Model::run_slot_attention_layer_(size_t layer,
                                                const AttentionExecState &attn_state) {
     LLAISYS_NVTX_SCOPE("forward/attention_layer_slot");
     const auto &ws = workspace_->view();
-    const size_t nh = meta_.nh;
+    const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
     const size_t nkvh = meta_.nkvh;
     const size_t dh = meta_.dh;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
@@ -424,7 +660,7 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
                                                 const AttentionExecState &attn_state) {
     LLAISYS_NVTX_SCOPE("forward/attention_layer_block");
     const auto &ws = workspace_->view();
-    const size_t nh = meta_.nh;
+    const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
     const size_t nkvh = meta_.nkvh;
     const size_t dh = meta_.dh;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
@@ -729,11 +965,13 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         std::cerr << "[Qwen2Model::forward] " << msg << std::endl;
         return -1;
     };
-    if (input.input_ids == nullptr || input.pos_ids == nullptr) {
-        return fail("missing input_ids/pos_ids");
-    }
-
     try {
+        if (!parallel_bound_) {
+            return fail("parallel context is not bound");
+        }
+        if (input.input_ids == nullptr || input.pos_ids == nullptr) {
+            return fail("missing input_ids/pos_ids");
+        }
         const tensor_t input_ids = input.input_ids->tensor;
         const tensor_t pos_ids = input.pos_ids->tensor;
         if (input_ids == nullptr || pos_ids == nullptr) {
@@ -869,6 +1107,12 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             {
                 LLAISYS_NVTX_SCOPE("forward/layer/attn_out_proj");
                 ops::linear(attn_proj, attn_out_2d, weights_.attn_o_w[layer]->tensor, nullptr);
+                if (tp_size_ > 1) {
+                    const int rc_tp = tp_allreduce_sum_(attn_proj);
+                    if (rc_tp != 0) {
+                        return fail("tp allreduce failed at attn_out_proj");
+                    }
+                }
                 ops::add(hidden, hidden, attn_proj);
             }
 
@@ -887,6 +1131,12 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
 
                 tensor_t down = slice_tokens_(ws.down, ntoken);
                 ops::linear(down, swiglu, weights_.mlp_down_w[layer]->tensor, nullptr);
+                if (tp_size_ > 1) {
+                    const int rc_tp = tp_allreduce_sum_(down);
+                    if (rc_tp != 0) {
+                        return fail("tp allreduce failed at mlp_down");
+                    }
+                }
                 ops::add(hidden, hidden, down);
             }
         }

@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -52,6 +53,14 @@ public:
                           size_t kv_block_size,
                           size_t kv_cache_capacity_tokens,
                           int64_t max_model_len);
+    int bind_parallel_context(int32_t tp_size,
+                              int32_t tp_rank,
+                              int32_t local_rank,
+                              const int *device_ids,
+                              int32_t ndevice,
+                              const char *distributed_backend,
+                              const char *init_method,
+                              int32_t use_single_process_tp);
 
     LlaisysQwen2Weights *weights() noexcept { return &weights_; }
     size_t nlayer() const noexcept { return meta_.nlayer; }
@@ -86,6 +95,16 @@ private:
     LlaisysQwen2Meta meta_{};
     llaisysDeviceType_t device_type_{LLAISYS_DEVICE_CPU};
     int device_id_{0};
+    int32_t tp_size_{1};
+    int32_t tp_rank_{0};
+    int32_t local_rank_{0};
+    int32_t use_single_process_tp_{0};
+    bool parallel_bound_{false};
+    std::vector<int> tp_device_ids_{};
+    std::string distributed_backend_{};
+    std::string tp_init_method_{};
+    size_t tp_nh_local_{0};
+    size_t tp_di_local_{0};
 
     LlaisysQwen2Weights weights_{};
     bool validated_{false};
@@ -165,6 +184,11 @@ private:
                        const char *name,
                        bool required) const;
     tensor_t bias_or_zero_(llaisysTensor_t handle, const tensor_t &zero_bias) const;
+    int init_nccl_comm_();
+    int tp_allreduce_sum_(const tensor_t &tensor) const;
+#ifdef ENABLE_NCCL_API
+    void *tp_nccl_comm_{nullptr};
+#endif
 
     void destroy_weights_();
 };

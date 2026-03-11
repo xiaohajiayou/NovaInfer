@@ -10,6 +10,7 @@ from .cpu_model_runner import CPUModelRunner
 from .gpu_model_runner import GPUModelRunner
 from .input_processor import InputProcessor
 from .model_registry import ModelRegistry, create_default_registry
+from .runtime_factory import select_tp_device_ids
 
 
 class Worker:
@@ -24,6 +25,15 @@ class Worker:
         cfg = config or EngineConfig(**kwargs)
         self._config = cfg
         self._model_path = Path(cfg.model_path) if cfg.model_path is not None else None
+        if int(getattr(cfg, "tensor_parallel_size", 1)) > 1:
+            if cfg.device != DeviceType.NVIDIA:
+                raise RuntimeError("tensor parallel requires NVIDIA device")
+            selected = select_tp_device_ids(
+                int(cfg.tensor_parallel_size),
+                tuple(cfg.tensor_parallel_device_ids) if cfg.tensor_parallel_device_ids is not None else None,
+            )
+            cfg.tensor_parallel_device_ids = tuple(int(v) for v in selected)
+            cfg.tp_local_rank = int(getattr(cfg, "tp_rank", 0))
         self._model_registry = model_registry if model_registry is not None else create_default_registry()
         model_obj = self._create_model_wrapper()
         runner_cls = CPUModelRunner if cfg.device == DeviceType.CPU else GPUModelRunner
@@ -42,6 +52,9 @@ class Worker:
             self._model_path,
             self._config.device,
             max_model_len=self._config.max_model_len,
+            tensor_parallel_device_ids=getattr(self._config, "tensor_parallel_device_ids", None),
+            tensor_parallel_size=int(getattr(self._config, "tensor_parallel_size", 1)),
+            tp_rank=int(getattr(self._config, "tp_rank", 0)),
         )
 
     @property

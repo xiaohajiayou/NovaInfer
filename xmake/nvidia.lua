@@ -29,6 +29,10 @@ target("llaisys-ops-cuda")
     end
     add_links("cublas")
     add_links("cublasLt")
+    if has_config("nv-nccl") then
+        add_defines("ENABLE_NCCL_API")
+        add_links("nccl")
+    end
     if has_config("nv-cudnn") then
         add_defines("ENABLE_CUDNN_API")
         add_links("cudnn")
@@ -48,3 +52,9 @@ target_end()
 target("llaisys-ops")
     add_deps("llaisys-ops-cuda")
 target_end()
+
+if has_config("nv-nccl") then
+    target("llaisys")
+        add_links("nccl")
+    target_end()
+end
