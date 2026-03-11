@@ -243,6 +243,23 @@ Notes:
 - TP+cuDNN path currently requires `cudnnGetVersion() >= 91800` (cuDNN 9.18+).
 - `--tensor-parallel-device-ids` in scripts uses logical IDs under `CUDA_VISIBLE_DEVICES`.
 
+TP=2 benchmark (two-process launcher):
+
+```bash
+export LD_LIBRARY_PATH=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive/lib:$LD_LIBRARY_PATH
+export LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn
+
+python scripts/bench_tp2_novainfer.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --cuda-visible-devices 4,5 \
+  --num-seqs 256 \
+  --min-input-len 100 --max-input-len 1024 \
+  --min-output-len 100 --max-output-len 1024 \
+  --max-model-len 4096 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 16384
+```
+
 ### 2. Install Python package
 
 ```bash
