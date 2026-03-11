@@ -822,12 +822,13 @@ static void build_cudnn_override_tensors(bool is_prefill,
     };
 
     // Runtime q/attn_val buffers are token-major contiguous: [sum_q, nhead, head_dim].
-    // For ragged THD, both logical axes `b` and `s` advance by one token in
-    // flattened storage; offsets across requests are provided by ragged_offset.
-    // This matches cuDNN chunked-prefill examples.
-    const int64_t q_stride_b = nhead * head_dim;
+    // Keep BSHD logical strides aligned with cuDNN THD/ragged samples:
+    //   stride_b = s_q * h * d, stride_s = h * d, stride_h = d.
+    // Ragged offsets carry per-request packed starts.
+    const int64_t q_stride_token = nhead * head_dim;
+    const int64_t q_stride_b = std::max<int64_t>(1, s_q_exec) * q_stride_token;
     const int64_t q_stride_h = head_dim;
-    const int64_t q_stride_s = nhead * head_dim;
+    const int64_t q_stride_s = q_stride_token;
     push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
     push(O_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
 
@@ -925,11 +926,13 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                                   .set_data_type(fe::DataType_t::INT32));
     }
 
+    const int64_t q_stride_b = s_q_plan * nhead * head_dim;
+    const int64_t q_stride_s = nhead * head_dim;
     auto q_attrs = fe::graph::Tensor_attributes()
                        .set_name("Q")
                        .set_uid(Q_UID)
                        .set_dim({b_plan, nhead, s_q_plan, head_dim})
-                       .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
+                       .set_stride({q_stride_b, head_dim, q_stride_s, 1});
     if (qo_ragged_offset != nullptr) {
         q_attrs.set_ragged_offset(qo_ragged_offset);
     }
@@ -997,7 +1000,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     O->set_output(true)
         .set_uid(O_UID)
         .set_dim({b_plan, nhead, s_q_plan, head_dim})
-        .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
+        .set_stride({q_stride_b, head_dim, q_stride_s, 1});
     if (qo_ragged_offset != nullptr) {
         // Emit packed prefill output directly so runtime output layout stays
         // consistent with native path ([sum_q, nhead, head_dim]).
@@ -1121,20 +1124,22 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
     if (prepared.max_seqlen_k <= 0 || static_cast<int64_t>(prepared.max_seqlen_k) > max_seq_len_kv) {
         return false;
     }
-    // printf(
-    //     "[cudnn] decode_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
-    //     "max_seqlen_k=%d table_size=%d block_size=%d\n",
-    //     static_cast<long long>(seqlen),
-    //     static_cast<long long>(nhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(nslot),
-    //     static_cast<long long>(nkvhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(b_exec),
-    //     static_cast<long long>(max_seq_len_q),
-    //     int(prepared.max_seqlen_k),
-    //     int(table_size),
-    //     int(block_size));
+    if (cudnn_debug_enabled()) {
+        printf(
+            "[cudnn][dbg] decode_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
+            "max_seqlen_k=%d table_size=%d block_size=%d\n",
+            static_cast<long long>(seqlen),
+            static_cast<long long>(nhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(nslot),
+            static_cast<long long>(nkvhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(b_exec),
+            static_cast<long long>(max_seq_len_q),
+            int(prepared.max_seqlen_k),
+            int(table_size),
+            int(block_size));
+    }
 
     CudnnRuntimeState &state = cudnn_runtime_state();
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
@@ -1178,6 +1183,10 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
             override_uids,
             override_shapes,
             override_strides);
+        cudnn_debug_dump_override(override_uids, override_shapes, override_strides);
+        cudnn_debug_dump_i32("decode.seq_lens_q", prepared.cudnn_seq_lens_q, b_exec, 32);
+        cudnn_debug_dump_i32("decode.seq_lens_kv", prepared.cudnn_seq_lens_kv, b_exec, 32);
+        cudnn_debug_dump_i32("decode.page_table", prepared.cudnn_page_table, b_exec * table_size, 64);
     }
 
     auto run_decode_execute = [&]() {
