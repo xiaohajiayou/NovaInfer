@@ -56,6 +56,9 @@ def _create_qwen2(
     model_path: Path | str,
     device: DeviceType,
     max_model_len: int | None = None,
+    tensor_parallel_device_ids: tuple[int, ...] | None = None,
+    tensor_parallel_size: int = 1,
+    tp_rank: int = 0,
 ):
     from ..models.qwen2 import Qwen2
 
@@ -63,6 +66,9 @@ def _create_qwen2(
         model_path=model_path,
         device=device,
         max_model_len=max_model_len,
+        device_ids=tensor_parallel_device_ids,
+        tensor_parallel_size=tensor_parallel_size,
+        tensor_parallel_rank=tp_rank,
     )
 
 
