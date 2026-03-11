@@ -969,6 +969,7 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         if (!parallel_bound_) {
             return fail("parallel context is not bound");
         }
+        llaisys::core::context().setDevice(device_type_, device_id_);
         if (input.input_ids == nullptr || input.pos_ids == nullptr) {
             return fail("missing input_ids/pos_ids");
         }

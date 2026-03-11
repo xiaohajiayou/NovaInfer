@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import json
 import os
 import re
 
 import numpy as np
-import safetensors
-import torch
 
 from ctypes import POINTER, byref, cast, c_int, c_int32, c_void_p
 
@@ -84,7 +82,7 @@ def _torch_dtype_to_datatype(torch_dtype: Optional[str]) -> DataType:
         return DataType.F32
     torch_dtype = torch_dtype.lower()
     if "bfloat16" in torch_dtype or torch_dtype == "bf16":
-        return DataType.BF16 if _BF16_DTYPE is not None else DataType.F32
+        return DataType.BF16
     if "float16" in torch_dtype or torch_dtype == "fp16" or torch_dtype == "f16":
         return DataType.F16
     if "float32" in torch_dtype or torch_dtype == "fp32" or torch_dtype == "f32":
@@ -97,9 +95,11 @@ def _datatype_to_numpy_dtype(dtype: DataType) -> np.dtype:
         return np.dtype(np.float32)
     if dtype == DataType.F16:
         return np.dtype(np.float16)
-    if dtype == DataType.BF16 and _BF16_DTYPE is not None:
-        return _BF16_DTYPE
-    # Fallback: use float32 even if meta says BF16 but runtime support is missing.
+    if dtype == DataType.BF16:
+        # Keep BF16 payload as-is even without ml_dtypes; uint16 preserves raw bits.
+        if _BF16_DTYPE is not None:
+            return _BF16_DTYPE
+        return np.dtype(np.uint16)
     return np.dtype(np.float32)
 
 
@@ -117,6 +117,113 @@ def _detach_tensor_handle(tensor: Tensor) -> c_void_p:
     # The backend takes ownership. Prevent Python-side double free.
     tensor._tensor = None  # type: ignore[attr-defined]
     return handle
+
+
+_SAFE_DTYPE_TO_NUMPY: Dict[str, np.dtype] = {
+    "BOOL": np.dtype(np.bool_),
+    "U8": np.dtype(np.uint8),
+    "I8": np.dtype(np.int8),
+    "I16": np.dtype(np.int16),
+    "U16": np.dtype(np.uint16),
+    "I32": np.dtype(np.int32),
+    "U32": np.dtype(np.uint32),
+    "I64": np.dtype(np.int64),
+    "U64": np.dtype(np.uint64),
+    "F16": np.dtype(np.float16),
+    "F32": np.dtype(np.float32),
+    "F64": np.dtype(np.float64),
+}
+
+
+_SAFE_DTYPE_NBYTES: Dict[str, int] = {
+    "BOOL": 1,
+    "U8": 1,
+    "I8": 1,
+    "I16": 2,
+    "U16": 2,
+    "I32": 4,
+    "U32": 4,
+    "I64": 8,
+    "U64": 8,
+    "F16": 2,
+    "BF16": 2,
+    "F32": 4,
+    "F64": 8,
+}
+
+
+def _numel(shape: Tuple[int, ...]) -> int:
+    n = 1
+    for d in shape:
+        n *= int(d)
+    return int(n)
+
+
+def _decode_safetensor_array(raw_u8: np.ndarray, dtype_code: str, shape: Tuple[int, ...], target_dtype: np.dtype) -> np.ndarray:
+    dtype_code = str(dtype_code).upper()
+    nbytes_per_elem = _SAFE_DTYPE_NBYTES.get(dtype_code)
+    if nbytes_per_elem is None:
+        raise RuntimeError(f"unsupported safetensors dtype: {dtype_code}")
+
+    expected_nbytes = _numel(shape) * int(nbytes_per_elem)
+    if int(raw_u8.size) != int(expected_nbytes):
+        raise RuntimeError(
+            f"safetensors payload size mismatch: dtype={dtype_code} shape={shape} "
+            f"payload={int(raw_u8.size)} expected={int(expected_nbytes)}"
+        )
+
+    if dtype_code == "BF16":
+        # Preserve BF16 payload bits; Tensor(BF16) consumes raw 16-bit lanes.
+        base = raw_u8.view(np.uint16)
+    else:
+        base_dtype = _SAFE_DTYPE_TO_NUMPY.get(dtype_code)
+        if base_dtype is None:
+            raise RuntimeError(f"unsupported safetensors dtype: {dtype_code}")
+        base = raw_u8.view(base_dtype)
+
+    base = base.reshape(shape)
+    return _as_contiguous(base, target_dtype)
+
+
+def _iter_safetensors_arrays(file: Path, target_dtype: np.dtype) -> Iterator[Tuple[str, np.ndarray]]:
+    with file.open("rb") as f:
+        prefix = f.read(8)
+        if len(prefix) != 8:
+            raise RuntimeError(f"invalid safetensors file: {file}")
+        header_len = int.from_bytes(prefix, byteorder="little", signed=False)
+        header_raw = f.read(header_len)
+        if len(header_raw) != header_len:
+            raise RuntimeError(f"invalid safetensors header: {file}")
+    try:
+        header = json.loads(header_raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"failed to parse safetensors header: {file}") from exc
+
+    data_offset = int(8 + header_len)
+    mmap_u8 = np.memmap(file, mode="r", dtype=np.uint8, offset=data_offset)
+    try:
+        for name, spec in header.items():
+            if name == "__metadata__":
+                continue
+            if not isinstance(spec, dict):
+                continue
+            dtype_code = str(spec.get("dtype", ""))
+            shape_raw = spec.get("shape", ())
+            offsets = spec.get("data_offsets", None)
+            if not isinstance(shape_raw, (list, tuple)):
+                raise RuntimeError(f"invalid shape in safetensors entry: name={name}")
+            if not isinstance(offsets, (list, tuple)) or len(offsets) != 2:
+                raise RuntimeError(f"invalid data_offsets in safetensors entry: name={name}")
+            shape = tuple(int(v) for v in shape_raw)
+            start = int(offsets[0])
+            end = int(offsets[1])
+            if start < 0 or end < start or end > int(mmap_u8.size):
+                raise RuntimeError(f"invalid data_offsets range in safetensors entry: name={name}")
+            raw = mmap_u8[start:end]
+            arr = _decode_safetensor_array(raw, dtype_code, shape, target_dtype=target_dtype)
+            yield str(name), arr
+    finally:
+        del mmap_u8
 
 
 @dataclass(frozen=True)
@@ -365,14 +472,7 @@ class Qwen2:
             raise FileNotFoundError(f"No safetensors files found under {self._model_path}")
 
         for file in safetensor_files:
-            # Use torch backend for safetensors loading to avoid numpy bfloat16 incompatibility.
-            data = safetensors.safe_open(file, framework="pt", device="cpu")
-            for name in data.keys():
-                tensor = data.get_tensor(name)
-                if tensor.dtype == torch.bfloat16:
-                    tensor = tensor.to(torch.float32)
-                array = tensor.detach().cpu().numpy()
-                array = _as_contiguous(array, self._np_dtype)
+            for name, array in _iter_safetensors_arrays(file, target_dtype=self._np_dtype):
                 self._map_and_assign(name, array)
 
     # -------------------- Inference --------------------

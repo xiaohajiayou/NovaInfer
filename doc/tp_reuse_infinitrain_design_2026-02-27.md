@@ -1738,3 +1738,114 @@ python scripts/bench_compare_vllm.py \
 1. 仅当实现存在硬阻塞时允许改名。
 2. 改名必须在本文末尾追加“API 变更记录”（日期、旧名、新名、原因、迁移影响）。
 3. 改名 PR 必须同时修改 C 头文件、ctypes 绑定、调用链与测试基线。
+
+### 13.16 当前实现状态与交接（2026-03-11）
+
+本节用于冻结“当前已完成内容 + 未完成阻塞 + 下一步计划”，保证后续可以无缝衔接开发。
+
+#### 13.16.1 已实现（代码已落地）
+
+1. TP 并行参数已贯通 Python -> C API -> C++ runtime/model：
+- `tensor_parallel_size/tp_rank/tp_local_rank/tensor_parallel_device_ids`
+- `distributed_backend/init_method/use_single_process_tp`
+2. `llaisysRuntimeParallelInit` 已做 fail-fast 校验：
+- `tp_size>1` 时必须提供 `ndevice==tp_size` 的设备列表，否则直接失败。
+3. Qwen2 并行上下文绑定已实现：
+- `bind_parallel_context(...)` 校验 rank/devices、记录 TP 局部维度。
+- TP>1 时初始化 NCCL 通信域（`ncclCommInitRank`）。
+4. Qwen2 前向已接入 row-parallel 规约：
+- `attn_out_proj` 后 `ncclAllReduce(sum)`
+- `mlp_down` 后 `ncclAllReduce(sum)`
+5. 构建系统已修复 NCCL 宏传播：
+- `ENABLE_NCCL_API` 不再只在 CUDA 子目标可见，主库编译也能识别。
+6. 运行时 device/stream 上下文已修复：
+- `Runtime` 构造时先 `set_device` 再 `create_stream`
+- `Qwen2Model::forward` 入口显式 `setDevice(device_type_, device_id_)`
+7. 权重加载链路已实现“零 torch 依赖”：
+- Python Qwen2 改为直接解析 `safetensors` 二进制 header+payload
+- BF16 按原始 16-bit 位模式加载（不做 BF16->F32 fallback）
+
+#### 13.16.2 已验证结果（截至本次）
+
+1. TP 结构/参数相关单测通过：
+- `test/core/test_core_model_api.py -k runtime_parallel_init`
+- `test/core/test_qwen2_adapter.py -k tp_shard`
+2. 并行初始化日志可见：
+- `[runtime.parallel] initialized ...`
+- `[qwen2.parallel] bound ...`
+3. BF16 safetensors 读取验证通过：
+- `DeepSeek-R1-Distill-Qwen-1.5B` 全量 `339` 个 tensor 可直接读出（dtype=bfloat16）
+
+#### 13.16.3 当前未闭环项（必须继续追）
+
+1. 尚未拿到“LLMEngine 双进程 TP E2E 稳定通过 + 吞吐达标”的最终验收结论。
+2. runtime 规划仍存在设备探测偏差风险：
+- 当前 `_available_memory_bytes(DeviceType.NVIDIA)` 固定探测 `cudaSetDevice(0)`。
+- 在未设置 `CUDA_VISIBLE_DEVICES` 且卡0紧张时，会出现 `estimated num_kvcache_blocks <= 0` 的误判。
+3. 性能目标项尚未完成：
+- allreduce 仍是同步路径，尚未做 comm/compute overlap。
+- QKV 尚未 fused（仍为三次线性）。
+- 未完成 TP=1/2 的完整 NSYS 对比与门槛判定（13.14 约束）。
+
+#### 13.16.4 下一步执行计划（严格顺序）
+
+1. 修复 runtime 规划设备探测口径：
+- 方案A：基于 `tensor_parallel_device_ids`/`tp_rank` 选定探测 device。
+- 方案B：在初始化阶段统一按可见设备集合探测并取最小安全值。
+2. 固化 E2E 验收脚本：
+- 双进程 rank0/rank1 同时拉起，固定 `LLAISYS_TP_SINGLE_PROCESS=0`。
+- 固定 `LLAISYS_TP_INIT_METHOD=file://...`，避免隐式通信初始化歧义。
+3. 完成 13.14 的正确性对比表（TP1 vs TP2）：
+- `top_k=1, top_p=1.0, temperature=1.0, seed=0` 全量 token 对齐。
+4. 完成 13.14 的性能对比与 NSYS：
+- 至少提交 TP=1/TP=2 的 `nvtx_sum/cuda_api_sum/cuda_gpu_kern_sum`。
+5. 在上述基线通过后，再进入性能优化：
+- decode 通信重叠
+- fused QKV
+- metadata/prepare 下沉 C++
+
+#### 13.16.5 交接入口（下次直接从这里开始）
+
+代码入口（优先阅读）：
+
+1. `src/llaisys/model.cc`：
+- `llaisysRuntimeParallelInit`
+- runtime 绑定 model 的并行上下文流程
+2. `src/llaisys/qwen2/qwen2_model.cpp`：
+- `bind_parallel_context`
+- `init_nccl_comm_`
+- `tp_allreduce_sum_`
+- `forward` 中 TP allreduce 接入点
+3. `python/llaisys/engine/runtime_factory.py`：
+- TP 选卡与 runtime 创建参数
+- 当前显存探测逻辑（待修）
+4. `python/llaisys/models/qwen2.py`：
+- TP 权重分片
+- safetensors 纯解析加载（零 torch）
+
+建议复现命令模板（开发机）：
+
+```bash
+CUDA_VISIBLE_DEVICES=3,4 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+LLAISYS_TP_SINGLE_PROCESS=0 \
+LLAISYS_TP_INIT_METHOD=file:///tmp/llaisys_tp_nccl.id \
+python scripts/bench_compare_vllm.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --backend novainfer \
+  --num-seqs 256 \
+  --min-input-len 100 \
+  --max-input-len 1024 \
+  --min-output-len 100 \
+  --max-output-len 1024 \
+  --max-model-len 4096 \
+  --seed 0 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 16384
+```
+
+交接要求：
+
+1. 下次继续开发前先复跑 13.16.2 的最小验证。
+2. 每次修改后必须更新本节“未闭环项”和“下一步计划”状态。
+3. 合并前必须补齐 13.14 所有验收表格，不得以“局部通过”替代。
