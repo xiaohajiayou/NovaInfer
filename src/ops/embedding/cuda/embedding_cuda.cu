@@ -4,6 +4,9 @@
 
 #include <cstdint>
 
+#include "../../../core/context/context.hpp"
+#include "../../../utils/check.hpp"
+
 namespace llaisys::device::nvidia {
 void cuda_check(cudaError_t rc, const char *what, const char *file, int line);
 } // namespace llaisys::device::nvidia
@@ -49,6 +52,18 @@ __global__ void embedding_u8_kernel(std::uint8_t *out,
 } // namespace
 
 void embedding(tensor_t out, tensor_t index, tensor_t weight) {
+    CHECK_ARGUMENT(out != nullptr && index != nullptr && weight != nullptr, "embedding: null tensor");
+    CHECK_ARGUMENT(out->deviceType() == LLAISYS_DEVICE_NVIDIA, "embedding: out must be NVIDIA tensor");
+    CHECK_ARGUMENT(index->deviceType() == LLAISYS_DEVICE_NVIDIA, "embedding: index must be NVIDIA tensor");
+    CHECK_ARGUMENT(weight->deviceType() == LLAISYS_DEVICE_NVIDIA, "embedding: weight must be NVIDIA tensor");
+    CHECK_ARGUMENT(index->dtype() == LLAISYS_DTYPE_I64, "embedding: index dtype must be I64");
+    CHECK_ARGUMENT(out->dtype() == weight->dtype(), "embedding: out/weight dtype mismatch");
+    CHECK_ARGUMENT(out->deviceId() == index->deviceId() && out->deviceId() == weight->deviceId(),
+                   "embedding: out/index/weight device mismatch");
+
+    // Keep launch stream/device aligned with tensor placement even if caller changed current device.
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+
     const std::uint64_t num_indices = static_cast<std::uint64_t>(index->shape()[0]);
     const std::uint64_t embedding_dim = static_cast<std::uint64_t>(weight->shape()[1]);
     const std::uint64_t vocab_size = static_cast<std::uint64_t>(weight->shape()[0]);

@@ -42,6 +42,10 @@ def _run_novainfer(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     kv_cache_memory_utilization: float,
+    tensor_parallel_size: int,
+    tp_rank: int,
+    tp_local_rank: int,
+    tensor_parallel_device_ids: tuple[int, ...] | None,
 ) -> dict:
     from llaisys.entrypoints.llm import LLM
     from llaisys.engine.types import SamplingParams
@@ -74,6 +78,10 @@ def _run_novainfer(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         kv_cache_memory_utilization=float(kv_cache_memory_utilization),
+        tensor_parallel_size=int(tensor_parallel_size),
+        tp_rank=int(tp_rank),
+        tp_local_rank=int(tp_local_rank),
+        tensor_parallel_device_ids=tensor_parallel_device_ids,
     )
     t_init1 = time.perf_counter()
     t_warmup0 = t_init1
@@ -83,7 +91,7 @@ def _run_novainfer(
     kv_stats = {}
     try:
         print("[bench] warmup start backend=novainfer")
-        llm.generate(["Benchmark: "], SamplingParams(max_new_tokens=1))
+        llm.generate([[151646, 151647, 42]], SamplingParams(max_new_tokens=1))
         kv_stats = llm.kv_cache_stats()
         if kv_stats:
             print(f"[bench] kv_stats_after_warmup backend=novainfer stats={kv_stats}")
@@ -210,6 +218,13 @@ def _run_vllm(
 
 
 def main() -> int:
+    def _parse_device_ids(raw: str) -> tuple[int, ...] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        ids = tuple(int(v.strip()) for v in text.split(",") if v.strip())
+        return ids if ids else None
+
     parser = argparse.ArgumentParser(description="Throughput benchmark: NovaInfer vs vLLM (nano-vllm-style timing).")
     parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--backend", default="both", choices=["novainfer", "vllm", "both"])
@@ -223,9 +238,14 @@ def main() -> int:
     parser.add_argument("--max-num-seqs", default=256, type=int)
     parser.add_argument("--max-num-batched-tokens", default=16384, type=int)
     parser.add_argument("--kv-cache-memory-utilization", default=0.9, type=float)
+    parser.add_argument("--tensor-parallel-size", default=1, type=int)
+    parser.add_argument("--tp-rank", default=0, type=int)
+    parser.add_argument("--tp-local-rank", default=0, type=int)
+    parser.add_argument("--tensor-parallel-device-ids", default="", type=str)
     parser.add_argument("--vllm-fair-mode", action="store_true")
     parser.add_argument("--result-json", default="", type=str)
     args = parser.parse_args()
+    tp_device_ids = _parse_device_ids(args.tensor_parallel_device_ids)
 
     prompts, out_lens = _build_dataset(
         seed=int(args.seed),
@@ -289,6 +309,14 @@ def main() -> int:
                 str(args.max_num_batched_tokens),
                 "--kv-cache-memory-utilization",
                 str(args.kv_cache_memory_utilization),
+                "--tensor-parallel-size",
+                str(args.tensor_parallel_size),
+                "--tp-rank",
+                str(args.tp_rank),
+                "--tp-local-rank",
+                str(args.tp_local_rank),
+                "--tensor-parallel-device-ids",
+                str(args.tensor_parallel_device_ids),
                 *(["--vllm-fair-mode"] if bool(args.vllm_fair_mode) else []),
                 "--result-json",
                 result_json,
@@ -329,6 +357,10 @@ def main() -> int:
             max_num_seqs=int(args.max_num_seqs),
             max_num_batched_tokens=int(args.max_num_batched_tokens),
             kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
+            tensor_parallel_size=int(args.tensor_parallel_size),
+            tp_rank=int(args.tp_rank),
+            tp_local_rank=int(args.tp_local_rank),
+            tensor_parallel_device_ids=tp_device_ids,
         )
         results.append(row)
         _print_row(row)

@@ -62,6 +62,11 @@ void Context::setDevice(llaisysDeviceType_t device_type, int device_id) {
         }
         runtimes[device_id]->_activate();
         _current_runtime = runtimes[device_id];
+    } else {
+        // External CUDA calls (e.g. Python-side cudaSetDevice probing) can desync
+        // process current device from the runtime we track in Context.
+        // Re-activate even on the same logical runtime to keep device state correct.
+        _current_runtime->_activate();
     }
 }
 

@@ -225,6 +225,24 @@ Notes:
 - `xmake install` is required so Python loads the latest library from `python/llaisys/libllaisys/`.
 - If `third_party/cudnn_frontend` submodule is missing, cuDNN frontend build path will not be available.
 
+TP=2 smoke (BLOCK + cuDNN, two processes):
+
+```bash
+export LD_LIBRARY_PATH=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive/lib:$LD_LIBRARY_PATH
+export LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn
+export LLAISYS_TP_SINGLE_PROCESS=0
+export LLAISYS_TP_INIT_METHOD=file:///tmp/llaisys_tp_nccl_smoke.id
+
+CUDA_VISIBLE_DEVICES=4,5 \
+python scripts/tp2_smoke.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+```
+
+Notes:
+
+- TP+cuDNN path currently requires `cudnnGetVersion() >= 91800` (cuDNN 9.18+).
+- `--tensor-parallel-device-ids` in scripts uses logical IDs under `CUDA_VISIBLE_DEVICES`.
+
 ### 2. Install Python package
 
 ```bash

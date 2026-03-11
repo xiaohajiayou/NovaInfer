@@ -106,6 +106,34 @@ def _load_cudart() -> ctypes.CDLL | None:
     return None
 
 
+def _load_cudnn() -> ctypes.CDLL | None:
+    candidates = [
+        find_library("cudnn"),
+        "libcudnn.so",
+        "libcudnn.so.9",
+    ]
+    for name in candidates:
+        if not name:
+            continue
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def _cudnn_version() -> int:
+    cudnn = _load_cudnn()
+    if cudnn is None:
+        return 0
+    try:
+        fn = cudnn.cudnnGetVersion
+        fn.restype = ctypes.c_size_t
+        return int(fn())
+    except Exception:
+        return 0
+
+
 def _cuda_visible_device_count(cudart: ctypes.CDLL) -> int:
     fn = cudart.cudaGetDeviceCount
     fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
@@ -280,6 +308,19 @@ def create_runtime(
     if tp_size > 1 and device != DeviceType.NVIDIA:
         LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
         raise RuntimeError("tensor parallel currently supports NVIDIA device only")
+    if tp_size > 1:
+        backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
+        if backend == "cudnn":
+            # TP+cuDNN path depends on recent cuDNN kernels for local_nkvh=1 shape family.
+            # Older 9.x builds can fail at first prefill graph build with opaque "no valid engine" errors.
+            cudnn_ver = _cudnn_version()
+            if cudnn_ver < 91800:
+                LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+                raise RuntimeError(
+                    "TP with cudnn backend requires cuDNN >= 9.18 "
+                    f"(detected: {cudnn_ver}). "
+                    "Please update libcudnn in LD_LIBRARY_PATH."
+                )
     if exec_backend != "uni":
         LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
         raise NotImplementedError(f"distributed_executor_backend={exec_backend} is not supported yet")
