@@ -1849,3 +1849,40 @@ python scripts/bench_compare_vllm.py \
 1. 下次继续开发前先复跑 13.16.2 的最小验证。
 2. 每次修改后必须更新本节“未闭环项”和“下一步计划”状态。
 3. 合并前必须补齐 13.14 所有验收表格，不得以“局部通过”替代。
+
+### 13.16.6 增量状态（2026-03-12）
+
+本节记录 2026-03-12 的新增落地与实测结果。
+
+新增落地：
+
+1. 设备上下文稳定性修复（`src/core/context/context.cpp`）：
+- `Context::setDevice(...)` 在“逻辑 runtime 未变化”时也强制 `_activate()`。
+- 目标：防止 Python 侧 `cudaSetDevice` 探测改变进程当前卡后，C++ 误以为上下文仍一致。
+2. TP 前置 fail-fast（`python/llaisys/engine/runtime_factory.py`）：
+- 当 `tp_size>1` 且 backend=`cudnn` 时，强制校验 `cudnnGetVersion() >= 91800`。
+- 低版本直接报错退出，避免运行期出现 opaque 的 `No valid engine configs`。
+3. 验收脚本补齐：
+- `scripts/tp2_smoke.py`：双进程 TP=2 最小可用 smoke（预分词输入，避免 tokenizer/torch 依赖）。
+- `scripts/bench_tp2_novainfer.py`：双进程 TP=2 benchmark 启动器（并发拉起 rank0/rank1，输出吞吐与日志目录）。
+4. bench 参数补齐（`scripts/bench_compare_vllm.py`）：
+- 新增 `--tensor-parallel-size/--tp-rank/--tp-local-rank/--tensor-parallel-device-ids`。
+- warmup 改为预分词输入，去掉字符串 warmup 对 tokenizer/torch 的隐式依赖。
+
+实测结果（开发机，`DeepSeek-R1-Distill-Qwen-1.5B`）：
+
+1. TP=2 smoke 通过：
+- 命令：`CUDA_VISIBLE_DEVICES=4,5` + `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn` + `LLAISYS_TP_SINGLE_PROCESS=0`。
+- 结果：`rank0=0, rank1=0`，两 rank 均成功完成 prefill+decode 并退出。
+2. TP=2 全量 bench 通过：
+- 命令：`python scripts/bench_tp2_novainfer.py --num-seqs 256 --in 100~1024 --out 100~1024 ...`
+- 结果：rank0 `1827.51 tok/s`，rank1 `1826.37 tok/s`（run ~76.7s）。
+3. TP=1 对照（同参数）：
+- 结果：`1786.00 tok/s`（run ~78.4s）。
+- 结论：1.5B 小模型上 TP=2 提升有限（约 +2.3%），当前“可用性闭环”已完成，但“高增益”需更大模型或进一步 overlap/fusion 优化。
+
+当前建议：
+
+1. 继续以 1.5B 作为功能验收模型（稳定、可快速回归）。
+2. 性能验收应增加更大模型（例如 32B）与更高 batch/token 压力，以放大 TP 收益并评估 NVLink 利用率。
+3. 下一阶段优先项保持不变：`allreduce overlap -> fused QKV -> metadata 下沉 C++`。
