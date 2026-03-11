@@ -58,11 +58,11 @@ def test_multi_seq_interleaved_decode():
         )
         assert out1.status == 0
         if IS_BLOCK_LAYOUT:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(100))) == -1
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(200))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == -1
         else:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(100))) == 1
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(200))) == 1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == 1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == 1
         assert out1.output_ids == [0, 1, 2, 3]
 
         out2 = _forward(
@@ -76,11 +76,11 @@ def test_multi_seq_interleaved_decode():
         )
         assert out2.status == 0
         if IS_BLOCK_LAYOUT:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(100))) == -1
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(200))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == -1
         else:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(100))) == 2
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(200))) == 2
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == 2
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == 2
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -99,6 +99,6 @@ def test_multi_seq_set_decode():
         # Forward metadata contract is one seq-id per token.
         assert out.status != 0
         if not IS_BLOCK_LAYOUT:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(1))) in (-1, 0, 1)
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(1))) in (-1, 0, 1)
     finally:
         destroy_model_runtime(model, runtime)

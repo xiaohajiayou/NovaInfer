@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Optional
 
 from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.model import KvCacheLayout, LlaisysRuntimeCreateParams
+from ..libllaisys.model import KvCacheLayout, LlaisysKvStateCreateParams
 from ..models import qwen2 as qwen2_impl
 
 
 @dataclass(frozen=True)
-class RuntimePlan:
+class KvCachePlan:
     max_model_len: int
     kv_cache_capacity_tokens: int
 
@@ -139,25 +139,25 @@ def _estimate_cuda_kv_capacity_tokens(
     return capacity_tokens, probe
 
 
-def create_runtime(
+def create_kv_state(
     *,
     kv_cache_layout: KvCacheLayout,
     kv_cache_block_size: int,
-    plan: RuntimePlan,
+    plan: KvCachePlan,
 ):
-    params = LlaisysRuntimeCreateParams(
+    params = LlaisysKvStateCreateParams(
         int(kv_cache_layout),
         int(kv_cache_block_size),
         int(plan.max_model_len),
         int(plan.kv_cache_capacity_tokens),
     )
-    runtime = LIB_LLAISYS.llaisysRuntimeCreate(byref(params))
-    if not runtime:
-        raise RuntimeError("Failed to create runtime state")
-    return runtime
+    kv_state = LIB_LLAISYS.llaisysKvStateCreate(byref(params))
+    if not kv_state:
+        raise RuntimeError("Failed to create kv state")
+    return kv_state
 
 
-def plan_qwen2_runtime(
+def plan_qwen2_kv_cache(
     *,
     model_path: Path | str,
     device: DeviceType,
@@ -165,7 +165,7 @@ def plan_qwen2_runtime(
     max_model_len: Optional[int],
     kv_cache_memory_utilization: float,
     max_num_seqs: Optional[int],
-) -> RuntimePlan:
+) -> KvCachePlan:
     model_path = Path(model_path)
     meta = qwen2_impl._parse_meta(model_path, max_model_len=max_model_len)
     resolved_max_model_len = int(meta.maxseq)
@@ -227,7 +227,7 @@ def plan_qwen2_runtime(
             f"capacity_tokens={resolved_kv_capacity_tokens}"
         )
 
-    return RuntimePlan(
+    return KvCachePlan(
         max_model_len=int(resolved_max_model_len),
         kv_cache_capacity_tokens=int(resolved_kv_capacity_tokens),
     )

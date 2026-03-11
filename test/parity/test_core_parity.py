@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from llaisys.engine.runtime_factory import create_runtime, plan_qwen2_runtime
+from llaisys.engine.runtime_factory import create_kv_state, plan_qwen2_kv_cache
 from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from llaisys.libllaisys.model import KvCacheLayout
@@ -42,7 +42,7 @@ def _restore_attn_backend(old: str | None):
 
 
 def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
-    plan = plan_qwen2_runtime(
+    plan = plan_qwen2_kv_cache(
         model_path=model_path,
         device=device,
         kv_cache_block_size=16,
@@ -50,7 +50,7 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
         kv_cache_memory_utilization=0.9,
         max_num_seqs=None,
     )
-    runtime_handle = create_runtime(
+    runtime_handle = create_kv_state(
         kv_cache_layout=kv_layout,
         kv_cache_block_size=16,
         plan=plan,
@@ -62,7 +62,7 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
             max_model_len=int(plan.max_model_len),
         )
     except Exception:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+        LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         raise
     return model, runtime_handle
 
@@ -283,5 +283,5 @@ def test_core_parity(require_model_path, prompts, ll_device, backend, kv_layout)
         if llaisys_model is not None:
             llaisys_model.close()
         if runtime_handle is not None:
-            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+            LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         _restore_attn_backend(old_backend)

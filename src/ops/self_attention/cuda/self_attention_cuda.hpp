@@ -6,6 +6,8 @@
 
 namespace llaisys::ops::cuda {
 
+struct CudnnRuntimeState;
+
 enum class PagedAttentionBackend : int32_t {
     NATIVE = 0,
     FLASHINFER = 1,
@@ -22,6 +24,7 @@ struct CommonAttentionMetadata {
     const int32_t *cu_seqlens_k{nullptr};
     const int32_t *block_tables{nullptr};
     const int32_t *slot_mapping{nullptr};
+    CudnnRuntimeState *cudnn_state{nullptr};
     // CUDNN-only metadata prepared by Python BLOCK builder.
     const int32_t *cudnn_seq_lens_q{nullptr};
     const int32_t *cudnn_seq_lens_kv{nullptr};
@@ -64,23 +67,14 @@ void self_attention_paged(tensor_t attn_val,
                           int32_t block_size,
                           float scale);
 
-void build_slot_mapping(tensor_t slot_mapping,
-                        tensor_t query_start_loc,
-                        tensor_t seq_lens,
-                        tensor_t block_tables,
-                        int32_t block_table_width,
-                        int32_t block_size);
-
-void build_query_start_loc_and_seq_lens(tensor_t query_start_loc,
-                                        tensor_t seq_lens,
-                                        tensor_t req_num_scheduled_tokens,
-                                        tensor_t req_num_computed_tokens);
-
 void build_block_positions(tensor_t pos_ids,
                            tensor_t query_start_loc,
                            tensor_t seq_lens);
 
 void build_last_token_logits_indices(tensor_t logits_indices,
                                      tensor_t query_start_loc);
+
+CudnnRuntimeState *create_cudnn_runtime_state();
+void destroy_cudnn_runtime_state(CudnnRuntimeState *state);
 
 } // namespace llaisys::ops::cuda

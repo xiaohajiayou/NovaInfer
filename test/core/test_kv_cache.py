@@ -38,25 +38,25 @@ def test_kv_seq_basic_ops():
         first_status = _forward(runtime, model, [1, 2, 3], [10, 10, 20])
         assert first_status == 0
         if IS_BLOCK_LAYOUT:
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqCp(runtime, c_int64(30), c_int64(10), c_int64(0), c_int64(2))) == 5
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqRm(runtime, c_int64(10), c_int64(1), c_int64(2))) == 5
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 5
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqKeep(runtime, c_int64(20))) == 5
+            assert int(LIB_LLAISYS.llaisysKvStateSeqCp(runtime, c_int64(30), c_int64(10), c_int64(0), c_int64(2))) == 5
+            assert int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(10), c_int64(1), c_int64(2))) == 5
+            assert int(LIB_LLAISYS.llaisysKvStateSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 5
+            assert int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(20))) == 5
             return
 
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(10))) == 1
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(20))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqCp(runtime, c_int64(30), c_int64(10), c_int64(0), c_int64(2))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(30))) == 1
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqRm(runtime, c_int64(10), c_int64(1), c_int64(2))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(10))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(0))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(20))) == 1
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqKeep(runtime, c_int64(20))) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(10))) == -1
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(20))) == 1
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(30))) == -1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(10))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(20))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqCp(runtime, c_int64(30), c_int64(10), c_int64(0), c_int64(2))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(30))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(10), c_int64(1), c_int64(2))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(10))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(0))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqAdd(runtime, c_int64(20), c_int64(0), c_int64(1), c_int64(1))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(20))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(20))) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(10))) == -1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(20))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(30))) == -1
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -78,15 +78,15 @@ def test_kv_seq_cp_then_rm_does_not_break_src():
     runtime, model, _ = _create_model()
     try:
         assert _forward(runtime, model, [1, 2], [7, 7]) == 0
-        cp_status = int(LIB_LLAISYS.llaisysRuntimeKvSeqCp(runtime, c_int64(8), c_int64(7), c_int64(0), c_int64(2)))
+        cp_status = int(LIB_LLAISYS.llaisysKvStateSeqCp(runtime, c_int64(8), c_int64(7), c_int64(0), c_int64(2)))
         if IS_BLOCK_LAYOUT:
             assert cp_status == 5
             return
         assert cp_status == 0
-        rm_status = int(LIB_LLAISYS.llaisysRuntimeKvSeqRm(runtime, c_int64(8), c_int64(0), c_int64(1)))
+        rm_status = int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(8), c_int64(0), c_int64(1)))
         assert rm_status == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(7))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(7))) == 1
         assert _forward(runtime, model, [3], [7]) == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(7))) == 2
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(7))) == 2
     finally:
         destroy_model_runtime(model, runtime)

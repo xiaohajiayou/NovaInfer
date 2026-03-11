@@ -8,6 +8,7 @@ from llaisys.libllaisys.model import KvCacheLayout, LlaisysKvStats, ModelType
 from test.utils.batch_builders import build_decode_batch
 from test.utils.forward_api import (
     TinyMeta,
+    create_runtime,
     create_tiny_qwen2_model,
     destroy_model_runtime,
     run_model_forward,
@@ -53,42 +54,42 @@ def test_model_create_forward_sampler_and_runtime_kv_api():
             # CPU sampler path is still under refactor in stage-1.
             assert "samplerSample failed" in str(exc)
 
-        keep0 = int(LIB_LLAISYS.llaisysRuntimeKvSeqKeep(runtime, c_int64(0)))
-        keep1 = int(LIB_LLAISYS.llaisysRuntimeKvSeqKeep(runtime, c_int64(1)))
+        keep0 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(0)))
+        keep1 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(1)))
         if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
             assert keep0 == 5
             assert keep1 == 5
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(0))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
         else:
             assert keep0 == 0
             assert keep1 == 2
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(0))) == 2
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == 2
 
-        rm_status = int(LIB_LLAISYS.llaisysRuntimeKvSeqRm(runtime, c_int64(0), c_int64(2), c_int64(3)))
+        rm_status = int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(0), c_int64(2), c_int64(3)))
         if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
             assert rm_status == 5
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(0))) == -1
-            assert int(LIB_LLAISYS.llaisysRuntimeKvResetPrefixCache(runtime)) == 0
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
+            assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
         else:
             assert rm_status == 0
-            assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(0))) == 1
+            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == 1
 
-        free_status = int(LIB_LLAISYS.llaisysRuntimeRequestFree(runtime, c_int64(0)))
+        free_status = int(LIB_LLAISYS.llaisysKvStateRequestFree(runtime, c_int64(0)))
         if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
             assert free_status == 2
         else:
             assert free_status == 0
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(runtime, c_int64(0))) == -1
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
 
         stats = LlaisysKvStats()
-        stats_rc = int(LIB_LLAISYS.llaisysRuntimeKvStats(runtime, byref(stats)))
+        stats_rc = int(LIB_LLAISYS.llaisysKvStateStats(runtime, byref(stats)))
         assert stats_rc == 0
         assert int(stats.capacity_tokens) == meta.maxseq
         assert int(stats.used_tokens) >= 0
         assert int(stats.free_tokens) >= 0
         assert int(stats.peak_used_tokens) >= 0
 
-        assert int(LIB_LLAISYS.llaisysRuntimeKvResetPrefixCache(runtime)) == 0
+        assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -104,3 +105,23 @@ def test_model_forward_reports_oom_when_exceeding_maxseq():
             assert out.status == 1
     finally:
         destroy_model_runtime(model, runtime)
+
+
+def test_model_forward_fails_fast_on_runtime_handle_change():
+    runtime_a, model, meta = _create_model()
+    runtime_b = create_runtime(
+        layout=KvCacheLayout(TEST_KV_LAYOUT),
+        block_size=TEST_KV_BLOCK_SIZE,
+        max_model_len=int(meta.maxseq),
+        kv_capacity_tokens=int(meta.maxseq),
+    )
+    try:
+        out_a = _forward(runtime_a, model, [1], [1])
+        assert out_a.status == 0
+
+        out_b = _forward(runtime_b, model, [2], [1])
+        assert out_b.status == -1
+    finally:
+        if runtime_b:
+            LIB_LLAISYS.llaisysKvStateDestroy(runtime_b)
+        destroy_model_runtime(model, runtime_a)
