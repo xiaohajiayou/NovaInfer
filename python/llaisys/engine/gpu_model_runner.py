@@ -423,7 +423,7 @@ class GPUModelRunner:
         seqs: list,
         *,
         target_width: int | None = None,
-    ) -> tuple[list[list[int]], int]:
+    ) -> tuple[np.ndarray, int]:
         if not seqs:
             raise RuntimeError("BLOCK layout requires non-empty seq list")
         widths = [len(getattr(seq, "block_table", [])) for seq in seqs]
@@ -438,15 +438,18 @@ class GPUModelRunner:
                 raise RuntimeError("target_width must be positive")
             if max_width > block_table_width:
                 raise RuntimeError("target_width is smaller than required block table width")
-        rows: list[list[int]] = []
-        for seq in seqs:
-            row = [int(b) for b in seq.block_table]
-            if any(v < 0 for v in row):
+        rows = np.empty((len(seqs), int(block_table_width)), dtype=np.int32)
+        for row_idx, seq in enumerate(seqs):
+            row = np.asarray(seq.block_table, dtype=np.int32)
+            if row.ndim != 1 or row.size <= 0:
+                raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
+            if np.any(row < 0):
                 raise RuntimeError("block_table contains invalid negative block id")
-            if len(row) < block_table_width:
+            n = int(row.size)
+            rows[row_idx, :n] = row
+            if n < int(block_table_width):
                 # Packed semantics: pad tail with a valid block id instead of sentinel.
-                row.extend([int(row[-1])] * (block_table_width - len(row)))
-            rows.append(row)
+                rows[row_idx, n:int(block_table_width)] = int(row[-1])
         return rows, block_table_width
 
     def _build_cudnn_decode_rows(
@@ -454,10 +457,12 @@ class GPUModelRunner:
         *,
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
-        block_table_rows: list[list[int]],
+        block_table_rows: np.ndarray,
         block_table_width: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-        nseq = len(block_table_rows)
+        if block_table_rows.ndim != 2:
+            raise RuntimeError("cudnn decode page_table must be rank-2 array")
+        nseq = int(block_table_rows.shape[0])
         if nseq <= 0:
             raise RuntimeError("cudnn decode metadata requires non-empty batch")
         if len(cu_seqlens_q) != nseq + 1 or len(cu_seqlens_k) != nseq + 1:
@@ -493,11 +498,13 @@ class GPUModelRunner:
         *,
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
-        block_table_rows: list[list[int]],
+        block_table_rows: np.ndarray,
         block_table_width: int,
         ntoken: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
-        nseq = len(block_table_rows)
+        if block_table_rows.ndim != 2:
+            raise RuntimeError("cudnn prefill page_table must be rank-2 array")
+        nseq = int(block_table_rows.shape[0])
         if nseq <= 0:
             raise RuntimeError("cudnn prefill metadata requires non-empty batch")
         if len(cu_seqlens_q) != nseq + 1 or len(cu_seqlens_k) != nseq + 1:
@@ -632,7 +639,7 @@ class GPUModelRunner:
         *,
         prepared: PreparedTensors,
         seqs: list,
-        block_table_rows: list[list[int]],
+        block_table_rows: np.ndarray,
         block_table_width: int,
         h2d_stream,
         incremental_update: bool = False,
@@ -662,18 +669,32 @@ class GPUModelRunner:
         else:
             cache = self._decode_block_table_cache
             if cache is None or cache.shape != block_rows_np.shape:
-                changed_rows = range(n_outputs)
+                cache = np.empty_like(block_rows_np)
+                changed_rows = np.arange(n_outputs, dtype=np.int32)
             else:
                 changed_rows = np.flatnonzero(np.any(block_rows_np != cache, axis=1))
             row_width = int(block_table_width)
-            for row_idx in changed_rows:
-                start = int(row_idx) * row_width
-                end = start + row_width
-                host_row_t = self._block_tables_buf.cpu.slice(0, start, end)
-                dev_row_t = self._block_tables_buf.gpu.slice(0, start, end)
-                host_row_t.copy_from_numpy(block_rows_np[row_idx])
-                dev_row_t.copy_(host_row_t, non_blocking=True, stream=h2d_stream)
-            self._decode_block_table_cache = block_rows_np.copy()
+            if int(changed_rows.size) > 0:
+                run_starts = [int(changed_rows[0])]
+                run_ends: list[int] = []
+                prev = int(changed_rows[0])
+                for row_idx in changed_rows[1:]:
+                    cur = int(row_idx)
+                    if cur != prev + 1:
+                        run_ends.append(prev + 1)
+                        run_starts.append(cur)
+                    prev = cur
+                run_ends.append(prev + 1)
+
+                for run_begin, run_end in zip(run_starts, run_ends):
+                    start = int(run_begin) * row_width
+                    end = int(run_end) * row_width
+                    host_rows_t = self._block_tables_buf.cpu.slice(0, start, end)
+                    dev_rows_t = self._block_tables_buf.gpu.slice(0, start, end)
+                    host_rows_t.copy_from_numpy(block_rows_np[run_begin:run_end].reshape(-1))
+                    dev_rows_t.copy_(host_rows_t, non_blocking=True, stream=h2d_stream)
+                cache[changed_rows, :] = block_rows_np[changed_rows, :]
+            self._decode_block_table_cache = cache
 
         prepared.keepalive.append(block_tables_t)
         prepared.block_tables = block_tables_t
@@ -746,7 +767,7 @@ class GPUModelRunner:
         slot_mapping: list[int],
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
-        block_table_rows: list[list[int]],
+        block_table_rows: np.ndarray,
         max_seqlen_q: int,
         max_seqlen_k: int,
         block_table_width: int,
@@ -862,7 +883,7 @@ class GPUModelRunner:
         max_seqlen_q: int,
         max_seqlen_k: int,
         slot_mapping: list[int],
-        block_table_rows: list[list[int]],
+        block_table_rows: np.ndarray,
         block_table_width: int,
         incremental_block_table_update: bool = False,
     ) -> PreparedTensors:

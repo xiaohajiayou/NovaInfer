@@ -1886,3 +1886,41 @@ python scripts/bench_compare_vllm.py \
 1. 继续以 1.5B 作为功能验收模型（稳定、可快速回归）。
 2. 性能验收应增加更大模型（例如 32B）与更高 batch/token 压力，以放大 TP 收益并评估 NVLink 利用率。
 3. 下一阶段优先项保持不变：`allreduce overlap -> fused QKV -> metadata 下沉 C++`。
+
+### 13.16.7 增量状态（2026-03-12，优化项 #1）
+
+本轮已完成“Python BLOCK 元数据链路去 list 化 + decode 增量上传批量化”：
+
+1. `python/llaisys/engine/gpu_model_runner.py`
+- `_build_packed_block_table_rows` 改为直接产出 `np.ndarray[int32]`（去掉 `list[list[int]]` 中间结构）。
+- `_build_cudnn_decode_rows/_build_cudnn_prefill_rows` 直接消费 `np.ndarray`，减少重复 `np.asarray`/对象分配。
+- `_stage_block_tables_tensor` 的 decode 增量更新改为“连续行段批量 copy”，替代逐行 slice+copy。
+- 去掉每 step 的 `cache = block_rows_np.copy()`，改为复用缓存并按 changed rows 原位更新。
+
+2. 正确性回归
+- `pytest -q test/engine/test_model_runner_split.py test/engine/test_executor.py test/engine/test_scheduler.py`
+- 结果：`7 passed`
+
+3. 性能结果（同机同参 A/B，1.5B，单卡）
+- 参数：`num_seqs=64, max_num_seqs=64, max_num_batched_tokens=4096, cudnn+block`
+- 优化前（`HEAD~1` 临时回退文件复测）：`1479.8041 tok/s`（run `24.9060s`）
+- 优化后（当前代码）：`1741.9716 tok/s`（run `21.1576s`）
+- 提升：`+17.7%`
+
+4. NSYS 佐证（轻量配置）
+- 报告：`/home/xiaohajiayou/NovaInfer/.nsys_out/nsys_opt_numpy_light_20260312_091911.nsys-rep`
+- 摘要：`/home/xiaohajiayou/NovaInfer/.nsys_out/nsys_opt_numpy_light_20260312_091911.nvtx_sum.log`
+- 关键 NVTX（avg / med）：
+  - `py/runner/prepare_inputs/decode`: `0.970ms / 0.978ms`
+  - `py/runner/prepare_inputs/block/build`: `0.545ms / 0.534ms`
+  - `py/runner/prepare_inputs/block/cudnn_meta`: `0.215ms / 0.205ms`
+
+5. 7B 验证（避免小模型通信占比失真）
+- 256 序列在单卡 7B 下触发 OOM，调整到可复现实参：`num_seqs=128, max_num_seqs=128, max_num_batched_tokens=8192`
+- 单卡（GPU4）：`1247.3906 tok/s`（run `55.3764s`）
+- TP=2（GPU4,5；脚本 `scripts/bench_tp2_novainfer.py`）：rank0/rank1 均 `1639.925x tok/s`（run `42.1214s`）
+- TP=2 相对单卡：约 `+31.5%`
+
+6. 下一优化项（优化 #2）
+- 目标：TP 路径通信侧优化（allreduce overlap + stream/event 明确化）
+- 验收口径：先在 1.5B 做功能/稳定性，再在 7B 同参复测吞吐与 NVTX。
