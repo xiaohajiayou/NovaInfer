@@ -2029,3 +2029,36 @@ Smoke-2（中负载）：
 - `allreduce overlap`
 - `fused QKV`
 - 更严格隔离环境下复测 TP2/TP4（固定空闲卡、3 次中位数）
+
+### 13.16.10 增量状态（2026-03-12，TP vs HF 正确性验收）
+
+按“不能只看吞吐，必须与 HF 对齐”的要求，补做了 TP 对 HF 的逐 token 验收。
+
+验证配置：
+
+1. 模型：`DeepSeek-R1-Distill-Qwen-7B`
+2. Prompt：两条文本 prompt，先用同一 HF tokenizer 转成 `prompt_ids`，再同时喂给 HF 与 NovaInfer，避免分词口径差异。
+3. 采样配置：`max_new_tokens=8`，greedy（HF: `do_sample=False`；NovaInfer: `top_k=1`）。
+4. 对比口径：`token_ids`（新增 token 序列）逐条、逐 token 精确相等。
+
+运行结果：
+
+1. HF 输出示例（两条序列）：
+- seq0: `[358, 2776, 4460, 311, 3535, 2664, 382, 40]`
+- seq1: `[21, 20, 20, 18, 21, 271, 151648, 198]`
+2. NovaInfer TP2：
+- 目录：`/tmp/tp2_vs_hf_4dj3j6kbhyovjq9i`
+- rank0/rank1 均输出：`[0, 0, 0, 0, 0, 0, 0, 0]`（两条序列均如此）
+- 结论：`FAIL`（与 HF 不一致）
+3. NovaInfer TP4：
+- 目录：`/tmp/tp4_vs_hf_jqlfaytj6a5w57e3`
+- rank0~rank3 均输出：`[0, 0, 0, 0, 0, 0, 0, 0]`
+- 结论：`FAIL`（与 HF 不一致）
+
+阶段结论：
+
+1. 当前 TP 路径在“可运行/吞吐”层面成立，但“与 HF 语义正确性对齐”未通过。
+2. 在修复该正确性问题前，不应将 TP 判定为最终可验收。
+3. 后续优先级应调整为：
+- 先修复输出正确性（至少 TP2/TP4 对 HF 通过）
+- 再推进 allreduce overlap / fused QKV 性能优化
