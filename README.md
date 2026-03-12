@@ -182,48 +182,36 @@ xmake install
 NVIDIA CUDA + cuDNN frontend (for `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`):
 
 ```bash
-git submodule update --init --recursive
+# Ubuntu: install/update cuDNN runtime+dev for CUDA 12 (requires sudo)
+sudo apt-get update
+sudo apt-get install -y libcudnn9-cuda-12 libcudnn9-dev-cuda-12
+
+# Verify cuDNN >= 9.18
+python - <<'PY'
+import ctypes, sys
+lib = ctypes.cdll.LoadLibrary("libcudnn.so.9")
+lib.cudnnGetVersion.restype = ctypes.c_size_t
+v = int(lib.cudnnGetVersion())
+major = v // 10000
+minor = (v % 10000) // 100
+patch = v % 100
+print(f"detected cuDNN: {major}.{minor}.{patch} ({v})")
+if not ((major > 9) or (major == 9 and minor >= 18)):
+    raise SystemExit("ERROR: NovaInfer requires cuDNN >= 9.18")
+PY
+
 xmake f --mode=release --nv-gpu=y --nv-cudnn=y
 xmake -j8
 xmake install
 ```
-```
-LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
-python scripts/bench_compare_vllm.py \
-  --model-path /home/liwenxiao/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --backend vllm \
-  --num-seqs 20 \
-  --min-input-len 100 --max-input-len 150 \
-  --min-output-len 100 --max-output-len 150 \
-  --max-model-len 4096 \
-  --seed 0 \
-  --max-num-seqs 20 \
-  --max-num-batched-tokens 500 \
-  --kv-cache-memory-utilization 0.7 \
-  --vllm-fair-mode
 
-
-
-CUDA_LAUNCH_BLOCKING=1 \
-LLAISYS_CUDNN_DEBUG=1 \
-LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
-python scripts/bench_compare_vllm.py \
-  --model-path /home/liwenxiao/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
-  --backend novainfer \
-  --num-seqs 20 \
-  --min-input-len 100 --max-input-len 150 \
-  --min-output-len 1 --max-output-len 1 \
-  --max-model-len 4096 \
-  --seed 0 \
-  --max-num-seqs 20 \
-  --max-num-batched-tokens 500 \
-  --kv-cache-memory-utilization 0.7
-```
+For repeatable large-vs-small benchmark experiment design and plotting scripts, see:
+`doc/novainfer_vs_vllm_perf_experiment_2026-03-12.md`
 Notes:
 
 - `xmake f ...` configures build mode/options; rerun it when switching CPU/GPU/cudnn.
 - `xmake install` is required so Python loads the latest library from `python/llaisys/libllaisys/`.
-- If `third_party/cudnn_frontend` submodule is missing, cuDNN frontend build path will not be available.
+- cuDNN frontend headers are vendored under `third_party/cudnn_frontend/include`.
 
 ### 2. Install Python package
 
