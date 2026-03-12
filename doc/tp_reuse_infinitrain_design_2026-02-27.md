@@ -1924,3 +1924,33 @@ python scripts/bench_compare_vllm.py \
 6. 下一优化项（优化 #2）
 - 目标：TP 路径通信侧优化（allreduce overlap + stream/event 明确化）
 - 验收口径：先在 1.5B 做功能/稳定性，再在 7B 同参复测吞吐与 NVTX。
+
+### 13.16.8 增量状态（2026-03-12，优化项 #2）
+
+本轮完成“decode 热路径 numpy scratch 复用（减少每 step 分配）”：
+
+1. `python/llaisys/engine/gpu_model_runner.py`
+- 新增 decode 常驻 scratch：
+  - `input_ids/positions/seqlens_k/slot_mapping`
+  - `scheduled_counts(ones)/cu_seqlens_q(arange template)/cu_seqlens_k`
+- `prepare_decode` 改为切片复用，不再每步 `np.empty/np.ones/np.arange/np.concatenate`。
+- `cu_seqlens_k` 使用预分配数组 + `np.cumsum(..., out=...)` 原位写入。
+
+2. 正确性回归
+- `pytest -q test/engine/test_model_runner_split.py test/engine/test_executor.py test/engine/test_scheduler.py`
+- 结果：`7 passed`
+
+3. 性能结果（同机同参 A/B，1.5B，单卡）
+- 参数：`num_seqs=64, max_num_seqs=64, max_num_batched_tokens=4096, cudnn+block`
+- 基线（优化 #1 后，commit `74dd766`）：`1534.9253 tok/s`（run `24.0116s`）
+- 当前（优化 #2 后）：`1737.5531 tok/s`（run `21.2114s`）
+- 提升：`+13.2%`
+
+4. 7B 同参复测（优化 #2 后）
+- 参数：`num_seqs=128, max_num_seqs=128, max_num_batched_tokens=8192`
+- 单卡（GPU4）：`1427.7641 tok/s`（run `48.3805s`）
+- TP=2（GPU4,5）：rank0 `1578.1314 tok/s`，rank1 `1578.0973 tok/s`（run `43.77s`）
+- TP=2 相对单卡：约 `+10.5%`
+
+5. 备注
+- 7B TP 吞吐在不同时间窗存在波动（GPU 共享环境干扰），后续会用固定空闲卡 + 重复 3 次取中位数作为最终验收口径。

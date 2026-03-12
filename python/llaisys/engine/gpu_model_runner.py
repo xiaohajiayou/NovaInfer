@@ -111,6 +111,13 @@ class GPUModelRunner:
         self._max_num_reqs = self._config.max_num_seqs
         self._max_num_tokens = self._config.max_num_batched_tokens
         self._max_num_cudnn_rows = self._next_pow2(self._max_num_reqs)
+        self._decode_input_ids_np = np.empty((self._max_num_reqs,), dtype=np.int64)
+        self._decode_positions_np = np.empty((self._max_num_reqs,), dtype=np.int64)
+        self._decode_seqlens_k_np = np.empty((self._max_num_reqs,), dtype=np.int32)
+        self._decode_slot_mapping_np = np.empty((self._max_num_reqs,), dtype=np.int32)
+        self._decode_scheduled_counts_np = np.ones((self._max_num_reqs,), dtype=np.int64)
+        self._decode_cu_seqlens_q_np = np.arange(self._max_num_reqs + 1, dtype=np.int32)
+        self._decode_cu_seqlens_k_np = np.empty((self._max_num_reqs + 1,), dtype=np.int32)
         max_model_len = int(self._config.max_model_len)
         block_size = max(1, int(self._config.kv_cache_block_size))
         self._max_block_table_width = max(1, (max_model_len + block_size - 1) // block_size)
@@ -1052,15 +1059,15 @@ class GPUModelRunner:
             nseq = len(seqs)
             if nseq <= 0:
                 return None
-            input_ids = np.empty((nseq,), dtype=np.int64)
-            positions = np.empty((nseq,), dtype=np.int64)
-            seqlens_k = np.empty((nseq,), dtype=np.int32)
+            input_ids = self._decode_input_ids_np[:nseq]
+            positions = self._decode_positions_np[:nseq]
+            seqlens_k = self._decode_seqlens_k_np[:nseq]
             for i, seq in enumerate(seqs):
                 seqlen = int(len(seq))
                 input_ids[i] = int(seq.last_token)
                 positions[i] = max(0, seqlen - 1)
                 seqlens_k[i] = int(seqlen)
-            scheduled_token_counts = np.ones((nseq,), dtype=np.int64)
+            scheduled_token_counts = self._decode_scheduled_counts_np[:nseq]
 
             if not is_block_layout:
                 prepared = self._build_slot_tensors(
@@ -1072,16 +1079,13 @@ class GPUModelRunner:
                 prepared.phase = int(AttentionPhase.DECODE)
                 return prepared
 
-            cu_seqlens_q = np.arange(nseq + 1, dtype=np.int32)
-            cu_seqlens_k = np.concatenate(
-                (
-                    np.zeros((1,), dtype=np.int32),
-                    np.cumsum(seqlens_k, dtype=np.int32),
-                )
-            )
+            cu_seqlens_q = self._decode_cu_seqlens_q_np[: nseq + 1]
+            cu_seqlens_k = self._decode_cu_seqlens_k_np[: nseq + 1]
+            cu_seqlens_k[0] = 0
+            np.cumsum(seqlens_k, dtype=np.int32, out=cu_seqlens_k[1:])
             max_seqlen_q = 1
             max_seqlen_k = int(seqlens_k.max())
-            slot_mapping = np.empty((nseq,), dtype=np.int32)
+            slot_mapping = self._decode_slot_mapping_np[:nseq]
             for i, seq in enumerate(seqs):
                 if not seq.block_table:
                     raise ValueError("BLOCK layout requires non-empty block_table for every scheduled sequence")
