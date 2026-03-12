@@ -57,6 +57,10 @@ _TP_SHARD_DIM_BY_FIELD: Dict[str, int] = {
     # Column-parallel (split output dim).
     "attn_q_w": 0,
     "attn_q_b": 0,
+    "attn_k_w": 0,
+    "attn_k_b": 0,
+    "attn_v_w": 0,
+    "attn_v_b": 0,
     "mlp_gate_w": 0,
     "mlp_up_w": 0,
     # Row-parallel (split input dim).

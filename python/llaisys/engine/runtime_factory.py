@@ -71,21 +71,33 @@ def _available_memory_bytes(device: DeviceType) -> int:
         cuda_set_device = cudart.cudaSetDevice
         cuda_set_device.argtypes = [ctypes.c_int]
         cuda_set_device.restype = ctypes.c_int
+        cuda_get_device = cudart.cudaGetDevice
+        cuda_get_device.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cuda_get_device.restype = ctypes.c_int
         cuda_mem_get_info = cudart.cudaMemGetInfo
         cuda_mem_get_info.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
         cuda_mem_get_info.restype = ctypes.c_int
 
-        rc = int(cuda_set_device(0))
-        if rc != 0:
-            print(f"[error] runtime_factory: cudaSetDevice(0) failed, rc={rc}")
-            return 0
-        free_b = ctypes.c_size_t(0)
-        total_b = ctypes.c_size_t(0)
-        rc = int(cuda_mem_get_info(ctypes.byref(free_b), ctypes.byref(total_b)))
-        if rc != 0:
-            print(f"[error] runtime_factory: cudaMemGetInfo failed, rc={rc}")
-            return 0
-        return int(free_b.value)
+        prev_dev = ctypes.c_int(-1)
+        prev_rc = int(cuda_get_device(ctypes.byref(prev_dev)))
+        try:
+            rc = int(cuda_set_device(0))
+            if rc != 0:
+                print(f"[error] runtime_factory: cudaSetDevice(0) failed, rc={rc}")
+                return 0
+            free_b = ctypes.c_size_t(0)
+            total_b = ctypes.c_size_t(0)
+            rc = int(cuda_mem_get_info(ctypes.byref(free_b), ctypes.byref(total_b)))
+            if rc != 0:
+                print(f"[error] runtime_factory: cudaMemGetInfo failed, rc={rc}")
+                return 0
+            return int(free_b.value)
+        finally:
+            if prev_rc == 0 and int(prev_dev.value) >= 0 and int(prev_dev.value) != 0:
+                try:
+                    cuda_set_device(int(prev_dev.value))
+                except Exception:
+                    pass
     return 0
 
 
@@ -145,6 +157,17 @@ def _cuda_visible_device_count(cudart: ctypes.CDLL) -> int:
     return int(n.value)
 
 
+def _cuda_get_device(cudart: ctypes.CDLL) -> int:
+    fn = cudart.cudaGetDevice
+    fn.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    fn.restype = ctypes.c_int
+    dev = ctypes.c_int(0)
+    rc = int(fn(ctypes.byref(dev)))
+    if rc != 0:
+        return -1
+    return int(dev.value)
+
+
 def _cuda_set_device(cudart: ctypes.CDLL, device_id: int) -> None:
     fn = cudart.cudaSetDevice
     fn.argtypes = [ctypes.c_int]
@@ -155,16 +178,24 @@ def _cuda_set_device(cudart: ctypes.CDLL, device_id: int) -> None:
 
 
 def _cuda_mem_free_bytes(cudart: ctypes.CDLL, device_id: int) -> int:
-    _cuda_set_device(cudart, int(device_id))
-    fn = cudart.cudaMemGetInfo
-    fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
-    fn.restype = ctypes.c_int
-    free_b = ctypes.c_size_t(0)
-    total_b = ctypes.c_size_t(0)
-    rc = int(fn(ctypes.byref(free_b), ctypes.byref(total_b)))
-    if rc != 0:
-        raise RuntimeError(f"cudaMemGetInfo(device={device_id}) failed, rc={rc}")
-    return int(free_b.value)
+    prev_device = _cuda_get_device(cudart)
+    try:
+        _cuda_set_device(cudart, int(device_id))
+        fn = cudart.cudaMemGetInfo
+        fn.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+        fn.restype = ctypes.c_int
+        free_b = ctypes.c_size_t(0)
+        total_b = ctypes.c_size_t(0)
+        rc = int(fn(ctypes.byref(free_b), ctypes.byref(total_b)))
+        if rc != 0:
+            raise RuntimeError(f"cudaMemGetInfo(device={device_id}) failed, rc={rc}")
+        return int(free_b.value)
+    finally:
+        if prev_device >= 0 and prev_device != int(device_id):
+            try:
+                _cuda_set_device(cudart, int(prev_device))
+            except Exception:
+                pass
 
 
 def _cuda_p2p_access(cudart: ctypes.CDLL, dev_a: int, dev_b: int) -> bool:

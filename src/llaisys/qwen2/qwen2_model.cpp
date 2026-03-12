@@ -154,6 +154,7 @@ int Qwen2Model::bind_parallel_context(int32_t tp_size,
         device_id_ = tp_device_ids_[static_cast<size_t>(tp_rank_)];
     }
     tp_nh_local_ = (tp_size_ > 1) ? (meta_.nh / static_cast<size_t>(tp_size_)) : meta_.nh;
+    tp_nkvh_local_ = (tp_size_ > 1) ? (meta_.nkvh / static_cast<size_t>(tp_size_)) : meta_.nkvh;
     tp_di_local_ = (tp_size_ > 1) ? (meta_.di / static_cast<size_t>(tp_size_)) : meta_.di;
     parallel_bound_ = true;
 
@@ -176,12 +177,13 @@ int Qwen2Model::bind_parallel_context(int32_t tp_size,
 #endif
 
     std::fprintf(stderr,
-                 "[qwen2.parallel] bound tp_size=%d tp_rank=%d local_rank=%d ndevice=%d nh_local=%zu di_local=%zu\n",
+                 "[qwen2.parallel] bound tp_size=%d tp_rank=%d local_rank=%d ndevice=%d nh_local=%zu nkvh_local=%zu di_local=%zu\n",
                  tp_size_,
                  tp_rank_,
                  local_rank_,
                  static_cast<int>(tp_device_ids_.size()),
                  tp_nh_local_,
+                 tp_nkvh_local_,
                  tp_di_local_);
     return 0;
 }
@@ -253,7 +255,8 @@ void Qwen2Model::init_runtime_state_() {
     } else {
         runtime_.kv_cache = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
     }
-    runtime_.kv_cache->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
+    const size_t nkvh_local = tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh;
+    runtime_.kv_cache->init_storage(meta_.nlayer, nkvh_local, meta_.dh, meta_.dtype, device_type_, device_id_);
     runtime_.kv_peak_used_tokens = 0;
 }
 
@@ -437,7 +440,10 @@ void Qwen2Model::check_meta_invariants_() const {
     CHECK_ARGUMENT(tp_size_ >= 1, "Qwen2: tp_size must be >= 1");
     if (tp_size_ > 1) {
         CHECK_ARGUMENT((meta_.nh % static_cast<size_t>(tp_size_)) == 0, "Qwen2: nh must be divisible by tp_size");
+        CHECK_ARGUMENT((meta_.nkvh % static_cast<size_t>(tp_size_)) == 0, "Qwen2: nkvh must be divisible by tp_size");
         CHECK_ARGUMENT((meta_.di % static_cast<size_t>(tp_size_)) == 0, "Qwen2: di must be divisible by tp_size");
+        CHECK_ARGUMENT(tp_nkvh_local_ > 0, "Qwen2: nkvh_local must be > 0");
+        CHECK_ARGUMENT((tp_nh_local_ % tp_nkvh_local_) == 0, "Qwen2: nh_local must be divisible by nkvh_local");
     }
 
     CHECK_ARGUMENT(meta_.dtype == LLAISYS_DTYPE_F32 ||
@@ -492,7 +498,7 @@ void Qwen2Model::validate_or_die_() {
 
     const size_t hs = meta_.hs;
     const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
-    const size_t nkvh = meta_.nkvh;
+    const size_t nkvh = tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh;
     const size_t dh = meta_.dh;
     const size_t di = tp_di_local_ > 0 ? tp_di_local_ : meta_.di;
     const size_t voc = meta_.voc;
@@ -553,7 +559,7 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
         workspace_ = std::make_unique<runtime::workspace::Qwen2Workspace>(
             meta_.hs,
             nh_local,
-            meta_.nkvh,
+            tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh,
             meta_.dh,
             di_local,
             meta_.voc,
@@ -621,7 +627,7 @@ tensor_t Qwen2Model::run_slot_attention_layer_(size_t layer,
     LLAISYS_NVTX_SCOPE("forward/attention_layer_slot");
     const auto &ws = workspace_->view();
     const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
-    const size_t nkvh = meta_.nkvh;
+    const size_t nkvh = tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh;
     const size_t dh = meta_.dh;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
 
@@ -678,7 +684,7 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
     LLAISYS_NVTX_SCOPE("forward/attention_layer_block");
     const auto &ws = workspace_->view();
     const size_t nh = tp_nh_local_ > 0 ? tp_nh_local_ : meta_.nh;
-    const size_t nkvh = meta_.nkvh;
+    const size_t nkvh = tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh;
     const size_t dh = meta_.dh;
     const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
 

@@ -59,6 +59,11 @@ def _worker(
         return 1
 
 
+def _worker_entry(*args) -> None:
+    rc = int(_worker(*args))
+    raise SystemExit(rc)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run TP=2 two-process smoke for NovaInfer.")
     parser.add_argument("--model-path", required=True, type=Path)
@@ -85,7 +90,7 @@ def main() -> int:
     device_ids = _parse_device_ids(args.tensor_parallel_device_ids)
     ctx = get_context("spawn")
     p0 = ctx.Process(
-        target=_worker,
+        target=_worker_entry,
         args=(
             0,
             str(args.model_path),
@@ -96,7 +101,7 @@ def main() -> int:
         ),
     )
     p1 = ctx.Process(
-        target=_worker,
+        target=_worker_entry,
         args=(
             1,
             str(args.model_path),

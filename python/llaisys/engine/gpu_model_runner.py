@@ -85,6 +85,7 @@ class GPUModelRunner:
         self._paged_attn_backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
         self._tp_size = int(getattr(self._config, "tensor_parallel_size", 1))
         self._tp_rank = int(getattr(self._config, "tp_rank", 0))
+        self._num_heads_local = int(self._num_heads)
         self._local_device_id = 0
         if self._tp_size > 1:
             if self._device != DeviceType.NVIDIA:
@@ -103,6 +104,11 @@ class GPUModelRunner:
                     f"tp_rank out of range: rank={self._tp_rank} ndevice={len(tp_dev_ids)}"
                 )
             self._local_device_id = int(tp_dev_ids[self._tp_rank])
+            if self._num_heads <= 0 or (self._num_heads % self._tp_size) != 0:
+                raise RuntimeError(
+                    f"invalid TP head partition: nh={self._num_heads} tp_size={self._tp_size}"
+                )
+            self._num_heads_local = int(self._num_heads // self._tp_size)
 
         self._compute_streams: dict[int, object] = {}
         # Decode+CUDNN block-table cache for incremental row updates.
@@ -538,7 +544,7 @@ class GPUModelRunner:
         if np.any(page_rows_np < 0):
             raise RuntimeError("cudnn prefill page_table contains invalid negative block id")
 
-        hd = int(self._num_heads) * int(self._head_dim)
+        hd = int(self._num_heads_local) * int(self._head_dim)
         if hd <= 0:
             raise RuntimeError("invalid model heads/head_dim for cudnn ragged prefill")
         token_prefix = np.concatenate(

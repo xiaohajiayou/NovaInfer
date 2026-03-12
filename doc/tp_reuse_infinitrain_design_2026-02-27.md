@@ -2062,3 +2062,65 @@ Smoke-2（中负载）：
 3. 后续优先级应调整为：
 - 先修复输出正确性（至少 TP2/TP4 对 HF 通过）
 - 再推进 allreduce overlap / fused QKV 性能优化
+
+### 13.16.11 增量状态（2026-03-13，TP>1 HF parity + 吞吐验收矩阵）
+
+本节更新最新实测结论（已覆盖 2/4 卡正确性与吞吐）。
+
+#### 13.16.11.1 本轮关键修复
+
+1. 修复 TP + CUDNN prefill 的 ragged offset 计算错误：
+- 文件：`python/llaisys/engine/gpu_model_runner.py`
+- 问题：`_build_cudnn_prefill_rows` 使用全局 `nh*dh` 计算 `qo_ragged_offset`，TP 场景应使用本 rank 本地 `nh_local*dh`。
+- 现象：`tp_size=2`、batch>1 时“第 1 条正常，第 2 条错误”。
+- 修复后：`tp_size=2` batch=2 与 HF 对齐通过。
+
+2. 保持 TP KV-head 本地分片一致性（Python 权重切分 + C++ runtime/local shape 一致）：
+- 文件：`python/llaisys/models/qwen2.py`
+- 文件：`src/llaisys/qwen2/qwen2_model.cpp/.hpp`
+
+3. TP 多进程设备探测修复（避免 rank 设备被探测逻辑污染）：
+- 文件：`python/llaisys/engine/runtime_factory.py`
+
+4. 新增验收脚本：
+- `scripts/tp_hf_parity.py`
+- `scripts/bench_tp_novainfer.py`
+
+#### 13.16.11.2 HF parity 结果
+
+环境：
+
+1. `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
+2. cuDNN：`9.18.1`（`/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive`）
+3. 口径：多 rank 一致性 + rank0 与 HF 逐 token 完全一致
+
+结果：
+
+1. `1.5B, TP=2, GPUs=5,6`：`PASS`
+2. `7B, TP=2, GPUs=5,6`：`PASS`
+3. `7B, TP=4, GPUs=3,5,6,7`：`PASS`
+4. `1.5B, TP=4`：`FAIL-FAST(预期)`，原因 `num_key_value_heads=2` 不能整除 `tp_size=4`
+
+#### 13.16.11.3 吞吐验收矩阵（NovaInfer）
+
+`1.5B`，参数：`num_seqs=256, in=[100,1024], out=[100,1024], max_num_batched_tokens=16384`
+
+1. `TP=1`（GPU6）：`2037.82 tok/s`
+2. `TP=2`（GPU5,6）：`1961.17 tok/s`（rank 平均）
+
+`7B`，参数：`num_seqs=128, in=[100,1024], out=[100,1024], max_num_batched_tokens=8192`
+
+1. `TP=1`（GPU6）：`1319.87 tok/s`
+2. `TP=2`（GPU5,6）：`1407.14 tok/s`（rank 平均）
+3. `TP=4`（GPU3,5,6,7）：`1490.57 tok/s`（rank 平均）
+
+#### 13.16.11.4 回归测试结果
+
+命令：
+
+`pytest --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --device nvidia --backend cudnn`
+
+结果：
+
+1. `102 passed, 9 skipped`
+2. 注意：测试环境需把 PyTorch NCCL 放在 `LD_LIBRARY_PATH` 最前，避免 `ncclCommWindowRegister` 符号冲突。

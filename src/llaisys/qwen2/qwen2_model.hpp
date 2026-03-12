@@ -75,7 +75,7 @@ public:
     size_t kv_cache_capacity_tokens() const noexcept { return runtime_.kv_cache_capacity_tokens; }
     int64_t kv_peak_used_tokens() const noexcept { return runtime_.kv_peak_used_tokens; }
     void set_kv_peak_used_tokens(int64_t value) noexcept { runtime_.kv_peak_used_tokens = value; }
-    size_t nkvh() const noexcept { return meta_.nkvh; }
+    size_t nkvh() const noexcept { return tp_nkvh_local_ > 0 ? tp_nkvh_local_ : meta_.nkvh; }
     size_t dh() const noexcept { return meta_.dh; }
     llaisysDataType_t dtype() const noexcept { return meta_.dtype; }
     tensor_t kv_layer_k(size_t layer) const;
@@ -103,6 +103,7 @@ private:
     std::string distributed_backend_{};
     std::string tp_init_method_{};
     size_t tp_nh_local_{0};
+    size_t tp_nkvh_local_{0};
     size_t tp_di_local_{0};
 
     LlaisysQwen2Weights weights_{};
