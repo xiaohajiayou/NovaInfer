@@ -1954,3 +1954,78 @@ python scripts/bench_compare_vllm.py \
 
 5. 备注
 - 7B TP 吞吐在不同时间窗存在波动（GPU 共享环境干扰），后续会用固定空闲卡 + 重复 3 次取中位数作为最终验收口径。
+
+### 13.16.9 增量状态（2026-03-12，TP=4 稳定性/性能验收）
+
+本节补充“更高 TP 数（TP=4）”的实际验收结果。
+
+验收环境与约束：
+
+1. 模型：`DeepSeek-R1-Distill-Qwen-7B`
+2. 可见卡：`CUDA_VISIBLE_DEVICES=3,5,6,7`（逻辑 `0,1,2,3`）
+3. TP 配置：
+- `tensor_parallel_size=4`
+- `tensor_parallel_device_ids=0,1,2,3`
+- `LLAISYS_TP_SINGLE_PROCESS=0`
+- `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
+
+#### 13.16.9.1 稳定性（smoke）结果
+
+Smoke-1（轻负载）：
+
+1. 参数：`num_seqs=8, in=[64,128], out=[16,64], max_num_batched_tokens=1024`
+2. 日志目录：`/tmp/tp4_smoke1_20260312_212619`
+3. 结果：4 rank 全部 `RC=0`
+- rank0 `75.6770 tok/s`
+- rank1 `75.2311 tok/s`
+- rank2 `76.1792 tok/s`
+- rank3 `75.6680 tok/s`
+
+Smoke-2（中负载）：
+
+1. 参数：`num_seqs=32, in=[100,256], out=[64,128], max_num_batched_tokens=2048`
+2. 日志目录：`/tmp/tp4_smoke2_20260312_212814`
+3. 结果：4 rank 全部 `RC=0`
+- rank0 `304.9215 tok/s`
+- rank1 `307.1715 tok/s`
+- rank2 `307.9551 tok/s`
+- rank3 `307.9459 tok/s`
+
+结论：TP=4 在当前实现下可稳定初始化并完成端到端推理（双轮 smoke 均通过）。
+
+#### 13.16.9.2 性能（7B，大参数）结果
+
+性能 Round-1：
+
+1. 参数：`num_seqs=128, in=[100,1024], out=[100,1024], max_num_batched_tokens=8192`
+2. 日志目录：`/tmp/tp4_bench1_20260312_212918`
+3. 结果：4 rank 全部 `RC=0`
+- rank0 `1595.6305 tok/s`（run `43.2907s`）
+- rank1 `1595.7037 tok/s`（run `43.2887s`）
+- rank2 `1594.8916 tok/s`（run `43.3108s`）
+- rank3 `1594.9367 tok/s`（run `43.3096s`）
+
+性能 Round-2：
+
+1. 参数同上
+2. 日志目录：`/tmp/tp4_bench2_20260312_213055`
+3. 结果：4 rank 全部 `RC=0`
+- rank0 `1558.4042 tok/s`（run `44.3248s`）
+- rank1 `1560.3952 tok/s`（run `44.2683s`）
+- rank2 `1558.3051 tok/s`（run `44.3276s`）
+- rank3 `1560.0384 tok/s`（run `44.2784s`）
+
+统计（按 rank0）：
+
+1. TP=4 轮次吞吐：`1595.63 / 1558.40 tok/s`
+2. 均值：`1577.02 tok/s`
+3. 波动（max-min）：约 `2.36%`
+
+#### 13.16.9.3 阶段性结论
+
+1. 更高 TP 数（TP=4）主链路已“功能稳定可运行”。
+2. TP=4 当前吞吐没有显著超过 TP=2（在共享 GPU 环境下约持平到小幅波动），说明通信重叠和算子融合仍是主要瓶颈。
+3. 下一步性能优先项不变：
+- `allreduce overlap`
+- `fused QKV`
+- 更严格隔离环境下复测 TP2/TP4（固定空闲卡、3 次中位数）
