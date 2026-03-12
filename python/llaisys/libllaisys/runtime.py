@@ -56,6 +56,8 @@ def load_runtime(lib):
 
     lib.llaisysSetContextRuntime.argtypes = [llaisysDeviceType_t, c_int]
     lib.llaisysSetContextRuntime.restype = None
+    lib.llaisysGetContextComputeStream.argtypes = [llaisysDeviceType_t, c_int]
+    lib.llaisysGetContextComputeStream.restype = llaisysStream_t
 
     lib.llaisysNvtxRangePush.argtypes = [ctypes.c_char_p]
     lib.llaisysNvtxRangePush.restype = None

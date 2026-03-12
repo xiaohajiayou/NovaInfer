@@ -100,6 +100,10 @@ Qwen2Model::Qwen2Model(const LlaisysQwen2Meta &meta,
 #ifdef ENABLE_NVIDIA_API
     if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
         paged_attn_backend_ = parse_paged_attn_backend_env();
+        if (paged_attn_backend_ == ops::cuda::PagedAttentionBackend::CUDNN) {
+            cudnn_runtime_state_ = ops::cuda::create_cudnn_runtime_state();
+            CHECK_ARGUMENT(cudnn_runtime_state_ != nullptr, "Qwen2: failed to create CUDNN runtime state");
+        }
     }
 #endif
 
@@ -189,6 +193,10 @@ Qwen2Model::~Qwen2Model() {
         tp_nccl_comm_ = nullptr;
     }
 #endif
+#ifdef ENABLE_NVIDIA_API
+    ops::cuda::destroy_cudnn_runtime_state(cudnn_runtime_state_);
+    cudnn_runtime_state_ = nullptr;
+#endif
     destroy_weights_();
 
     delete[] weights_.attn_norm_w;
@@ -203,6 +211,17 @@ Qwen2Model::~Qwen2Model() {
     delete[] weights_.mlp_gate_w;
     delete[] weights_.mlp_up_w;
     delete[] weights_.mlp_down_w;
+}
+
+bool Qwen2Model::bind_kv_state_handle(const void *kv_state_handle) noexcept {
+    if (kv_state_handle == nullptr) {
+        return false;
+    }
+    if (bound_kv_state_handle_ == nullptr) {
+        bound_kv_state_handle_ = kv_state_handle;
+        return true;
+    }
+    return bound_kv_state_handle_ == kv_state_handle;
 }
 
 void Qwen2Model::init_weight_slots_() {
@@ -235,7 +254,6 @@ void Qwen2Model::init_runtime_state_() {
         runtime_.kv_cache = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
     }
     runtime_.kv_cache->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
-    runtime_.output = std::make_unique<runtime::output::OutputBuffer>(meta_.voc);
     runtime_.kv_peak_used_tokens = 0;
 }
 
@@ -260,7 +278,6 @@ int Qwen2Model::configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
     runtime_.max_model_len = max_len;
     runtime_.kv_cache_capacity_tokens = kv_capacity;
     runtime_.kv_cache.reset();
-    runtime_.output.reset();
     workspace_.reset();
     init_runtime_state_();
     return 0;
@@ -714,11 +731,17 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
         LLAISYS_NVTX_SCOPE("forward/attn/core");
 #ifdef ENABLE_NVIDIA_API
         if (device_type_ == LLAISYS_DEVICE_NVIDIA) {
+            ops::cuda::CudnnRuntimeState *cudnn_state = nullptr;
+            if (attn_state.use_cudnn_backend) {
+                cudnn_state = cudnn_runtime_state_;
+                CHECK_ARGUMENT(cudnn_state != nullptr, "Qwen2: missing CUDNN runtime state");
+            }
             const ops::cuda::CommonAttentionMetadata prepared{
                 reinterpret_cast<const int32_t *>(attn_state.cu_seqlens_q != nullptr ? attn_state.cu_seqlens_q->data() : nullptr),
                 reinterpret_cast<const int32_t *>(attn_state.cu_seqlens_k != nullptr ? attn_state.cu_seqlens_k->data() : nullptr),
                 reinterpret_cast<const int32_t *>(attn_state.block_tables != nullptr ? attn_state.block_tables->data() : nullptr),
                 reinterpret_cast<const int32_t *>(attn_state.slot_mapping != nullptr ? attn_state.slot_mapping->data() : nullptr),
+                cudnn_state,
                 reinterpret_cast<const int32_t *>(attn_state.cudnn_seq_lens_q != nullptr ? attn_state.cudnn_seq_lens_q->data() : nullptr),
                 reinterpret_cast<const int32_t *>(attn_state.cudnn_seq_lens_kv != nullptr ? attn_state.cudnn_seq_lens_kv->data() : nullptr),
                 reinterpret_cast<const int32_t *>(attn_state.cudnn_page_table != nullptr ? attn_state.cudnn_page_table->data() : nullptr),
@@ -878,6 +901,9 @@ int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMe
         (attn.phase != ATTENTION_PHASE_PREFILL || has_tensor(attn.cudnn_qo_ragged_offset));
     if (want_cudnn_backend) {
         CHECK_ARGUMENT(has_cudnn_meta, "Qwen2: CUDNN backend requested but missing CUDNN BLOCK metadata");
+#ifdef ENABLE_NVIDIA_API
+        CHECK_ARGUMENT(cudnn_runtime_state_ != nullptr, "Qwen2: CUDNN runtime state is not initialized");
+#endif
     }
     const bool use_cudnn_backend = want_cudnn_backend;
     state->use_cudnn_backend = use_cudnn_backend;

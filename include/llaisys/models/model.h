@@ -24,7 +24,7 @@ __C {
         int ndevice;
     };
 
-    struct LlaisysRuntimeCreateParams {
+    struct LlaisysKvStateCreateParams {
         int32_t kv_cache_layout;          // LlaisysKvCacheLayout, <0 means default(BLOCK)
         int32_t kv_cache_block_size;      // <=0 means default(16)
         int32_t max_model_len;            // <=0 means use model meta.maxseq
@@ -32,11 +32,11 @@ __C {
     };
 
     struct LlaisysParallelInitParams {
-        int32_t tensor_parallel_size;     // >=1
-        int32_t pipeline_parallel_size;   // >=1
-        int32_t world_size;               // >=1
-        int32_t rank;                     // [0, world_size)
-        int32_t local_rank;               // >=0
+        int32_t tensor_parallel_size;           // >=1
+        int32_t pipeline_parallel_size;         // >=1
+        int32_t world_size;                     // >=1
+        int32_t rank;                           // [0, world_size)
+        int32_t local_rank;                     // >=0
         const char *distributed_executor_backend; // optional, e.g. "uni"
         const char *distributed_backend;          // optional, e.g. "nccl"
         const char *master_addr;                  // optional
@@ -70,7 +70,7 @@ __C {
     struct AttentionMetadata {
         int32_t mode; // AttentionMode
         int32_t phase; // AttentionPhase
-        llaisysTensor_t seq_ids; // [n_tokens], i64, SLOT metadata
+        llaisysTensor_t seq_ids;         // [n_tokens], i64, SLOT metadata
         llaisysTensor_t pos_ids_host;    // [n_tokens], i64, SLOT metadata
         llaisysTensor_t cu_seqlens_q;    // [n_batch_seq + 1], i32, BLOCK required
         llaisysTensor_t cu_seqlens_k;    // [n_batch_seq + 1], i32, BLOCK required
@@ -80,11 +80,11 @@ __C {
         llaisysTensor_t block_tables;    // [n_batch_seq * block_table_width], i32, BLOCK metadata
         int32_t block_table_width;
         // CUDNN-only BLOCK metadata. These fields are ignored by native BLOCK/SLOT paths.
-        llaisysTensor_t cudnn_seq_lens_q;   // [cudnn_b_exec], i32
-        llaisysTensor_t cudnn_seq_lens_kv;  // [cudnn_b_exec], i32
-        llaisysTensor_t cudnn_page_table;   // [cudnn_b_exec * block_table_width], i32
+        llaisysTensor_t cudnn_seq_lens_q;      // [cudnn_b_exec], i32
+        llaisysTensor_t cudnn_seq_lens_kv;     // [cudnn_b_exec], i32
+        llaisysTensor_t cudnn_page_table;      // [cudnn_b_exec * block_table_width], i32
         llaisysTensor_t cudnn_qo_ragged_offset; // [cudnn_b_exec + 1], i32, prefill-only
-        int32_t cudnn_b_exec;               // rows in cudnn_* metadata
+        int32_t cudnn_b_exec;                  // rows in cudnn_* metadata
     };
 
     struct ModelForwardInput {
@@ -112,21 +112,15 @@ __C {
     };
 
     struct LlaisysModel;
-    struct LlaisysRuntime;
+    struct LlaisysKvState;
 
     __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params);
     __export void llaisysModelDestroy(struct LlaisysModel *model);
     __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model);
-    __export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntimeCreateParams *params);
-    __export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime);
-    // Return: 0 success, -1 invalid input, -2 unsupported config.
-    __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
+    __export struct LlaisysKvState *llaisysKvStateCreate(const struct LlaisysKvStateCreateParams *params);
+    __export void llaisysKvStateDestroy(struct LlaisysKvState *kv_state);
+    __export int32_t llaisysKvStateParallelInit(struct LlaisysKvState *kv_state,
                                                 const struct LlaisysParallelInitParams *params);
-    // Return the runtime compute stream bound to (device_type, device_id) in current thread.
-    // nullptr on invalid input or failure.
-    __export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,
-                                                            llaisysDeviceType_t device_type,
-                                                            int device_id);
 
     __export void *llaisysModelWeights(struct LlaisysModel *model);
     // Safely replace one weight slot:
@@ -147,23 +141,10 @@ __C {
     // -1  invalid input
     // < -1 internal error
     __export int32_t llaisysModelForward(struct LlaisysModel *model,
-                                         struct LlaisysRuntime *runtime,
+                                         struct LlaisysKvState *kv_state,
                                          const struct ModelForwardInput *input,
                                          struct ModelForwardOutput *output);
-    // Build BLOCK attention runtime metadata on target device.
-    // Return: 0 success, -1 invalid input, -2 internal error.
-    __export int32_t llaisysRuntimeBuildBlockAttentionMetadata(
-        struct LlaisysRuntime *runtime,
-        llaisysTensor_t req_num_scheduled_tokens, // [n_batch_seq], i32
-        llaisysTensor_t req_num_computed_tokens,  // [n_batch_seq], i32
-        llaisysTensor_t block_tables,             // [n_batch_seq * block_table_width], i32
-        int32_t block_table_width,
-        int32_t ntoken,
-        llaisysTensor_t query_start_loc, // [n_batch_seq + 1], i32 (out)
-        llaisysTensor_t seq_lens,        // [n_batch_seq], i32 (out)
-        llaisysTensor_t slot_mapping);   // [ntoken], i32 (out)
-    __export int32_t llaisysSamplerSample(struct LlaisysRuntime *runtime,
-                                          const struct SamplerInput *input,
+    __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
                                           struct SamplerOutput *output);
 
     // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):
@@ -173,19 +154,19 @@ __C {
     // 3: INVALID_POS
     // 4: EMPTY_RANGE
     // 5: INTERNAL_ERROR
-    __export int llaisysRuntimeKvSeqCp(struct LlaisysRuntime *runtime, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
-    __export int llaisysRuntimeKvSeqRm(struct LlaisysRuntime *runtime, int64_t seq_id, int64_t p0, int64_t p1);
-    __export int llaisysRuntimeKvSeqAdd(struct LlaisysRuntime *runtime, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
-    __export int llaisysRuntimeKvSeqKeep(struct LlaisysRuntime *runtime, int64_t seq_id);
-    __export int64_t llaisysRuntimeKvSeqPosMax(struct LlaisysRuntime *runtime, int64_t seq_id);
+    __export int llaisysKvStateSeqCp(struct LlaisysKvState *kv_state, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
+    __export int llaisysKvStateSeqRm(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1);
+    __export int llaisysKvStateSeqAdd(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
+    __export int llaisysKvStateSeqKeep(struct LlaisysKvState *kv_state, int64_t seq_id);
+    __export int64_t llaisysKvStateSeqPosMax(struct LlaisysKvState *kv_state, int64_t seq_id);
     // Free all KV entries that belong to one request/sequence id.
     // Return code follows KV status mapping above.
-    __export int llaisysRuntimeRequestFree(struct LlaisysRuntime *runtime, int64_t seq_id);
+    __export int llaisysKvStateRequestFree(struct LlaisysKvState *kv_state, int64_t seq_id);
     // 0 success, <0 invalid input/internal error.
-    __export int llaisysRuntimeKvStats(struct LlaisysRuntime *runtime, struct LlaisysKvStats *out_stats);
+    __export int llaisysKvStateStats(struct LlaisysKvState *kv_state, struct LlaisysKvStats *out_stats);
     // Reset prefix-cache related metadata (no-op when prefix cache disabled/not implemented).
     // Return code follows KV status mapping above.
-    __export int llaisysRuntimeKvResetPrefixCache(struct LlaisysRuntime *runtime);
+    __export int llaisysKvStateResetPrefixCache(struct LlaisysKvState *kv_state);
 }
 
 #endif // LLAISYS_MODELS_MODEL_H

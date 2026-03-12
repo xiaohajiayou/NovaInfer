@@ -15,7 +15,6 @@ class Sampler:
     def __init__(
         self,
         device: DeviceType,
-        runtime_handle,
         max_num_seqs: int | None = None,
         config: EngineConfig | None = None,
     ):
@@ -24,9 +23,6 @@ class Sampler:
             max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
         )
         self._device = cfg.device
-        self._runtime = runtime_handle
-        if self._runtime is None:
-            raise ValueError("runtime_handle is required by Sampler")
         self._max_num_seqs = max(1, int(cfg.max_num_seqs))
 
     def sample_tokens(
@@ -71,7 +67,7 @@ class Sampler:
         sout = SamplerOutput()
         sout.sampled_ids = out_ids_dev.lib_tensor()
 
-        status = int(LIB_LLAISYS.llaisysSamplerSample(self._runtime, byref(sin), byref(sout)))
+        status = int(LIB_LLAISYS.llaisysSamplerSample(byref(sin), byref(sout)))
         if status != 0:
             raise RuntimeError(f"samplerSample failed with status={status}")
         return out_ids_dev

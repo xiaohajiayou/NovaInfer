@@ -5,17 +5,17 @@ import os
 from ctypes import byref, c_char_p, c_int
 from ctypes.util import find_library
 from dataclasses import dataclass
-from pathlib import Path
 from itertools import combinations
+from pathlib import Path
 from typing import Optional
 
 from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.model import KvCacheLayout, LlaisysParallelInitParams, LlaisysRuntimeCreateParams
+from ..libllaisys.model import KvCacheLayout, LlaisysKvStateCreateParams, LlaisysParallelInitParams
 from ..models import qwen2 as qwen2_impl
 
 
 @dataclass(frozen=True)
-class RuntimePlan:
+class KvCachePlan:
     max_model_len: int
     kv_cache_capacity_tokens: int
 
@@ -229,7 +229,8 @@ def select_tp_device_ids(tp_size: int, explicit_ids: tuple[int, ...] | None) -> 
     print(
         "[tp] auto_select "
         f"tp_size={tp} candidates={list(candidates)} selected={list(best)} "
-        f"free_bytes={ {k: int(v) for k, v in free_bytes.items()} } p2p_matrix={p2p_matrix}"
+        f"free_bytes={{ {', '.join(f'{k}: {int(v)}' for k, v in free_bytes.items())} }} "
+        f"p2p_matrix={p2p_matrix}"
     )
     return tuple(int(v) for v in best)
 
@@ -271,12 +272,12 @@ def _estimate_cuda_kv_capacity_tokens(
     return capacity_tokens, probe
 
 
-def create_runtime(
+def create_kv_state(
     *,
     device: DeviceType,
     kv_cache_layout: KvCacheLayout,
     kv_cache_block_size: int,
-    plan: RuntimePlan,
+    plan: KvCachePlan,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     distributed_executor_backend: str = "uni",
@@ -285,44 +286,41 @@ def create_runtime(
     tp_rank: int = 0,
     tp_local_rank: int = 0,
 ):
-    params = LlaisysRuntimeCreateParams(
+    params = LlaisysKvStateCreateParams(
         int(kv_cache_layout),
         int(kv_cache_block_size),
         int(plan.max_model_len),
         int(plan.kv_cache_capacity_tokens),
     )
-    runtime = LIB_LLAISYS.llaisysRuntimeCreate(byref(params))
-    if not runtime:
-        raise RuntimeError("Failed to create runtime state")
+    kv_state = LIB_LLAISYS.llaisysKvStateCreate(byref(params))
+    if not kv_state:
+        raise RuntimeError("Failed to create kv state")
 
     tp_size = max(1, int(tensor_parallel_size))
     pp_size = max(1, int(pipeline_parallel_size))
     rank = max(0, int(tp_rank))
     local_rank = max(0, int(tp_local_rank))
     if rank >= tp_size:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError(f"tp_rank out of range: rank={rank} tp_size={tp_size}")
     exec_backend = str(distributed_executor_backend or "uni").strip().lower()
     dist_backend = str(distributed_backend or "nccl").strip().lower()
 
     if tp_size > 1 and device != DeviceType.NVIDIA:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError("tensor parallel currently supports NVIDIA device only")
     if tp_size > 1:
         backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
         if backend == "cudnn":
-            # TP+cuDNN path depends on recent cuDNN kernels for local_nkvh=1 shape family.
-            # Older 9.x builds can fail at first prefill graph build with opaque "no valid engine" errors.
             cudnn_ver = _cudnn_version()
             if cudnn_ver < 91800:
-                LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+                LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
                 raise RuntimeError(
                     "TP with cudnn backend requires cuDNN >= 9.18 "
-                    f"(detected: {cudnn_ver}). "
-                    "Please update libcudnn in LD_LIBRARY_PATH."
+                    f"(detected: {cudnn_ver}). Please update libcudnn in LD_LIBRARY_PATH."
                 )
     if exec_backend != "uni":
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise NotImplementedError(f"distributed_executor_backend={exec_backend} is not supported yet")
 
     try:
@@ -333,11 +331,11 @@ def create_runtime(
                 raise RuntimeError("tensor_parallel_device_ids is only valid on NVIDIA device")
             selected_ids = tuple()
     except Exception:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise
 
     if device == DeviceType.NVIDIA and len(selected_ids) != tp_size:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError(f"parallel device ids mismatch: tp_size={tp_size} selected={len(selected_ids)}")
 
     ids_arr = (c_int * len(selected_ids))(*[int(v) for v in selected_ids])
@@ -351,6 +349,7 @@ def create_runtime(
     init_method_b = init_method.encode("utf-8")
     tp_group_name_b = b"tp"
     single_process_tp = int(os.getenv("LLAISYS_TP_SINGLE_PROCESS", "1"))
+
     par = LlaisysParallelInitParams(
         int(tp_size),
         int(pp_size),
@@ -369,17 +368,17 @@ def create_runtime(
         ids_arr,
         int(len(selected_ids)),
     )
-    rc = int(LIB_LLAISYS.llaisysRuntimeParallelInit(runtime, byref(par)))
+    rc = int(LIB_LLAISYS.llaisysKvStateParallelInit(kv_state, byref(par)))
     if rc != 0:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError(
-            "llaisysRuntimeParallelInit failed "
+            "llaisysKvStateParallelInit failed "
             f"(rc={rc}, tp_size={tp_size}, rank={rank}, local_rank={local_rank}, device_ids={list(selected_ids)})"
         )
-    return runtime
+    return kv_state
 
 
-def plan_qwen2_runtime(
+def plan_qwen2_kv_cache(
     *,
     model_path: Path | str,
     device: DeviceType,
@@ -387,16 +386,13 @@ def plan_qwen2_runtime(
     max_model_len: Optional[int],
     kv_cache_memory_utilization: float,
     max_num_seqs: Optional[int],
-) -> RuntimePlan:
+) -> KvCachePlan:
     model_path = Path(model_path)
     meta = qwen2_impl._parse_meta(model_path, max_model_len=max_model_len)
     resolved_max_model_len = int(meta.maxseq)
     available_memory_bytes = int(_available_memory_bytes(device))
     if available_memory_bytes <= 0:
-        raise RuntimeError(
-            "invalid available memory bytes (<= 0): "
-            "cannot initialize model with current device memory probe"
-        )
+        raise RuntimeError("invalid available memory bytes (<= 0): cannot initialize model with current device memory probe")
 
     token_bytes = _kv_token_bytes(meta)
     util = min(0.98, max(0.01, float(kv_cache_memory_utilization)))
@@ -449,7 +445,7 @@ def plan_qwen2_runtime(
             f"capacity_tokens={resolved_kv_capacity_tokens}"
         )
 
-    return RuntimePlan(
+    return KvCachePlan(
         max_model_len=int(resolved_max_model_len),
         kv_cache_capacity_tokens=int(resolved_kv_capacity_tokens),
     )

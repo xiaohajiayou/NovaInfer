@@ -8,9 +8,6 @@
 #include "runtime/kv_cache/unified_kv.hpp"
 #include "runtime/weights/weights.hpp"
 #include "../core/context/context.hpp"
-#ifdef ENABLE_NVIDIA_API
-#include "../ops/self_attention/cuda/self_attention_cuda.hpp"
-#endif
 #include "../utils.hpp"
 
 #include <algorithm>
@@ -57,21 +54,6 @@ llaisys::tensor_t kv_layer_v_from_cache(KvCacheBase *cache, KvCacheLayout layout
     }
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     return impl ? impl->layer_v(layer) : nullptr;
-}
-
-llaisys::tensor_t require_i32_1d_tensor(llaisysTensor_t handle) {
-    if (handle == nullptr || handle->tensor == nullptr) {
-        return nullptr;
-    }
-    llaisys::tensor_t t = handle->tensor;
-    if (t->ndim() != 1 || t->dtype() != LLAISYS_DTYPE_I32 || !t->isContiguous()) {
-        return nullptr;
-    }
-    return t;
-}
-
-bool check_same_device(const llaisys::tensor_t &a, const llaisys::tensor_t &b) {
-    return a != nullptr && b != nullptr && a->deviceType() == b->deviceType() && a->deviceId() == b->deviceId();
 }
 
 std::string str_or_empty(const char *s) {
@@ -344,7 +326,7 @@ struct LlaisysModelImpl {
 
 };
 
-struct LlaisysRuntimeImpl {
+struct LlaisysKvStateImpl {
     struct RuntimeParallelConfig {
         int32_t tensor_parallel_size{1};
         int32_t pipeline_parallel_size{1};
@@ -364,45 +346,10 @@ struct LlaisysRuntimeImpl {
         bool initialized{false};
     };
 
-    struct SamplerScratchState {
-        llaisys::tensor_t max_val_buf{};
-        size_t max_val_capacity{0};
-        llaisysDataType_t max_val_dtype{LLAISYS_DTYPE_INVALID};
-        llaisysDeviceType_t max_val_device_type{LLAISYS_DEVICE_CPU};
-        int max_val_device_id{0};
-
-        llaisys::tensor_t ensure_max_val(size_t n,
-                                         llaisysDataType_t dtype,
-                                         llaisysDeviceType_t device_type,
-                                         int device_id) {
-            if (n == 0) {
-                return nullptr;
-            }
-            bool recreate = (max_val_buf == nullptr) || (max_val_capacity < n) || (max_val_dtype != dtype) ||
-                            (max_val_device_type != device_type) || (max_val_device_id != device_id);
-            if (recreate) {
-                size_t cap = std::max<size_t>(1, max_val_capacity);
-                while (cap < n) {
-                    cap *= 2;
-                }
-                max_val_buf = llaisys::Tensor::create({cap}, dtype, device_type, device_id);
-                max_val_capacity = cap;
-                max_val_dtype = dtype;
-                max_val_device_type = device_type;
-                max_val_device_id = device_id;
-            }
-            if (max_val_capacity == n) {
-                return max_val_buf;
-            }
-            return max_val_buf->slice(0, 0, n);
-        }
-    };
-
-    LlaisysRuntimeCreateParams params{};
+    LlaisysKvStateCreateParams params{};
     RuntimeParallelConfig parallel{};
     std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
     std::weak_ptr<LlaisysModelImpl> bound_model{};
-    SamplerScratchState sampler_scratch{};
 
     bool ensure_model_bound(const std::shared_ptr<LlaisysModelImpl> &impl) {
         if (!impl) {
@@ -429,7 +376,6 @@ struct LlaisysRuntimeImpl {
             } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
                 return false;
             }
-
             const int32_t tp_size = parallel.initialized ? std::max<int32_t>(1, parallel.tensor_parallel_size) : int32_t{1};
             const int32_t tp_rank = parallel.initialized ? std::max<int32_t>(0, parallel.rank) : int32_t{0};
             const int32_t local_rank = parallel.initialized ? std::max<int32_t>(0, parallel.local_rank) : int32_t{0};
@@ -442,7 +388,6 @@ struct LlaisysRuntimeImpl {
                     tp_size, tp_rank, local_rank, tp_device_ids, tp_ndevice, dist_backend, init_method, use_single_process_tp) != 0) {
                 return false;
             }
-
             const size_t kv_block_size =
                 params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
             const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
@@ -556,19 +501,19 @@ struct LlaisysModel {
     std::shared_ptr<LlaisysModelImpl> impl;
 };
 
-struct LlaisysRuntime {
-    std::unique_ptr<LlaisysRuntimeImpl> impl;
+struct LlaisysKvState {
+    std::unique_ptr<LlaisysKvStateImpl> impl;
 };
 
-__export struct LlaisysRuntime *llaisysRuntimeCreate(const struct LlaisysRuntimeCreateParams *params) {
+__export struct LlaisysKvState *llaisysKvStateCreate(const struct LlaisysKvStateCreateParams *params) {
     if (params == nullptr) {
         return nullptr;
     }
     try {
-        auto *runtime = new LlaisysRuntime{};
-        runtime->impl = std::make_unique<LlaisysRuntimeImpl>();
-        runtime->impl->params = *params;
-        return runtime;
+        auto *kv_state = new LlaisysKvState{};
+        kv_state->impl = std::make_unique<LlaisysKvStateImpl>();
+        kv_state->impl->params = *params;
+        return kv_state;
     } catch (...) {
         return nullptr;
     }
@@ -612,17 +557,17 @@ __export void llaisysModelDestroy(struct LlaisysModel *model) {
     delete model;
 }
 
-__export void llaisysRuntimeDestroy(struct LlaisysRuntime *runtime) {
-    delete runtime;
+__export void llaisysKvStateDestroy(struct LlaisysKvState *kv_state) {
+    delete kv_state;
 }
 
-__export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
+__export int32_t llaisysKvStateParallelInit(struct LlaisysKvState *kv_state,
                                             const struct LlaisysParallelInitParams *params) {
-    if (runtime == nullptr || runtime->impl == nullptr || params == nullptr) {
+    if (kv_state == nullptr || kv_state->impl == nullptr || params == nullptr) {
         return -1;
     }
 
-    auto &parallel = runtime->impl->parallel;
+    auto &parallel = kv_state->impl->parallel;
     const int32_t tp_size = params->tensor_parallel_size > 0 ? params->tensor_parallel_size : int32_t{1};
     const int32_t pp_size = params->pipeline_parallel_size > 0 ? params->pipeline_parallel_size : int32_t{1};
     const int32_t world_size = params->world_size > 0 ? params->world_size : tp_size;
@@ -645,20 +590,16 @@ __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
     if (ndevice > 0 && params->device_ids == nullptr) {
         return -1;
     }
-
-    if (tp_size > 1) {
-        // No fallback: enforce explicit device list for TP mode.
-        if (ndevice != tp_size) {
-            std::fprintf(stderr,
-                         "[ERROR] runtime parallel init invalid device_ids: tp_size=%d rank=%d local_rank=%d "
-                         "backend=%s op=runtime_parallel_init ndevice=%d\n",
-                         tp_size,
-                         rank,
-                         local_rank,
-                         str_or_empty(params->distributed_backend).c_str(),
-                         ndevice);
-            return -1;
-        }
+    if (tp_size > 1 && ndevice != tp_size) {
+        std::fprintf(stderr,
+                     "[ERROR] kv_state parallel init invalid device_ids: tp_size=%d rank=%d local_rank=%d "
+                     "backend=%s op=kv_state_parallel_init ndevice=%d\n",
+                     tp_size,
+                     rank,
+                     local_rank,
+                     str_or_empty(params->distributed_backend).c_str(),
+                     ndevice);
+        return -1;
     }
 
     parallel.tensor_parallel_size = tp_size;
@@ -683,7 +624,7 @@ __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
     parallel.initialized = true;
 
     std::fprintf(stderr,
-                 "[runtime.parallel] initialized tp_size=%d pp_size=%d world_size=%d rank=%d local_rank=%d "
+                 "[kv_state.parallel] initialized tp_size=%d pp_size=%d world_size=%d rank=%d local_rank=%d "
                  "ndevice=%d backend=%s exec_backend=%s\n",
                  parallel.tensor_parallel_size,
                  parallel.pipeline_parallel_size,
@@ -694,20 +635,6 @@ __export int32_t llaisysRuntimeParallelInit(struct LlaisysRuntime *runtime,
                  parallel.distributed_backend.c_str(),
                  parallel.distributed_executor_backend.c_str());
     return 0;
-}
-
-__export llaisysStream_t llaisysRuntimeGetComputeStream(struct LlaisysRuntime *runtime,
-                                                        llaisysDeviceType_t device_type,
-                                                        int device_id) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return nullptr;
-    }
-    try {
-        llaisys::core::context().setDevice(device_type, device_id);
-        return llaisys::core::context().runtime().stream();
-    } catch (...) {
-        return nullptr;
-    }
 }
 
 __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model) {
@@ -811,16 +738,24 @@ __export int llaisysModelReplaceWeight(struct LlaisysModel *model,
 }
 
 __export int32_t llaisysModelForward(struct LlaisysModel *model,
-                                     struct LlaisysRuntime *runtime,
+                                     struct LlaisysKvState *kv_state,
                                      const struct ModelForwardInput *input,
                                      struct ModelForwardOutput *output) {
     LLAISYS_NVTX_SCOPE("api/model_forward");
-    if (model == nullptr || model->impl == nullptr || runtime == nullptr || runtime->impl == nullptr || input == nullptr ||
+    if (model == nullptr || model->impl == nullptr || kv_state == nullptr || kv_state->impl == nullptr || input == nullptr ||
         input->input_ids == nullptr) {
         return -1;
     }
     try {
-        if (!runtime->impl->ensure_model_bound(model->impl)) {
+        if (model->impl->type == LLAISYS_MODEL_TYPE_QWEN2 && model->impl->qwen2 != nullptr) {
+            if (!model->impl->qwen2->bind_kv_state_handle(static_cast<const void *>(kv_state))) {
+                std::fprintf(stderr,
+                             "[ERROR] Qwen2: kv_state handle changed after first forward (current=%p)\n",
+                             static_cast<const void *>(kv_state));
+                return -1;
+            }
+        }
+        if (!kv_state->impl->ensure_model_bound(model->impl)) {
             return -1;
         }
         return model->impl->forward(*input, output);
@@ -831,230 +766,60 @@ __export int32_t llaisysModelForward(struct LlaisysModel *model,
     }
 }
 
-__export int32_t llaisysRuntimeBuildBlockAttentionMetadata(struct LlaisysRuntime *runtime,
-                                                           llaisysTensor_t req_num_scheduled_tokens,
-                                                           llaisysTensor_t req_num_computed_tokens,
-                                                           llaisysTensor_t block_tables,
-                                                           int32_t block_table_width,
-                                                           int32_t ntoken,
-                                                           llaisysTensor_t query_start_loc,
-                                                           llaisysTensor_t seq_lens,
-                                                           llaisysTensor_t slot_mapping) {
-    LLAISYS_NVTX_SCOPE("api/runtime_build_block_attention_metadata");
-    if (runtime == nullptr || runtime->impl == nullptr || block_table_width <= 0 || ntoken < 0) {
+__export int llaisysKvStateSeqCp(struct LlaisysKvState *kv_state, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    return to_kv_code(kv_state->impl->kv_seq_cp(dst_seq, src_seq, p0, p1));
+}
+
+__export int llaisysKvStateSeqRm(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    return to_kv_code(kv_state->impl->kv_seq_rm(seq_id, p0, p1));
+}
+
+__export int llaisysKvStateSeqAdd(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    return to_kv_code(kv_state->impl->kv_seq_add(seq_id, p0, p1, delta));
+}
+
+__export int llaisysKvStateSeqKeep(struct LlaisysKvState *kv_state, int64_t seq_id) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    return to_kv_code(kv_state->impl->kv_seq_keep(seq_id));
+}
+
+__export int64_t llaisysKvStateSeqPosMax(struct LlaisysKvState *kv_state, int64_t seq_id) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
         return -1;
     }
-    try {
-        const llaisys::tensor_t req_sched_t = require_i32_1d_tensor(req_num_scheduled_tokens);
-        const llaisys::tensor_t req_comp_t = require_i32_1d_tensor(req_num_computed_tokens);
-        const llaisys::tensor_t block_tables_t = require_i32_1d_tensor(block_tables);
-        llaisys::tensor_t query_start_loc_t = require_i32_1d_tensor(query_start_loc);
-        llaisys::tensor_t seq_lens_t = require_i32_1d_tensor(seq_lens);
-        llaisys::tensor_t slot_mapping_t = require_i32_1d_tensor(slot_mapping);
-        if (req_sched_t == nullptr || req_comp_t == nullptr || block_tables_t == nullptr || query_start_loc_t == nullptr ||
-            seq_lens_t == nullptr || slot_mapping_t == nullptr) {
-            return -1;
-        }
-
-        if (!check_same_device(req_sched_t, req_comp_t) || !check_same_device(req_sched_t, block_tables_t) ||
-            !check_same_device(req_sched_t, query_start_loc_t) || !check_same_device(req_sched_t, seq_lens_t) ||
-            !check_same_device(req_sched_t, slot_mapping_t)) {
-            return -1;
-        }
-
-        const llaisysDeviceType_t device_type = req_sched_t->deviceType();
-        const int device_id = req_sched_t->deviceId();
-        const size_t n_batch_seq = req_sched_t->shape()[0];
-        if (n_batch_seq == 0) {
-            return -1;
-        }
-        if (req_comp_t->shape()[0] != n_batch_seq || seq_lens_t->shape()[0] != n_batch_seq ||
-            query_start_loc_t->shape()[0] != n_batch_seq + 1 || slot_mapping_t->shape()[0] != static_cast<size_t>(ntoken) ||
-            block_tables_t->shape()[0] != n_batch_seq * static_cast<size_t>(block_table_width)) {
-            return -1;
-        }
-
-        llaisys::core::context().setDevice(device_type, device_id);
-#ifdef ENABLE_NVIDIA_API
-        if (device_type == LLAISYS_DEVICE_NVIDIA) {
-            llaisys::ops::cuda::build_query_start_loc_and_seq_lens(query_start_loc_t, seq_lens_t, req_sched_t, req_comp_t);
-            const int32_t block_size = runtime->impl->params.kv_cache_block_size > 0 ? runtime->impl->params.kv_cache_block_size : 16;
-            llaisys::ops::cuda::build_slot_mapping(slot_mapping_t,
-                                                   query_start_loc_t,
-                                                   seq_lens_t,
-                                                   block_tables_t,
-                                                   block_table_width,
-                                                   block_size);
-            return 0;
-        }
-#endif
-        if (device_type != LLAISYS_DEVICE_CPU) {
-            return -1;
-        }
-
-        const auto *req_sched = reinterpret_cast<const int32_t *>(req_sched_t->data());
-        const auto *req_comp = reinterpret_cast<const int32_t *>(req_comp_t->data());
-        const auto *block_tab = reinterpret_cast<const int32_t *>(block_tables_t->data());
-        auto *qstart = reinterpret_cast<int32_t *>(query_start_loc_t->data());
-        auto *slens = reinterpret_cast<int32_t *>(seq_lens_t->data());
-        auto *slot_map = reinterpret_cast<int32_t *>(slot_mapping_t->data());
-        const int32_t block_size = runtime->impl->params.kv_cache_block_size > 0 ? runtime->impl->params.kv_cache_block_size : 16;
-
-        int32_t acc = 0;
-        qstart[0] = 0;
-        for (size_t i = 0; i < n_batch_seq; ++i) {
-            const int32_t n_sched = req_sched[i];
-            const int32_t n_comp = req_comp[i];
-            if (n_sched < 0 || n_comp < 0) {
-                return -1;
-            }
-            acc += n_sched;
-            qstart[i + 1] = acc;
-            slens[i] = n_sched + n_comp;
-        }
-        if (acc != ntoken) {
-            return -1;
-        }
-
-        for (size_t row = 0; row < n_batch_seq; ++row) {
-            const int32_t row_start = qstart[row];
-            const int32_t row_end = qstart[row + 1];
-            const int32_t row_sched = row_end - row_start;
-            if (row_sched <= 0) {
-                continue;
-            }
-            const int32_t row_seq_len = slens[row];
-            const int32_t q_base = row_seq_len - row_sched;
-            for (int32_t t = row_start; t < row_end; ++t) {
-                const int32_t local = t - row_start;
-                const int32_t qpos = q_base + local;
-                if (qpos < 0) {
-                    return -1;
-                }
-                const int32_t bidx = qpos / block_size;
-                const int32_t boff = qpos % block_size;
-                if (bidx < 0 || bidx >= block_table_width) {
-                    return -1;
-                }
-                const int32_t bid = block_tab[row * static_cast<size_t>(block_table_width) + static_cast<size_t>(bidx)];
-                if (bid < 0) {
-                    return -1;
-                }
-                slot_map[t] = bid * block_size + boff;
-            }
-        }
-        return 0;
-    } catch (...) {
-        return -2;
-    }
+    return kv_state->impl->kv_seq_pos_max(seq_id);
 }
 
-__export int32_t llaisysSamplerSample(struct LlaisysRuntime *runtime,
-                                      const struct SamplerInput *input,
-                                      struct SamplerOutput *output) {
-    LLAISYS_NVTX_SCOPE("api/sampler_sample");
-    if (runtime == nullptr || runtime->impl == nullptr || input == nullptr || output == nullptr || input->logits == nullptr ||
-        output->sampled_ids == nullptr) {
+__export int llaisysKvStateRequestFree(struct LlaisysKvState *kv_state, int64_t seq_id) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
+        return to_kv_code(KvStatus::INTERNAL_ERROR);
+    }
+    return to_kv_code(kv_state->impl->request_free(seq_id));
+}
+
+__export int llaisysKvStateStats(struct LlaisysKvState *kv_state, struct LlaisysKvStats *out_stats) {
+    if (kv_state == nullptr || kv_state->impl == nullptr || out_stats == nullptr) {
         return -1;
     }
-    try {
-        const llaisys::tensor_t logits = input->logits->tensor;
-        llaisys::tensor_t sampled_ids = output->sampled_ids->tensor;
-        if (logits == nullptr || sampled_ids == nullptr) {
-            return -1;
-        }
-        if (logits->ndim() != 2 || !logits->isContiguous()) {
-            return -1;
-        }
-        if (sampled_ids->ndim() != 1 || sampled_ids->dtype() != LLAISYS_DTYPE_I64 || !sampled_ids->isContiguous()) {
-            return -1;
-        }
-        if (sampled_ids->deviceType() != logits->deviceType() || sampled_ids->deviceId() != logits->deviceId()) {
-            return -1;
-        }
-
-        const size_t n_outputs = logits->shape()[0];
-        if (n_outputs == 0) {
-            return 0;
-        }
-        if (sampled_ids->shape()[0] < n_outputs) {
-            return -1;
-        }
-
-        if (sampled_ids->shape()[0] > n_outputs) {
-            sampled_ids = sampled_ids->slice(0, 0, n_outputs);
-        }
-
-        llaisys::tensor_t max_idx = sampled_ids;
-        llaisys::tensor_t max_val =
-            runtime->impl->sampler_scratch.ensure_max_val(n_outputs, logits->dtype(), logits->deviceType(), logits->deviceId());
-        if (max_val == nullptr) {
-            return -1;
-        }
-        {
-            LLAISYS_NVTX_SCOPE("sample/argmax_rows");
-            llaisys::ops::argmax_rows(max_idx, max_val, logits);
-        }
-        return 0;
-    } catch (...) {
-        return -2;
-    }
+    return kv_state->impl->kv_stats(out_stats);
 }
 
-__export int llaisysRuntimeKvSeqCp(struct LlaisysRuntime *runtime, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
+__export int llaisysKvStateResetPrefixCache(struct LlaisysKvState *kv_state) {
+    if (kv_state == nullptr || kv_state->impl == nullptr) {
         return to_kv_code(KvStatus::INTERNAL_ERROR);
     }
-    return to_kv_code(runtime->impl->kv_seq_cp(dst_seq, src_seq, p0, p1));
-}
-
-__export int llaisysRuntimeKvSeqRm(struct LlaisysRuntime *runtime, int64_t seq_id, int64_t p0, int64_t p1) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(runtime->impl->kv_seq_rm(seq_id, p0, p1));
-}
-
-__export int llaisysRuntimeKvSeqAdd(struct LlaisysRuntime *runtime, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(runtime->impl->kv_seq_add(seq_id, p0, p1, delta));
-}
-
-__export int llaisysRuntimeKvSeqKeep(struct LlaisysRuntime *runtime, int64_t seq_id) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(runtime->impl->kv_seq_keep(seq_id));
-}
-
-__export int64_t llaisysRuntimeKvSeqPosMax(struct LlaisysRuntime *runtime, int64_t seq_id) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return -1;
-    }
-    return runtime->impl->kv_seq_pos_max(seq_id);
-}
-
-__export int llaisysRuntimeRequestFree(struct LlaisysRuntime *runtime, int64_t seq_id) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(runtime->impl->request_free(seq_id));
-}
-
-__export int llaisysRuntimeKvStats(struct LlaisysRuntime *runtime, struct LlaisysKvStats *out_stats) {
-    if (runtime == nullptr || runtime->impl == nullptr || out_stats == nullptr) {
-        return -1;
-    }
-    return runtime->impl->kv_stats(out_stats);
-}
-
-__export int llaisysRuntimeKvResetPrefixCache(struct LlaisysRuntime *runtime) {
-    if (runtime == nullptr || runtime->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(runtime->impl->kv_reset_prefix_cache());
+    return to_kv_code(kv_state->impl->kv_reset_prefix_cache());
 }
 
 } // extern "C"

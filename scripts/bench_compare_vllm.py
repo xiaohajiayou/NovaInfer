@@ -158,6 +158,8 @@ def _run_vllm(
     sps = [
         SamplingParams(
             temperature=0.6,
+            top_k=1,
+            top_p=1.0,
             ignore_eos=True,
             max_tokens=out_len,
         )

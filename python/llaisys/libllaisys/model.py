@@ -1,12 +1,12 @@
 from ctypes import POINTER, Structure, c_int, c_int32, c_int64, c_char_p, c_void_p
 from enum import IntEnum
 
-from .llaisys_types import llaisysDeviceType_t, llaisysStream_t
+from .llaisys_types import llaisysDeviceType_t
 from .tensor import llaisysTensor_t
 
 
 llaisysModel_t = c_void_p
-llaisysRuntime_t = c_void_p
+llaisysKvState_t = c_void_p
 
 
 class ModelType(IntEnum):
@@ -33,7 +33,7 @@ class LlaisysModelCreateParams(Structure):
     ]
 
 
-class LlaisysRuntimeCreateParams(Structure):
+class LlaisysKvStateCreateParams(Structure):
     _fields_ = [
         ("kv_cache_layout", c_int32),
         ("kv_cache_block_size", c_int32),
@@ -123,15 +123,13 @@ class SamplerOutput(Structure):
 
 
 def load_model(lib):
-    lib.llaisysRuntimeCreate.argtypes = [POINTER(LlaisysRuntimeCreateParams)]
-    lib.llaisysRuntimeCreate.restype = llaisysRuntime_t
+    lib.llaisysKvStateCreate.argtypes = [POINTER(LlaisysKvStateCreateParams)]
+    lib.llaisysKvStateCreate.restype = llaisysKvState_t
 
-    lib.llaisysRuntimeDestroy.argtypes = [llaisysRuntime_t]
-    lib.llaisysRuntimeDestroy.restype = None
-    lib.llaisysRuntimeParallelInit.argtypes = [llaisysRuntime_t, POINTER(LlaisysParallelInitParams)]
-    lib.llaisysRuntimeParallelInit.restype = c_int32
-    lib.llaisysRuntimeGetComputeStream.argtypes = [llaisysRuntime_t, llaisysDeviceType_t, c_int]
-    lib.llaisysRuntimeGetComputeStream.restype = llaisysStream_t
+    lib.llaisysKvStateDestroy.argtypes = [llaisysKvState_t]
+    lib.llaisysKvStateDestroy.restype = None
+    lib.llaisysKvStateParallelInit.argtypes = [llaisysKvState_t, POINTER(LlaisysParallelInitParams)]
+    lib.llaisysKvStateParallelInit.restype = c_int32
 
     lib.llaisysModelCreate.argtypes = [POINTER(LlaisysModelCreateParams)]
     lib.llaisysModelCreate.restype = llaisysModel_t
@@ -148,55 +146,43 @@ def load_model(lib):
     lib.llaisysModelReplaceWeight.argtypes = [llaisysModel_t, c_char_p, c_int32, c_void_p]
     lib.llaisysModelReplaceWeight.restype = c_int
 
-    lib.llaisysModelForward.argtypes = [llaisysModel_t, llaisysRuntime_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
+    lib.llaisysModelForward.argtypes = [llaisysModel_t, llaisysKvState_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
     lib.llaisysModelForward.restype = c_int32
-    lib.llaisysRuntimeBuildBlockAttentionMetadata.argtypes = [
-        llaisysRuntime_t,
-        llaisysTensor_t,
-        llaisysTensor_t,
-        llaisysTensor_t,
-        c_int32,
-        c_int32,
-        llaisysTensor_t,
-        llaisysTensor_t,
-        llaisysTensor_t,
-    ]
-    lib.llaisysRuntimeBuildBlockAttentionMetadata.restype = c_int32
-    lib.llaisysSamplerSample.argtypes = [llaisysRuntime_t, POINTER(SamplerInput), POINTER(SamplerOutput)]
+    lib.llaisysSamplerSample.argtypes = [POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
 
-    lib.llaisysRuntimeKvSeqCp.argtypes = [llaisysRuntime_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysRuntimeKvSeqCp.restype = c_int
+    lib.llaisysKvStateSeqCp.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
+    lib.llaisysKvStateSeqCp.restype = c_int
 
-    lib.llaisysRuntimeKvSeqRm.argtypes = [llaisysRuntime_t, c_int64, c_int64, c_int64]
-    lib.llaisysRuntimeKvSeqRm.restype = c_int
+    lib.llaisysKvStateSeqRm.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64]
+    lib.llaisysKvStateSeqRm.restype = c_int
 
-    lib.llaisysRuntimeKvSeqAdd.argtypes = [llaisysRuntime_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysRuntimeKvSeqAdd.restype = c_int
+    lib.llaisysKvStateSeqAdd.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
+    lib.llaisysKvStateSeqAdd.restype = c_int
 
-    lib.llaisysRuntimeKvSeqKeep.argtypes = [llaisysRuntime_t, c_int64]
-    lib.llaisysRuntimeKvSeqKeep.restype = c_int
+    lib.llaisysKvStateSeqKeep.argtypes = [llaisysKvState_t, c_int64]
+    lib.llaisysKvStateSeqKeep.restype = c_int
 
-    lib.llaisysRuntimeKvSeqPosMax.argtypes = [llaisysRuntime_t, c_int64]
-    lib.llaisysRuntimeKvSeqPosMax.restype = c_int64
+    lib.llaisysKvStateSeqPosMax.argtypes = [llaisysKvState_t, c_int64]
+    lib.llaisysKvStateSeqPosMax.restype = c_int64
 
-    lib.llaisysRuntimeRequestFree.argtypes = [llaisysRuntime_t, c_int64]
-    lib.llaisysRuntimeRequestFree.restype = c_int
+    lib.llaisysKvStateRequestFree.argtypes = [llaisysKvState_t, c_int64]
+    lib.llaisysKvStateRequestFree.restype = c_int
 
-    lib.llaisysRuntimeKvStats.argtypes = [llaisysRuntime_t, POINTER(LlaisysKvStats)]
-    lib.llaisysRuntimeKvStats.restype = c_int
+    lib.llaisysKvStateStats.argtypes = [llaisysKvState_t, POINTER(LlaisysKvStats)]
+    lib.llaisysKvStateStats.restype = c_int
 
-    lib.llaisysRuntimeKvResetPrefixCache.argtypes = [llaisysRuntime_t]
-    lib.llaisysRuntimeKvResetPrefixCache.restype = c_int
+    lib.llaisysKvStateResetPrefixCache.argtypes = [llaisysKvState_t]
+    lib.llaisysKvStateResetPrefixCache.restype = c_int
 
 __all__ = [
     "llaisysModel_t",
-    "llaisysRuntime_t",
+    "llaisysKvState_t",
     "ModelType",
     "KvCacheLayout",
     "AttentionPhase",
     "LlaisysModelCreateParams",
-    "LlaisysRuntimeCreateParams",
+    "LlaisysKvStateCreateParams",
     "LlaisysParallelInitParams",
     "LlaisysKvStats",
     "AttentionMetadata",

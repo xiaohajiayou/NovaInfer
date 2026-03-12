@@ -485,7 +485,7 @@ class Qwen2:
     def end_token_id(self) -> int:
         return int(self._meta_info.end_token)
 
-    def forward(self, runtime, fin: ModelForwardInput, fout: ModelForwardOutput) -> int:
-        if not self._model or runtime is None:
+    def forward(self, kv_state, fin: ModelForwardInput, fout: ModelForwardOutput) -> int:
+        if not self._model or kv_state is None:
             return -1
-        return int(LIB_LLAISYS.llaisysModelForward(self._model, runtime, byref(fin), byref(fout)))
+        return int(LIB_LLAISYS.llaisysModelForward(self._model, kv_state, byref(fin), byref(fout)))

@@ -77,9 +77,9 @@ class GPUModelRunner:
         self._head_dim = int(getattr(meta_info, "dh", 0))
         self._config.max_model_len = int(self.model.max_seq_len)
         self._config.end_token_id = int(self.model.end_token_id)
-        self._runtime = None
-        self.allocate_kv_cache()
-        self.sampler = Sampler(self._device, self._runtime, config=self._config)
+        self._kv_state = None
+        self.allocate_kv_state()
+        self.sampler = Sampler(self._device, config=self._config)
 
         self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._paged_attn_backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
@@ -157,12 +157,12 @@ class GPUModelRunner:
         self._execute_model_state: ExecuteState | None = None
         self._closed = False
 
-    def allocate_kv_cache(self) -> None:
-        if self._runtime is not None:
+    def allocate_kv_state(self) -> None:
+        if self._kv_state is not None:
             return
         if self._model_path is None:
-            raise ValueError("model_path is required for runtime allocation")
-        runtime_handle, runtime_info = self._model_registry.create_runtime(
+            raise ValueError("model_path is required for kv-state allocation")
+        kv_state, kv_state_info = self._model_registry.create_kv_state(
             self._model_type,
             self._model_path,
             self._device,
@@ -180,11 +180,11 @@ class GPUModelRunner:
             tp_rank=int(getattr(self._config, "tp_rank", 0)),
             tp_local_rank=int(getattr(self._config, "tp_local_rank", 0)),
         )
-        if runtime_handle is None:
-            raise RuntimeError("runtime allocation failed")
-        self._runtime = runtime_handle
-        if runtime_info:
-            kv_capacity = runtime_info.get("kv_cache_capacity_tokens")
+        if kv_state is None:
+            raise RuntimeError("kv-state allocation failed")
+        self._kv_state = kv_state
+        if kv_state_info:
+            kv_capacity = kv_state_info.get("kv_cache_capacity_tokens")
             if self._config.kv_cache_layout == KvCacheLayout.BLOCK and kv_capacity is not None:
                 self._config.num_kvcache_blocks = (
                     int(kv_capacity) + int(self._config.kv_cache_block_size) - 1
@@ -202,13 +202,13 @@ class GPUModelRunner:
                     self._runtime_api.stream_synchronize(stream)
                 except Exception:
                     pass
-        runtime = self._runtime
-        self._runtime = None
+        kv_state = self._kv_state
+        self._kv_state = None
         close_fn = getattr(self.model, "close", None)
         if callable(close_fn):
             close_fn()
-        if runtime is not None:
-            LIB_LLAISYS.llaisysRuntimeDestroy(runtime)
+        if kv_state is not None:
+            LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
 
     def execute_model(
         self,
@@ -269,9 +269,9 @@ class GPUModelRunner:
                 forward_fn = getattr(self.model, "forward", None)
                 if not callable(forward_fn):
                     raise RuntimeError("model wrapper must implement forward(ModelForwardInput, ModelForwardOutput)")
-                if self._runtime is None:
-                    raise RuntimeError("runtime handle is required")
-                status = int(forward_fn(self._runtime, fin, fout))
+                if self._kv_state is None:
+                    raise RuntimeError("kv_state handle is required")
+                status = int(forward_fn(self._kv_state, fin, fout))
                 if status != 0:
                     raise RuntimeError(f"modelForward failed with status={status}")
 
@@ -361,7 +361,7 @@ class GPUModelRunner:
             with nvtx_range("py/runner/sample_tokens/d2h"):
                 sampled_host = self._sampled_ids_buf.cpu.slice(0, 0, n_outputs)
                 dev_id = int(sampled.device_id())
-                compute_stream = self._get_runtime_compute_stream(dev_id)
+                compute_stream = self._get_compute_stream(dev_id)
                 self._runtime_api.set_device(dev_id)
                 sampled_host.copy_(sampled, non_blocking=True, stream=compute_stream)
                 sync_fn = getattr(self._runtime_api, "stream_synchronize", None)
@@ -381,17 +381,16 @@ class GPUModelRunner:
             pin_memory=pin_memory,
         )
 
-    def _get_runtime_compute_stream(self, device_id: int):
+    def _get_compute_stream(self, device_id: int):
         stream = self._compute_streams.get(int(device_id))
         if stream is not None:
             return stream
-        stream = LIB_LLAISYS.llaisysRuntimeGetComputeStream(
-            self._runtime,
+        stream = LIB_LLAISYS.llaisysGetContextComputeStream(
             llaisysDeviceType_t(self._device),
             int(device_id),
         )
         if stream is None:
-            raise RuntimeError(f"failed to acquire runtime compute stream for device_id={device_id}")
+            raise RuntimeError(f"failed to acquire compute stream for device_id={device_id}")
         self._compute_streams[int(device_id)] = stream
         return stream
 
@@ -589,7 +588,7 @@ class GPUModelRunner:
         input_ids_t = self._input_ids_buf.gpu.slice(0, 0, ntoken)
         pos_ids_t = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
         dev_id = int(input_ids_t.device_id())
-        h2d_stream = self._get_runtime_compute_stream(dev_id)
+        h2d_stream = self._get_compute_stream(dev_id)
         input_ids_host_t.copy_from_numpy(np.asarray(input_ids, dtype=np.int64))
         pos_ids_host_t.copy_from_numpy(np.asarray(positions, dtype=np.int64))
         input_ids_t.copy_(input_ids_host_t, non_blocking=True, stream=h2d_stream)
@@ -1119,12 +1118,12 @@ class GPUModelRunner:
             prepared.phase = int(AttentionPhase.DECODE)
             return prepared
     def request_free(self, seq_id: int) -> None:
-        if self._runtime is None:
+        if self._kv_state is None:
             return
-        LIB_LLAISYS.llaisysRuntimeRequestFree(self._runtime, c_int64(int(seq_id)))
+        LIB_LLAISYS.llaisysKvStateRequestFree(self._kv_state, c_int64(int(seq_id)))
 
     def kv_stats(self) -> dict[str, int]:
-        if self._runtime is None:
+        if self._kv_state is None:
             return {
                 "capacity_tokens": 0,
                 "used_tokens": 0,
@@ -1132,7 +1131,7 @@ class GPUModelRunner:
                 "peak_used_tokens": 0,
             }
         out = LlaisysKvStats()
-        rc = int(LIB_LLAISYS.llaisysRuntimeKvStats(self._runtime, byref(out)))
+        rc = int(LIB_LLAISYS.llaisysKvStateStats(self._kv_state, byref(out)))
         if rc != 0:
             raise RuntimeError(f"KvStats failed with status={rc}")
         return {
@@ -1143,6 +1142,6 @@ class GPUModelRunner:
         }
 
     def kv_reset_prefix_cache(self) -> int:
-        if self._runtime is None:
+        if self._kv_state is None:
             return 5
-        return int(LIB_LLAISYS.llaisysRuntimeKvResetPrefixCache(self._runtime))
+        return int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(self._kv_state))

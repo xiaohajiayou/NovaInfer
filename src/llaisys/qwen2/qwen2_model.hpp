@@ -5,7 +5,6 @@
 
 #include "../llaisys_tensor.hpp"
 #include "../runtime/kv_cache/kv_cache.hpp"
-#include "../runtime/output/output.hpp"
 #include "../runtime/workspace/workspace.hpp"
 #include "../runtime/weights/weights.hpp"
 
@@ -67,6 +66,7 @@ public:
     size_t vocab_size() const noexcept { return meta_.voc; }
     llaisysDeviceType_t device_type() const noexcept { return device_type_; }
     int device_id() const noexcept { return device_id_; }
+    bool bind_kv_state_handle(const void *kv_state_handle) noexcept;
     int32_t forward(const ::ModelForwardInput &input, ::ModelForwardOutput *output);
     tensor_t step_logits() const noexcept { return step_logits_; }
     runtime::kv_cache::KvCacheBase *kv_cache() noexcept { return runtime_.kv_cache.get(); }
@@ -88,7 +88,6 @@ private:
         size_t max_model_len{0};
         size_t kv_cache_capacity_tokens{0};
         std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache{};
-        std::unique_ptr<runtime::output::OutputBuffer> output{};
         mutable int64_t kv_peak_used_tokens{0};
     };
 
@@ -125,7 +124,9 @@ private:
 #ifdef ENABLE_NVIDIA_API
     // Switch point for staged FlashInfer migration (NATIVE by default).
     ops::cuda::PagedAttentionBackend paged_attn_backend_{ops::cuda::PagedAttentionBackend::NATIVE};
+    ops::cuda::CudnnRuntimeState *cudnn_runtime_state_{nullptr};
 #endif
+    const void *bound_kv_state_handle_{nullptr};
     struct AttentionExecState {
         bool paged_attention{false};
         bool use_cudnn_backend{false};

@@ -53,8 +53,8 @@ def test_model_registry_qwen2_and_mock():
         mock_out = run_model_forward(mock, mock_runtime, built, device=llaisys.DeviceType.CPU)
         assert mock_out.status == -2
 
-        assert int(LIB_LLAISYS.llaisysRuntimeKvSeqPosMax(mock_runtime, c_int64(5))) == -1
-        assert int(LIB_LLAISYS.llaisysRuntimeRequestFree(mock_runtime, c_int64(5))) == 2
+        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(mock_runtime, c_int64(5))) == -1
+        assert int(LIB_LLAISYS.llaisysKvStateRequestFree(mock_runtime, c_int64(5))) == 2
     finally:
         destroy_model_runtime(qwen2, qwen2_runtime)
         destroy_model_runtime(mock, mock_runtime)

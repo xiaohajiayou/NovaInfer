@@ -53,6 +53,9 @@ __C {
 
     // Llaisys API for switching device context
     __export void llaisysSetContextRuntime(llaisysDeviceType_t, int);
+    // Return compute stream from current thread context runtime bound to (device_type, device_id).
+    // nullptr on failure.
+    __export llaisysStream_t llaisysGetContextComputeStream(llaisysDeviceType_t, int);
 
     // Lightweight NVTX helpers for Python-side timeline instrumentation.
     __export void llaisysNvtxRangePush(const char *);

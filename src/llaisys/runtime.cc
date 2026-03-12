@@ -8,6 +8,15 @@ __C void llaisysSetContextRuntime(llaisysDeviceType_t device_type, int device_id
     llaisys::core::context().setDevice(device_type, device_id);
 }
 
+__C llaisysStream_t llaisysGetContextComputeStream(llaisysDeviceType_t device_type, int device_id) {
+    try {
+        llaisys::core::context().setDevice(device_type, device_id);
+        return llaisys::core::context().runtime().stream();
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 // Llaisys API for getting the runtime APIs
 __C const LlaisysRuntimeAPI *llaisysGetRuntimeAPI(llaisysDeviceType_t device_type) {
     return llaisys::device::getRuntimeAPI(device_type);

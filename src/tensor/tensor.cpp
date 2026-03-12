@@ -52,14 +52,19 @@ tensor_t Tensor::create(const std::vector<size_t> &shape,
         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
     }
 
-    if (device_type == LLAISYS_DEVICE_CPU && core::context().runtime().deviceType() != LLAISYS_DEVICE_CPU) {
+    if (device_type == LLAISYS_DEVICE_CPU) {
+        // Non-pinned CPU tensors must always use CPU runtime allocator.
+        // Otherwise host allocation can route to CUDA mallocHost when the
+        // current context runtime is NVIDIA, which is fragile under CUDA
+        // sticky errors and can fail unrelated CPU tests.
+        core::context().setDevice(LLAISYS_DEVICE_CPU, 0);
         auto storage = core::context().runtime().allocateHostStorage(total_elems * dtype_size);
         return std::shared_ptr<Tensor>(new Tensor(meta, storage));
-    } else {
-        core::context().setDevice(device_type, device);
-        auto storage = core::context().runtime().allocateDeviceStorage(total_elems * dtype_size);
-        return std::shared_ptr<Tensor>(new Tensor(meta, storage));
     }
+
+    core::context().setDevice(device_type, device);
+    auto storage = core::context().runtime().allocateDeviceStorage(total_elems * dtype_size);
+    return std::shared_ptr<Tensor>(new Tensor(meta, storage));
 }
 
 std::byte *Tensor::data() {

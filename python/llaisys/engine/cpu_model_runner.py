@@ -108,7 +108,14 @@ class CPUModelRunner(GPUModelRunner):
         cudnn_b_exec: int = 0,
         incremental_block_table_update: bool = False,
     ) -> PreparedTensors:
-        del attention_phase, cudnn_seq_lens_q, cudnn_seq_lens_kv, cudnn_page_table, cudnn_b_exec, incremental_block_table_update
+        del (
+            attention_phase,
+            cudnn_seq_lens_q,
+            cudnn_seq_lens_kv,
+            cudnn_page_table,
+            cudnn_b_exec,
+            incremental_block_table_update,
+        )
         ntoken = len(input_ids)
         n_outputs = len(seqs)
         if ntoken > self._max_num_tokens:

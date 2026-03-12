@@ -19,6 +19,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -30,6 +31,38 @@ void cuda_check(cudaError_t rc, const char *what, const char *file, int line);
     ::llaisys::device::nvidia::cuda_check((call), #call, __FILE__, __LINE__)
 
 namespace llaisys::ops::cuda {
+
+#ifdef ENABLE_CUDNN_API
+struct CudnnPagedPlan {
+#ifdef ENABLE_CUDNN_FRONTEND
+    std::shared_ptr<cudnn_frontend::graph::Graph> graph{};
+    bool graph_ready{false};
+    int64_t built_b{0};
+    int64_t built_s_q{0};
+    int32_t built_table_size{0};
+    int64_t built_max_seq_len_kv{0};
+    int64_t built_num_blocks{0};
+    int32_t built_block_size{0};
+
+    void *workspace{nullptr};
+    size_t workspace_cap{0};
+
+#endif
+
+    ~CudnnPagedPlan() {
+        if (workspace != nullptr) {
+            cudaFree(workspace);
+            workspace = nullptr;
+        }
+    }
+};
+
+struct CudnnRuntimeState {
+    cudnnHandle_t handle{nullptr};
+    CudnnPagedPlan decode_plan{};
+    CudnnPagedPlan prefill_plan{};
+};
+#endif
 
 namespace {
 
@@ -683,30 +716,6 @@ bool is_prefill_phase(const CommonAttentionMetadata &prepared) {
 }
 
 #ifdef ENABLE_CUDNN_API
-struct CudnnPagedPlan {
-#ifdef ENABLE_CUDNN_FRONTEND
-    std::shared_ptr<cudnn_frontend::graph::Graph> graph{};
-    bool graph_ready{false};
-    int64_t built_b{0};
-    int64_t built_s_q{0};
-    int32_t built_table_size{0};
-    int64_t built_max_seq_len_kv{0};
-    int64_t built_num_blocks{0};
-    int32_t built_block_size{0};
-
-    void *workspace{nullptr};
-    size_t workspace_cap{0};
-
-#endif
-
-    ~CudnnPagedPlan() {
-        if (workspace != nullptr) {
-            cudaFree(workspace);
-            workspace = nullptr;
-        }
-    }
-};
-
 constexpr int64_t Q_UID = 1;
 constexpr int64_t K_UID = 2;
 constexpr int64_t V_UID = 3;
@@ -717,19 +726,26 @@ constexpr int64_t PAGE_TABLE_K_UID = 9;
 constexpr int64_t PAGE_TABLE_V_UID = 10;
 constexpr int64_t QO_RAGGED_OFFSET_UID = 11;
 
-struct CudnnRuntimeState {
-    cudnnHandle_t handle{nullptr};
-    CudnnPagedPlan decode_plan{};
-    CudnnPagedPlan prefill_plan{};
-};
-
-static CudnnRuntimeState &cudnn_runtime_state() {
-    static thread_local CudnnRuntimeState state{};
-    return state;
-}
-
 static CudnnPagedPlan &select_cudnn_plan(CudnnRuntimeState &state, bool is_prefill) {
     return is_prefill ? state.prefill_plan : state.decode_plan;
+}
+
+static void reset_cudnn_paged_plan(CudnnPagedPlan &plan) {
+#ifdef ENABLE_CUDNN_FRONTEND
+    plan.graph.reset();
+    plan.graph_ready = false;
+    plan.built_b = 0;
+    plan.built_s_q = 0;
+    plan.built_table_size = 0;
+    plan.built_max_seq_len_kv = 0;
+    plan.built_num_blocks = 0;
+    plan.built_block_size = 0;
+#endif
+    if (plan.workspace != nullptr) {
+        cudaFree(plan.workspace);
+        plan.workspace = nullptr;
+    }
+    plan.workspace_cap = 0;
 }
 
 static bool cudnn_set_stream(cudnnHandle_t &handle, cudaStream_t stream) {
@@ -822,12 +838,13 @@ static void build_cudnn_override_tensors(bool is_prefill,
     };
 
     // Runtime q/attn_val buffers are token-major contiguous: [sum_q, nhead, head_dim].
-    // For ragged THD, both logical axes `b` and `s` advance by one token in
-    // flattened storage; offsets across requests are provided by ragged_offset.
-    // This matches cuDNN chunked-prefill examples.
-    const int64_t q_stride_b = nhead * head_dim;
+    // Keep BSHD logical strides aligned with cuDNN THD/ragged samples:
+    //   stride_b = s_q * h * d, stride_s = h * d, stride_h = d.
+    // Ragged offsets carry per-request packed starts.
+    const int64_t q_stride_token = nhead * head_dim;
+    const int64_t q_stride_b = std::max<int64_t>(1, s_q_exec) * q_stride_token;
     const int64_t q_stride_h = head_dim;
-    const int64_t q_stride_s = nhead * head_dim;
+    const int64_t q_stride_s = q_stride_token;
     push(Q_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
     push(O_UID, {b_exec, nhead, s_q_exec, head_dim}, {q_stride_b, q_stride_h, q_stride_s, 1});
 
@@ -870,9 +887,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
             need_rebuild = true;
         }
     }
-    // For dynamic-shape graphs (cuDNN >= 9.18), runtime b/s_q growth can be
-    // handled via override shapes without mandatory rebuild. Keep rebuild checks
-    // for cache geometry and paged-KV capacity semantics.
+    // Keep rebuild checks for cache geometry and paged-KV capacity semantics.
     if (!need_rebuild) {
         if (table_size > plan.built_table_size || max_seq_len_kv > plan.built_max_seq_len_kv) {
             need_rebuild = true;
@@ -925,11 +940,13 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                                   .set_data_type(fe::DataType_t::INT32));
     }
 
+    const int64_t q_stride_b = s_q_plan * nhead * head_dim;
+    const int64_t q_stride_s = nhead * head_dim;
     auto q_attrs = fe::graph::Tensor_attributes()
                        .set_name("Q")
                        .set_uid(Q_UID)
                        .set_dim({b_plan, nhead, s_q_plan, head_dim})
-                       .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
+                       .set_stride({q_stride_b, head_dim, q_stride_s, 1});
     if (qo_ragged_offset != nullptr) {
         q_attrs.set_ragged_offset(qo_ragged_offset);
     }
@@ -997,7 +1014,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     O->set_output(true)
         .set_uid(O_UID)
         .set_dim({b_plan, nhead, s_q_plan, head_dim})
-        .set_stride({nhead * head_dim, head_dim, nhead * head_dim, 1});
+        .set_stride({q_stride_b, head_dim, q_stride_s, 1});
     if (qo_ragged_offset != nullptr) {
         // Emit packed prefill output directly so runtime output layout stays
         // consistent with native path ([sum_q, nhead, head_dim]).
@@ -1121,30 +1138,35 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
     if (prepared.max_seqlen_k <= 0 || static_cast<int64_t>(prepared.max_seqlen_k) > max_seq_len_kv) {
         return false;
     }
-    // printf(
-    //     "[cudnn] decode_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
-    //     "max_seqlen_k=%d table_size=%d block_size=%d\n",
-    //     static_cast<long long>(seqlen),
-    //     static_cast<long long>(nhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(nslot),
-    //     static_cast<long long>(nkvhead),
-    //     static_cast<long long>(head_dim),
-    //     static_cast<long long>(b_exec),
-    //     static_cast<long long>(max_seq_len_q),
-    //     int(prepared.max_seqlen_k),
-    //     int(table_size),
-    //     int(block_size));
+    if (cudnn_debug_enabled()) {
+        printf(
+            "[cudnn][dbg] decode_input q=[%lld,%lld,%lld] k=[%lld,%lld,%lld] b_exec=%lld max_seqlen_q=%lld "
+            "max_seqlen_k=%d table_size=%d block_size=%d\n",
+            static_cast<long long>(seqlen),
+            static_cast<long long>(nhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(nslot),
+            static_cast<long long>(nkvhead),
+            static_cast<long long>(head_dim),
+            static_cast<long long>(b_exec),
+            static_cast<long long>(max_seq_len_q),
+            int(prepared.max_seqlen_k),
+            int(table_size),
+            int(block_size));
+    }
 
-    CudnnRuntimeState &state = cudnn_runtime_state();
+    CudnnRuntimeState *state = prepared.cudnn_state;
+    if (state == nullptr) {
+        return false;
+    }
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    if (!cudnn_set_stream(state.handle, stream)) {
+    if (!cudnn_set_stream(state->handle, stream)) {
         return false;
     }
 
-    auto &plan = select_cudnn_plan(state, /*is_prefill=*/false);
+    auto &plan = select_cudnn_plan(*state, /*is_prefill=*/false);
     if (!ensure_cudnn_plan_ready(
-            plan, state.handle, q->dtype(), false, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
+            plan, state->handle, q->dtype(), false, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
             table_size, max_seq_len_kv, block_size, scale)) {
         return false;
     }
@@ -1178,11 +1200,15 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
             override_uids,
             override_shapes,
             override_strides);
+        cudnn_debug_dump_override(override_uids, override_shapes, override_strides);
+        cudnn_debug_dump_i32("decode.seq_lens_q", prepared.cudnn_seq_lens_q, b_exec, 32);
+        cudnn_debug_dump_i32("decode.seq_lens_kv", prepared.cudnn_seq_lens_kv, b_exec, 32);
+        cudnn_debug_dump_i32("decode.page_table", prepared.cudnn_page_table, b_exec * table_size, 64);
     }
 
     auto run_decode_execute = [&]() {
         LLAISYS_NVTX_SCOPE("attn/cudnn/decode/execute");
-        return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
+        return plan.graph->execute(state->handle, variant_pack, plan.workspace, override_uids, override_shapes,
                                    override_strides);
     };
     auto exec_status = run_decode_execute();
@@ -1190,7 +1216,7 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
         // Dynamic-shape execution may fail for a plan that was built with a
         // smaller template. Force a one-shot rebuild and retry once.
         if (ensure_cudnn_plan_ready(plan,
-                                    state.handle,
+                                    state->handle,
                                     q->dtype(),
                                     false,
                                     b_exec,
@@ -1304,15 +1330,18 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
             int(block_size));
     }
 
-    CudnnRuntimeState &state = cudnn_runtime_state();
+    CudnnRuntimeState *state = prepared.cudnn_state;
+    if (state == nullptr) {
+        return false;
+    }
     auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    if (!cudnn_set_stream(state.handle, stream)) {
+    if (!cudnn_set_stream(state->handle, stream)) {
         return false;
     }
 
-    auto &plan = select_cudnn_plan(state, /*is_prefill=*/true);
+    auto &plan = select_cudnn_plan(*state, /*is_prefill=*/true);
     if (!ensure_cudnn_plan_ready(
-            plan, state.handle, q->dtype(), true, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
+            plan, state->handle, q->dtype(), true, b_exec, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
             table_size, max_seq_len_kv, block_size, scale)) {
         return false;
     }
@@ -1356,7 +1385,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
 
     auto run_prefill_execute = [&]() {
         LLAISYS_NVTX_SCOPE("attn/cudnn/prefill/execute");
-        return plan.graph->execute(state.handle, variant_pack, plan.workspace, override_uids, override_shapes,
+        return plan.graph->execute(state->handle, variant_pack, plan.workspace, override_uids, override_shapes,
                                    override_strides);
     };
     auto exec_status = run_prefill_execute();
@@ -1364,7 +1393,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
         // Dynamic-shape execution may fail for a plan that was built with a
         // smaller template. Force a one-shot rebuild and retry once.
         if (ensure_cudnn_plan_ready(plan,
-                                    state.handle,
+                                    state->handle,
                                     q->dtype(),
                                     true,
                                     b_exec,
@@ -1454,129 +1483,6 @@ void reshape_and_cache(tensor_t k_cache,
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(k_src->dtype());
     }
-}
-
-__global__ void build_slot_mapping_kernel(int32_t *slot_mapping_out,
-                                          int32_t ntoken,
-                                          int32_t nseq,
-                                          const int32_t *query_start_loc,
-                                          const int32_t *seq_lens,
-                                          const int32_t *block_tables,
-                                          int32_t block_table_width,
-                                          int32_t block_size) {
-    const int32_t t = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (t < 0 || t >= ntoken) {
-        return;
-    }
-
-    int32_t lo = 0;
-    int32_t hi = nseq;
-    while (lo < hi) {
-        const int32_t mid = lo + ((hi - lo) >> 1);
-        if (query_start_loc[mid + 1] <= t) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    const int32_t row = lo;
-    if (row < 0 || row >= nseq) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-
-    const int32_t row_start = query_start_loc[row];
-    const int32_t row_end = query_start_loc[row + 1];
-    const int32_t row_scheduled = row_end - row_start;
-    if (row_scheduled <= 0) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-    const int32_t local = t - row_start;
-    if (local < 0 || local >= row_scheduled) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-
-    const int32_t seq_len = seq_lens[row];
-    const int32_t qpos = (seq_len - row_scheduled) + local;
-    if (qpos < 0) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-    const int32_t bidx = qpos / block_size;
-    const int32_t boff = qpos % block_size;
-    if (bidx < 0 || bidx >= block_table_width) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-    const int32_t bid = block_tables[row * block_table_width + bidx];
-    if (bid < 0) {
-        slot_mapping_out[t] = -1;
-        return;
-    }
-    slot_mapping_out[t] = bid * block_size + boff;
-}
-
-__global__ void build_query_start_loc_and_seq_lens_kernel(int32_t *query_start_loc_out,
-                                                           int32_t *seq_lens_out,
-                                                           int32_t nseq,
-                                                           const int32_t *req_num_scheduled_tokens,
-                                                           const int32_t *req_num_computed_tokens) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
-        return;
-    }
-    int32_t acc = 0;
-    query_start_loc_out[0] = 0;
-    for (int32_t i = 0; i < nseq; ++i) {
-        const int32_t n_scheduled = req_num_scheduled_tokens[i];
-        const int32_t n_computed = req_num_computed_tokens[i];
-        acc += n_scheduled;
-        query_start_loc_out[i + 1] = acc;
-        seq_lens_out[i] = n_scheduled + n_computed;
-    }
-}
-
-void build_query_start_loc_and_seq_lens(tensor_t query_start_loc,
-                                        tensor_t seq_lens,
-                                        tensor_t req_num_scheduled_tokens,
-                                        tensor_t req_num_computed_tokens) {
-    CHECK_ARGUMENT(query_start_loc != nullptr && seq_lens != nullptr && req_num_scheduled_tokens != nullptr &&
-                       req_num_computed_tokens != nullptr,
-                   "build_query_start_loc_and_seq_lens: tensors must be non-null");
-    CHECK_ARGUMENT(query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA && seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA &&
-                       req_num_scheduled_tokens->deviceType() == LLAISYS_DEVICE_NVIDIA &&
-                       req_num_computed_tokens->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "build_query_start_loc_and_seq_lens: tensors must be CUDA");
-    CHECK_ARGUMENT(query_start_loc->dtype() == LLAISYS_DTYPE_I32 && seq_lens->dtype() == LLAISYS_DTYPE_I32 &&
-                       req_num_scheduled_tokens->dtype() == LLAISYS_DTYPE_I32 &&
-                       req_num_computed_tokens->dtype() == LLAISYS_DTYPE_I32,
-                   "build_query_start_loc_and_seq_lens: tensors must be I32");
-    CHECK_ARGUMENT(query_start_loc->ndim() == 1 && seq_lens->ndim() == 1 && req_num_scheduled_tokens->ndim() == 1 &&
-                       req_num_computed_tokens->ndim() == 1,
-                   "build_query_start_loc_and_seq_lens: tensors must be 1D");
-    CHECK_ARGUMENT(query_start_loc->isContiguous() && seq_lens->isContiguous() && req_num_scheduled_tokens->isContiguous() &&
-                       req_num_computed_tokens->isContiguous(),
-                   "build_query_start_loc_and_seq_lens: tensors must be contiguous");
-
-    const int32_t nseq = static_cast<int32_t>(req_num_scheduled_tokens->shape()[0]);
-    CHECK_ARGUMENT(nseq >= 0, "build_query_start_loc_and_seq_lens: invalid nseq");
-    CHECK_ARGUMENT(req_num_computed_tokens->shape()[0] == static_cast<size_t>(nseq),
-                   "build_query_start_loc_and_seq_lens: req_num_computed_tokens size mismatch");
-    CHECK_ARGUMENT(seq_lens->shape()[0] == static_cast<size_t>(nseq),
-                   "build_query_start_loc_and_seq_lens: seq_lens size mismatch");
-    CHECK_ARGUMENT(query_start_loc->shape()[0] == static_cast<size_t>(nseq + 1),
-                   "build_query_start_loc_and_seq_lens: query_start_loc size mismatch");
-
-    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    build_query_start_loc_and_seq_lens_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<int32_t *>(query_start_loc->data()),
-                                                                    reinterpret_cast<int32_t *>(seq_lens->data()),
-                                                                    nseq,
-                                                                    reinterpret_cast<const int32_t *>(
-                                                                        req_num_scheduled_tokens->data()),
-                                                                    reinterpret_cast<const int32_t *>(
-                                                                        req_num_computed_tokens->data()));
-    LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
 __global__ void build_block_positions_kernel(int64_t *pos_ids_out,
@@ -1689,50 +1595,6 @@ void build_last_token_logits_indices(tensor_t logits_indices,
         reinterpret_cast<int64_t *>(logits_indices->data()),
         nseq,
         reinterpret_cast<const int32_t *>(query_start_loc->data()));
-    LLAISYS_CUDA_CHECK(cudaGetLastError());
-}
-
-void build_slot_mapping(tensor_t slot_mapping,
-                        tensor_t query_start_loc,
-                        tensor_t seq_lens,
-                        tensor_t block_tables,
-                        int32_t block_table_width,
-                        int32_t block_size) {
-    CHECK_ARGUMENT(slot_mapping != nullptr && query_start_loc != nullptr && seq_lens != nullptr && block_tables != nullptr,
-                   "build_slot_mapping: metadata tensors must be non-null");
-    CHECK_ARGUMENT(slot_mapping->deviceType() == LLAISYS_DEVICE_NVIDIA && query_start_loc->deviceType() == LLAISYS_DEVICE_NVIDIA &&
-                       seq_lens->deviceType() == LLAISYS_DEVICE_NVIDIA && block_tables->deviceType() == LLAISYS_DEVICE_NVIDIA,
-                   "build_slot_mapping: tensors must be CUDA");
-    CHECK_ARGUMENT(slot_mapping->dtype() == LLAISYS_DTYPE_I32 && query_start_loc->dtype() == LLAISYS_DTYPE_I32 &&
-                       seq_lens->dtype() == LLAISYS_DTYPE_I32 && block_tables->dtype() == LLAISYS_DTYPE_I32,
-                   "build_slot_mapping: tensors must be I32");
-    CHECK_ARGUMENT(slot_mapping->ndim() == 1 && query_start_loc->ndim() == 1 && seq_lens->ndim() == 1 && block_tables->ndim() == 1,
-                   "build_slot_mapping: tensors must be 1D");
-    CHECK_ARGUMENT(slot_mapping->isContiguous() && query_start_loc->isContiguous() && seq_lens->isContiguous() &&
-                       block_tables->isContiguous(),
-                   "build_slot_mapping: tensors must be contiguous");
-    CHECK_ARGUMENT(block_table_width > 0 && block_size > 0, "build_slot_mapping: block params must be > 0");
-    CHECK_ARGUMENT(query_start_loc->shape()[0] == seq_lens->shape()[0] + 1,
-                   "build_slot_mapping: query_start_loc size mismatch");
-    CHECK_ARGUMENT(block_tables->shape()[0] == seq_lens->shape()[0] * static_cast<size_t>(block_table_width),
-                   "build_slot_mapping: block_tables size mismatch");
-
-    const int32_t ntoken = static_cast<int32_t>(slot_mapping->shape()[0]);
-    const int32_t nseq = static_cast<int32_t>(seq_lens->shape()[0]);
-    if (ntoken <= 0 || nseq <= 0) {
-        return;
-    }
-    constexpr int32_t kBlock = 256;
-    const int32_t grid = (ntoken + kBlock - 1) / kBlock;
-    auto stream = reinterpret_cast<cudaStream_t>(llaisys::core::context().runtime().stream());
-    build_slot_mapping_kernel<<<grid, kBlock, 0, stream>>>(reinterpret_cast<int32_t *>(slot_mapping->data()),
-                                                            ntoken,
-                                                            nseq,
-                                                            reinterpret_cast<const int32_t *>(query_start_loc->data()),
-                                                            reinterpret_cast<const int32_t *>(seq_lens->data()),
-                                                            reinterpret_cast<const int32_t *>(block_tables->data()),
-                                                            block_table_width,
-                                                            block_size);
     LLAISYS_CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1904,12 +1766,39 @@ void self_attention_paged(tensor_t attn_val,
         nullptr,
         nullptr,
         nullptr,
+        nullptr,
         0,
         static_cast<int32_t>(cu_seqlens_q->shape()[0]) - 1,
         max_seqlen_q,
         max_seqlen_k,
         (max_seqlen_q == 1 ? AttentionPhase::DECODE : AttentionPhase::PREFILL)};
     self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
+}
+
+CudnnRuntimeState *create_cudnn_runtime_state() {
+#ifdef ENABLE_CUDNN_API
+    auto *state = new (std::nothrow) CudnnRuntimeState();
+    return state;
+#else
+    return nullptr;
+#endif
+}
+
+void destroy_cudnn_runtime_state(CudnnRuntimeState *state) {
+#ifdef ENABLE_CUDNN_API
+    if (state == nullptr) {
+        return;
+    }
+    reset_cudnn_paged_plan(state->decode_plan);
+    reset_cudnn_paged_plan(state->prefill_plan);
+    if (state->handle != nullptr) {
+        cudnnDestroy(state->handle);
+        state->handle = nullptr;
+    }
+    delete state;
+#else
+    (void)state;
+#endif
 }
 
 } // namespace llaisys::ops::cuda

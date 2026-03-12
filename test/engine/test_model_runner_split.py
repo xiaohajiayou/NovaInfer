@@ -76,7 +76,8 @@ def test_sample_tokens_cpu_gpu_runner_semantics_match():
     gpu_runner.sampler = _FakeSampler([11, 22])
     gpu_runner._device = llaisys.DeviceType.NVIDIA
     gpu_runner._runtime_api = _FakeRuntimeAPI()
-    gpu_runner._get_runtime_compute_stream = lambda _device_id: object()
+    gpu_runner._compute_streams = {}
+    gpu_runner._get_compute_stream = lambda _device_id: object()
     gpu_runner._get_sampler_done_event = lambda _device_id: object()
     gpu_runner._get_d2h_stream = lambda _device_id: object()
 

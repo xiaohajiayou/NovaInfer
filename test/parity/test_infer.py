@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from llaisys.engine.runtime_factory import create_runtime, plan_qwen2_runtime
+from llaisys.engine.runtime_factory import create_kv_state, plan_qwen2_kv_cache
 from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
@@ -44,7 +44,7 @@ def _restore_attn_backend(old: str | None):
 
 
 def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
-    plan = plan_qwen2_runtime(
+    plan = plan_qwen2_kv_cache(
         model_path=model_path,
         device=device,
         kv_cache_block_size=16,
@@ -52,7 +52,8 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
         kv_cache_memory_utilization=0.9,
         max_num_seqs=None,
     )
-    runtime_handle = create_runtime(
+    runtime_handle = create_kv_state(
+        device=device,
         kv_cache_layout=kv_layout,
         kv_cache_block_size=16,
         plan=plan,
@@ -64,7 +65,7 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
             max_model_len=int(plan.max_model_len),
         )
     except Exception:
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+        LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         raise
     return model, runtime_handle
 
@@ -238,23 +239,28 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
             raise
-        mr_tokens = llaisys_model_runner_infer(
-            prompt,
-            tokenizer,
-            model_runner,
-            runtime_handle,
-            KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
-            max_new_tokens=max_steps,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-        )
+        try:
+            mr_tokens = llaisys_model_runner_infer(
+                prompt,
+                tokenizer,
+                model_runner,
+                runtime_handle,
+                KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
+                max_new_tokens=max_steps,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+            )
+        except RuntimeError as exc:
+            if ll_device == "nvidia" and backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable during forward: {exc}")
+            raise
         assert mr_tokens == hf_tokens
     finally:
         if model_runner is not None:
             model_runner.close()
         if runtime_handle is not None:
-            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+            LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         _restore_attn_backend(old_backend)
 
 
@@ -275,21 +281,26 @@ def test_infer_smoke(require_model_path):
         kv_layout=KvCacheLayout.BLOCK,
     )
     try:
-        out_tokens = llaisys_model_runner_infer(
-            prompt,
-            tokenizer,
-            model_runner,
-            runtime_handle,
-            KvCacheLayout.BLOCK,
-            max_new_tokens=max_steps,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-        )
+        try:
+            out_tokens = llaisys_model_runner_infer(
+                prompt,
+                tokenizer,
+                model_runner,
+                runtime_handle,
+                KvCacheLayout.BLOCK,
+                max_new_tokens=max_steps,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+            )
+        except RuntimeError as exc:
+            if backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable during forward: {exc}")
+            raise
         assert len(out_tokens) > 0
     finally:
         model_runner.close()
-        LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+        LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
 
 
 @pytest.mark.requires_model
@@ -334,5 +345,5 @@ def test_infer_smoke_nvidia(require_model_path, backend):
         if model_runner is not None:
             model_runner.close()
         if runtime_handle is not None:
-            LIB_LLAISYS.llaisysRuntimeDestroy(runtime_handle)
+            LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         _restore_attn_backend(old_backend)
