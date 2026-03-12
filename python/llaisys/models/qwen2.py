@@ -173,8 +173,15 @@ def _decode_safetensor_array(raw_u8: np.ndarray, dtype_code: str, shape: Tuple[i
         )
 
     if dtype_code == "BF16":
-        # Preserve BF16 payload bits; Tensor(BF16) consumes raw 16-bit lanes.
-        base = raw_u8.view(np.uint16)
+        # BF16 payload is raw 16-bit lanes. Decode by bit pattern, never numeric-cast from uint16.
+        base_u16 = raw_u8.view(np.uint16).reshape(shape)
+        if target_dtype == np.dtype(np.uint16):
+            return _as_contiguous(base_u16, target_dtype)
+        if _BF16_DTYPE is not None and target_dtype == _BF16_DTYPE:
+            return _as_contiguous(base_u16.view(_BF16_DTYPE), target_dtype)
+        # Exact BF16 -> FP32 conversion via bit expansion.
+        as_f32 = (base_u16.astype(np.uint32) << 16).view(np.float32)
+        return _as_contiguous(as_f32, target_dtype)
     else:
         base_dtype = _SAFE_DTYPE_TO_NUMPY.get(dtype_code)
         if base_dtype is None:
