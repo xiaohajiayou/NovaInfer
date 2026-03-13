@@ -32,17 +32,12 @@ __C {
         int64_t peak_used_tokens;
     };
 
-    typedef enum AttentionMode {
-        ATTENTION_MODE_BLOCK = 1,
-    } AttentionMode;
-
     typedef enum AttentionPhase {
         ATTENTION_PHASE_PREFILL = 0,
         ATTENTION_PHASE_DECODE = 1,
     } AttentionPhase;
 
     struct AttentionMetadata {
-        int32_t mode; // AttentionMode
         int32_t phase; // AttentionPhase
         llaisysTensor_t cu_seqlens_q;    // [n_batch_seq + 1], i32, BLOCK required
         llaisysTensor_t cu_seqlens_k;    // [n_batch_seq + 1], i32, BLOCK required

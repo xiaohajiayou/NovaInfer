@@ -12,11 +12,6 @@ namespace {
 using KvStatus = llaisys::runtime::kv_cache::KvStatus;
 using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
 
-bool attention_mode_supported(llaisysDeviceType_t device_type, int32_t mode) {
-    (void)device_type;
-    return mode == ATTENTION_MODE_BLOCK;
-}
-
 bool attention_phase_valid(int32_t phase) {
     return phase == ATTENTION_PHASE_PREFILL || phase == ATTENTION_PHASE_DECODE;
 }
@@ -432,7 +427,7 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
             };
             const auto backend =
                 attn_state.use_cudnn_backend ? paged_attn_backend_ : ops::cuda::PagedAttentionBackend::NATIVE;
-            ops::cuda::dispatch_attention_with_backend(
+            ops::cuda::self_attention_paged_with_backend(
                 attn_out,
                 rope_q,
                 layer_k_cache,
@@ -614,17 +609,8 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             return fail("ntoken mismatch");
         }
 
-        if (input.attention.mode != ATTENTION_MODE_BLOCK) {
-            return fail("invalid attention mode");
-        }
         if (!attention_phase_valid(input.attention.phase)) {
             return fail("invalid attention phase");
-        }
-        if (!attention_mode_supported(device_type_, input.attention.mode)) {
-            return fail("attention mode unsupported");
-        }
-        if (input.attention.mode != ATTENTION_MODE_BLOCK) {
-            return fail("attention mode != kv layout");
         }
 
         if (input.logits_indices == nullptr || input.logits_indices->tensor == nullptr) {

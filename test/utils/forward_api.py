@@ -11,7 +11,6 @@ from llaisys.engine.sampler import Sampler
 from llaisys.libllaisys import LIB_LLAISYS, DataType, DeviceType
 from llaisys.libllaisys.model import (
     AttentionMetadata,
-    AttentionMode,
     AttentionPhase,
     LlaisysModelCreateParams,
     LlaisysKvStateCreateParams,
@@ -20,7 +19,7 @@ from llaisys.libllaisys.model import (
     ModelType,
 )
 from llaisys.libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
-from llaisys.tensor import Tensor
+from llaisys.bindings.tensor import Tensor
 
 from .batch_builders import BatchBuildResult
 
@@ -238,7 +237,6 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
     output_ids = [i for i, m in enumerate(batch.logits_mask) if int(m) != 0]
     output_ids_t = _make_tensor_1d(output_ids, DataType.I64, device)
     attn = AttentionMetadata()
-    attn.mode = int(batch.mode)
     attn.phase = int(AttentionPhase.PREFILL)
     attn.cu_seqlens_q = None
     attn.cu_seqlens_k = None
@@ -253,7 +251,7 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
     attn.cudnn_qo_ragged_offset = None
     attn.cudnn_b_exec = 0
 
-    if not batch.invalid and int(batch.mode) == int(AttentionMode.BLOCK):
+    if not batch.invalid:
         if (
             batch.req_num_scheduled_tokens is None
             or batch.req_num_computed_tokens is None

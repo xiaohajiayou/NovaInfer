@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from llaisys.libllaisys.model import AttentionMode
-
-
 SeqIdLike = int | Sequence[int]
 
 
@@ -22,7 +19,6 @@ class BatchBuildResult:
     logits_mask: list[int]
     seq_ids: list[int]
     pos_values: list[int]
-    mode: AttentionMode
     req_num_scheduled_tokens: list[int] | None = None
     req_num_computed_tokens: list[int] | None = None
     block_tables: list[int] | None = None
@@ -82,7 +78,6 @@ def build_decode_batch(
     if pos_ids is not None and len(pos_ids) != n:
         raise ValueError("pos_ids length mismatch")
 
-    mode = AttentionMode.BLOCK
     token_values = [int(t) for t in token_ids]
     logits_values = [int(x) for x in logits_mask] if logits_mask is not None else ([0] * max(0, n - 1) + [1])
 
@@ -103,7 +98,6 @@ def build_decode_batch(
             logits_mask=logits_values,
             seq_ids=seq_single,
             pos_values=pos_values,
-            mode=mode,
             invalid=True,
         )
 
@@ -145,7 +139,6 @@ def build_decode_batch(
         logits_mask=logits_values,
         seq_ids=seq_single,
         pos_values=pos_values,
-        mode=mode,
         req_num_scheduled_tokens=req_num_scheduled_tokens,
         req_num_computed_tokens=req_num_computed_tokens,
         block_tables=block_tables,

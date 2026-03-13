@@ -5,7 +5,7 @@ from typing import Optional, Sequence
 
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType
 from ..libllaisys.model import SamplerInput, SamplerOutput
-from ..tensor import Tensor
+from ..bindings.tensor import Tensor
 from .config import EngineConfig
 
 

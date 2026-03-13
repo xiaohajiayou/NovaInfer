@@ -14,9 +14,6 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
-class AttentionMode(IntEnum):
-    BLOCK = 1
-
 class AttentionPhase(IntEnum):
     PREFILL = 0
     DECODE = 1
@@ -49,7 +46,6 @@ class LlaisysKvStats(Structure):
 
 class AttentionMetadata(Structure):
     _fields_ = [
-        ("mode", c_int32),
         ("phase", c_int32),
         ("cu_seqlens_q", llaisysTensor_t),
         ("cu_seqlens_k", llaisysTensor_t),
@@ -153,7 +149,6 @@ __all__ = [
     "llaisysModel_t",
     "llaisysKvState_t",
     "ModelType",
-    "AttentionMode",
     "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysKvStateCreateParams",

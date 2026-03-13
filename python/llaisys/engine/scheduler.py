@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from .block_manager import BlockManager, BlockManagerStats
 from .config import EngineConfig
 from .sequence import Sequence, SequenceStatus

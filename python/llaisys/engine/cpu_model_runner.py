@@ -5,7 +5,7 @@ from .config import EngineConfig
 from .gpu_model_runner import GPUModelRunner, PreparedTensors
 from .model_registry import ModelRegistry
 from ..libllaisys import DataType, DeviceType
-from ..tensor import Tensor
+from ..bindings.tensor import Tensor
 
 
 class CPUModelRunner(GPUModelRunner):

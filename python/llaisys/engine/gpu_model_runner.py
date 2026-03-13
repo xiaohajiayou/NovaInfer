@@ -11,18 +11,17 @@ from .config import EngineConfig
 from .model_registry import ModelRegistry, create_default_registry
 from .sampler import Sampler
 from .scheduler import SchedulerOutputs
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType, llaisysDeviceType_t
 from ..libllaisys.model import (
     AttentionMetadata,
-    AttentionMode,
     AttentionPhase,
     LlaisysKvStats,
     ModelForwardInput,
     ModelForwardOutput,
 )
-from ..runtime import RuntimeAPI
-from ..tensor import Tensor
+from ..bindings.runtime import RuntimeAPI
+from ..bindings.tensor import Tensor
 
 Buffer = Tensor | CpuGpuBuffer
 ExecuteState = tuple[Tensor, int, list[Tensor], list[float], list[float], list[int], list[int], list[int]]
@@ -49,6 +48,45 @@ class PreparedTensors:
     cudnn_page_table: Tensor | None = None
     cudnn_qo_ragged_offset: Tensor | None = None
     cudnn_b_exec: int = 0
+
+
+@dataclass
+class CommonPreparedTensors:
+    input_ids: Tensor
+    pos_ids: Tensor
+    logits_indices: Tensor
+    n_outputs: int
+    keepalive: list[Tensor]
+
+
+@dataclass
+class BlockTablesTensor:
+    block_tables: Tensor
+    block_table_width: int
+    keepalive: list[Tensor]
+
+
+@dataclass
+class NativeBlockMeta:
+    cu_seqlens_q: Tensor
+    cu_seqlens_k: Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    slot_mapping: Tensor
+    keepalive: list[Tensor]
+
+
+@dataclass
+class CudnnBlockMeta:
+    slot_mapping: Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    cudnn_seq_lens_q: Tensor
+    cudnn_seq_lens_kv: Tensor
+    cudnn_page_table: Tensor
+    cudnn_qo_ragged_offset: Tensor | None
+    cudnn_b_exec: int
+    keepalive: list[Tensor]
 
 
 class GPUModelRunner:
@@ -184,7 +222,6 @@ class GPUModelRunner:
 
             with nvtx_range("py/runner/execute_model/build_forward_io"):
                 attn = AttentionMetadata()
-                attn.mode = c_int32(int(AttentionMode.BLOCK))
                 attn.phase = c_int32(int(prepared.phase))
                 attn.cu_seqlens_q = (
                     prepared.cu_seqlens_q.lib_tensor() if prepared.cu_seqlens_q is not None else None
@@ -498,7 +535,7 @@ class GPUModelRunner:
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
-    ) -> tuple[PreparedTensors, object]:
+    ) -> tuple[CommonPreparedTensors, object]:
         ntoken = int(len(input_ids))
         n_outputs = int(len(seqs))
         if ntoken > self._max_num_tokens:
@@ -537,7 +574,7 @@ class GPUModelRunner:
             logits_indices_t.copy_(logits_indices_host_t, non_blocking=True, stream=h2d_stream)
         keepalive.append(logits_indices_t)
 
-        prepared = PreparedTensors(
+        prepared = CommonPreparedTensors(
             input_ids=input_ids_t,
             pos_ids=pos_ids_t,
             logits_indices=logits_indices_t,
@@ -554,7 +591,7 @@ class GPUModelRunner:
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
-    ) -> tuple[PreparedTensors, object]:
+    ) -> tuple[CommonPreparedTensors, object]:
         return self._build_common_io_tensors(
             seqs=seqs,
             input_ids=input_ids,
@@ -565,13 +602,12 @@ class GPUModelRunner:
     def _stage_block_tables_tensor(
         self,
         *,
-        prepared: PreparedTensors,
         seqs: list,
         block_table_rows: list[list[int]],
         block_table_width: int,
         h2d_stream,
         incremental_update: bool = False,
-    ) -> None:
+    ) -> BlockTablesTensor:
         n_outputs = int(len(seqs))
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
@@ -610,15 +646,18 @@ class GPUModelRunner:
                 dev_row_t.copy_(host_row_t, non_blocking=True, stream=h2d_stream)
             self._decode_block_table_cache = block_rows_np.copy()
 
-        prepared.keepalive.append(block_tables_t)
-        prepared.block_tables = block_tables_t
-        prepared.block_table_width = int(block_table_width)
+        return BlockTablesTensor(
+            block_tables=block_tables_t,
+            block_table_width=int(block_table_width),
+            keepalive=[block_tables_t],
+        )
 
     def _build_block_native_meta(
         self,
         *,
-        prepared: PreparedTensors,
         seqs: list,
+        ntoken: int,
+        block_tables: Tensor,
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
         max_seqlen_q: int,
@@ -626,8 +665,7 @@ class GPUModelRunner:
         slot_mapping: list[int],
         block_table_width: int,
         h2d_stream,
-    ) -> None:
-        ntoken = int(prepared.input_ids.shape()[0])
+    ) -> NativeBlockMeta:
         if len(cu_seqlens_q) != len(seqs) + 1:
             raise RuntimeError("cu_seqlens_q size mismatch")
         if len(cu_seqlens_k) != len(seqs) + 1:
@@ -638,7 +676,7 @@ class GPUModelRunner:
             raise RuntimeError("slot_mapping size mismatch")
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
-        if prepared.block_tables is None or int(prepared.block_table_width) != int(block_table_width):
+        if block_tables is None:
             raise RuntimeError("block_tables must be staged before native metadata build")
 
         assert self._cu_seqlens_q_buf is not None
@@ -665,19 +703,21 @@ class GPUModelRunner:
         cu_seqlens_k_t.copy_(cu_seqlens_k_host_t, non_blocking=True, stream=h2d_stream)
         slot_mapping_t.copy_(slot_mapping_host_t, non_blocking=True, stream=h2d_stream)
 
-        prepared.keepalive.extend([cu_seqlens_q_t, cu_seqlens_k_t, slot_mapping_t])
-        prepared.cu_seqlens_q = cu_seqlens_q_t
-        prepared.cu_seqlens_k = cu_seqlens_k_t
-        prepared.max_seqlen_q = int(max_seqlen_q)
-        prepared.max_seqlen_k = int(max_seqlen_k)
-        prepared.slot_mapping = slot_mapping_t
-        prepared.block_table_width = int(block_table_width)
+        return NativeBlockMeta(
+            cu_seqlens_q=cu_seqlens_q_t,
+            cu_seqlens_k=cu_seqlens_k_t,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            slot_mapping=slot_mapping_t,
+            keepalive=[cu_seqlens_q_t, cu_seqlens_k_t, slot_mapping_t],
+        )
 
     def _build_block_cudnn_meta(
         self,
         *,
-        prepared: PreparedTensors,
         attention_phase: int,
+        ntoken: int,
+        block_tables: Tensor,
         slot_mapping: list[int],
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
@@ -686,11 +726,10 @@ class GPUModelRunner:
         max_seqlen_k: int,
         block_table_width: int,
         h2d_stream,
-    ) -> None:
-        ntoken = int(prepared.input_ids.shape()[0])
+    ) -> CudnnBlockMeta:
         if len(slot_mapping) != ntoken:
             raise RuntimeError("slot_mapping size mismatch")
-        if prepared.block_tables is None or int(prepared.block_table_width) != int(block_table_width):
+        if block_tables is None:
             raise RuntimeError("block_tables must be staged before cudnn metadata build")
 
         assert self._slot_mapping_buf is not None
@@ -748,23 +787,25 @@ class GPUModelRunner:
         cudnn_seq_lens_kv_t.copy_(cudnn_seq_lens_kv_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_page_table_t.copy_(cudnn_page_table_host_t, non_blocking=True, stream=h2d_stream)
 
-        prepared.keepalive.extend([slot_mapping_t, cudnn_seq_lens_q_t, cudnn_seq_lens_kv_t, cudnn_page_table_t])
-        prepared.slot_mapping = slot_mapping_t
-        prepared.max_seqlen_q = int(max_seqlen_q)
-        prepared.max_seqlen_k = int(max_seqlen_k)
-        prepared.block_table_width = int(block_table_width)
-        prepared.cudnn_seq_lens_q = cudnn_seq_lens_q_t
-        prepared.cudnn_seq_lens_kv = cudnn_seq_lens_kv_t
-        prepared.cudnn_page_table = cudnn_page_table_t
-        prepared.cudnn_qo_ragged_offset = None
+        keepalive = [slot_mapping_t, cudnn_seq_lens_q_t, cudnn_seq_lens_kv_t, cudnn_page_table_t]
+        ragged_t = None
         if qo_ragged_offsets is not None:
             ragged_host_t = self._cudnn_qo_ragged_offset_buf.cpu.slice(0, 0, int(b_exec) + 1)
             ragged_t = self._cudnn_qo_ragged_offset_buf.gpu.slice(0, 0, int(b_exec) + 1)
             ragged_host_t.copy_from_numpy(qo_ragged_offsets)
             ragged_t.copy_(ragged_host_t, non_blocking=True, stream=h2d_stream)
-            prepared.keepalive.append(ragged_t)
-            prepared.cudnn_qo_ragged_offset = ragged_t
-        prepared.cudnn_b_exec = int(b_exec)
+            keepalive.append(ragged_t)
+        return CudnnBlockMeta(
+            slot_mapping=slot_mapping_t,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            cudnn_seq_lens_q=cudnn_seq_lens_q_t,
+            cudnn_seq_lens_kv=cudnn_seq_lens_kv_t,
+            cudnn_page_table=cudnn_page_table_t,
+            cudnn_qo_ragged_offset=ragged_t,
+            cudnn_b_exec=int(b_exec),
+            keepalive=keepalive,
+        )
 
     def _build_block_tensors(
         self,
@@ -785,15 +826,14 @@ class GPUModelRunner:
     ) -> PreparedTensors:
         with nvtx_range("py/runner/prepare_inputs/block/build"):
             # Stage input/position/logits copies first so DMA can overlap with metadata construction.
-            prepared, h2d_stream = self._build_block_common_tensors(
+            common, h2d_stream = self._build_block_common_tensors(
                 seqs=seqs,
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
             )
             # Stage block table upload early for the same reason.
-            self._stage_block_tables_tensor(
-                prepared=prepared,
+            block_tables = self._stage_block_tables_tensor(
                 seqs=seqs,
                 block_table_rows=block_table_rows,
                 block_table_width=int(block_table_width),
@@ -802,9 +842,10 @@ class GPUModelRunner:
             )
             if self._use_cudnn_block_builder():
                 with nvtx_range("py/runner/prepare_inputs/block/cudnn_meta"):
-                    self._build_block_cudnn_meta(
-                        prepared=prepared,
+                    cudnn_meta = self._build_block_cudnn_meta(
                         attention_phase=int(attention_phase),
+                        ntoken=int(common.input_ids.shape()[0]),
+                        block_tables=block_tables.block_tables,
                         slot_mapping=slot_mapping,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
@@ -814,11 +855,29 @@ class GPUModelRunner:
                         block_table_width=int(block_table_width),
                         h2d_stream=h2d_stream,
                     )
+                prepared = PreparedTensors(
+                    input_ids=common.input_ids,
+                    pos_ids=common.pos_ids,
+                    logits_indices=common.logits_indices,
+                    n_outputs=common.n_outputs,
+                    keepalive=common.keepalive + block_tables.keepalive + cudnn_meta.keepalive,
+                    block_tables=block_tables.block_tables,
+                    block_table_width=block_tables.block_table_width,
+                    max_seqlen_q=cudnn_meta.max_seqlen_q,
+                    max_seqlen_k=cudnn_meta.max_seqlen_k,
+                    slot_mapping=cudnn_meta.slot_mapping,
+                    cudnn_seq_lens_q=cudnn_meta.cudnn_seq_lens_q,
+                    cudnn_seq_lens_kv=cudnn_meta.cudnn_seq_lens_kv,
+                    cudnn_page_table=cudnn_meta.cudnn_page_table,
+                    cudnn_qo_ragged_offset=cudnn_meta.cudnn_qo_ragged_offset,
+                    cudnn_b_exec=cudnn_meta.cudnn_b_exec,
+                )
             else:
                 with nvtx_range("py/runner/prepare_inputs/block/native_meta"):
-                    self._build_block_native_meta(
-                        prepared=prepared,
+                    native_meta = self._build_block_native_meta(
                         seqs=seqs,
+                        ntoken=int(common.input_ids.shape()[0]),
+                        block_tables=block_tables.block_tables,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=int(max_seqlen_q),
@@ -827,6 +886,20 @@ class GPUModelRunner:
                         block_table_width=int(block_table_width),
                         h2d_stream=h2d_stream,
                     )
+                prepared = PreparedTensors(
+                    input_ids=common.input_ids,
+                    pos_ids=common.pos_ids,
+                    logits_indices=common.logits_indices,
+                    n_outputs=common.n_outputs,
+                    keepalive=common.keepalive + block_tables.keepalive + native_meta.keepalive,
+                    cu_seqlens_q=native_meta.cu_seqlens_q,
+                    cu_seqlens_k=native_meta.cu_seqlens_k,
+                    max_seqlen_q=native_meta.max_seqlen_q,
+                    max_seqlen_k=native_meta.max_seqlen_k,
+                    slot_mapping=native_meta.slot_mapping,
+                    block_tables=block_tables.block_tables,
+                    block_table_width=block_tables.block_table_width,
+                )
             return prepared
 
     def prepare_prefill(

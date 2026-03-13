@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Dict, Sequence
 
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from .config import EngineConfig
 from .executor import Executor
 from .model_registry import ModelRegistry

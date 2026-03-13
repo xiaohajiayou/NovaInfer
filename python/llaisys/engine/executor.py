@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from .scheduler import SchedulerOutputs
 from .worker import Worker
 

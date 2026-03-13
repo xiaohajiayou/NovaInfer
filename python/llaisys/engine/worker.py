@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from ..libllaisys import DeviceType
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from .config import EngineConfig
 from .cpu_model_runner import CPUModelRunner
 from .gpu_model_runner import GPUModelRunner
