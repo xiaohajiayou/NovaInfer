@@ -213,6 +213,38 @@ Notes:
 - `xmake install` is required so Python loads the latest library from `python/llaisys/libllaisys/`.
 - cuDNN frontend headers are vendored under `third_party/cudnn_frontend/include`.
 
+### 1.1 Experimental MetaX / MXMACA Build
+
+Environment:
+
+```bash
+export CUDA_PATH=/path/to/cu-bridge
+# or: export MACA_PATH=/path/to/maca
+# optional if cucc is not already on PATH:
+export CUCC_PATH=/path/to/cucc/bin
+```
+
+Build:
+
+```bash
+xmake f --mode=release --mx-gpu=y
+xmake -j8
+xmake install
+```
+
+Runtime:
+
+```bash
+export LLAISYS_METAX_CUDA_COMPAT=1
+export LLAISYS_CUDA_PAGED_ATTN_BACKEND=native
+```
+
+Current scope:
+
+- only the native CUDA-compatible path is in scope
+- `cudnn` backend is intentionally unsupported on MetaX compatibility path and will fail fast
+- migration notes: `doc/metax_cuda_compat_migration_plan_2026-03.md`
+
 ### 2. Install Python package
 
 ```bash

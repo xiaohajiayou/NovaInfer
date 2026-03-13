@@ -1699,6 +1699,10 @@ void dispatch_attention_with_backend(tensor_t attn_val,
     const bool is_decode = is_decode_phase(prepared);
     const bool is_prefill = is_prefill_phase(prepared);
     CHECK_ARGUMENT(is_decode || is_prefill, "dispatch_attention_with_backend: invalid attention phase");
+#ifdef ENABLE_METAX_CUDA_COMPAT
+    CHECK_ARGUMENT(backend != PagedAttentionBackend::CUDNN,
+                   "self_attention_paged: CUDNN backend is disabled for MetaX CUDA compatibility path; use native backend");
+#endif
     if (backend == PagedAttentionBackend::CUDNN) {
         CHECK_ARGUMENT(prepared.cudnn_seq_lens_q != nullptr && prepared.cudnn_seq_lens_kv != nullptr &&
                            prepared.cudnn_page_table != nullptr && prepared.cudnn_b_exec > 0,

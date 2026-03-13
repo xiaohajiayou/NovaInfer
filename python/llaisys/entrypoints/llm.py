@@ -58,6 +58,8 @@ class LLM:
         kv_cache_block_size: int,
     ) -> None:
         # Auto-derive cuDNN prebuild bucket from scheduler shape limits.
+        if str(os.getenv("LLAISYS_METAX_CUDA_COMPAT", "")).strip().lower() in ("1", "true", "yes", "on"):
+            return
         backend = os.environ.get("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "").strip().lower()
         if backend != "cudnn":
             return

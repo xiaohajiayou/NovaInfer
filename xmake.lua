@@ -19,9 +19,21 @@ option("nv-cudnn")
     set_description("Whether to enable cuDNN backend integration for Nvidia GPU")
 option_end()
 
+option("mx-gpu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile implementations for MetaX MXMACA/cu-bridge GPU compatibility path")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+if has_config("mx-gpu") then
+    add_defines("ENABLE_NVIDIA_API")
+    add_defines("ENABLE_METAX_CUDA_COMPAT")
+    includes("xmake/metax.lua")
 end
 
 target("llaisys-utils")
