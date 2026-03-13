@@ -12,19 +12,33 @@ class InputProcessor:
         self._model_path = model_path
         self._tokenizer = None
         self._tokenizer_lock = threading.Lock()
+        self._tokenizer_failed = False
 
     def _get_tokenizer(self):
         if self._model_path is None:
             return None
+        if self._tokenizer_failed:
+            return None
         if self._tokenizer is not None:
             return self._tokenizer
         with self._tokenizer_lock:
+            if self._tokenizer_failed:
+                return None
             if self._tokenizer is None:
                 try:
                     from transformers import AutoTokenizer  # type: ignore
                 except Exception:
-                    from transformers.models.auto.tokenization_auto import AutoTokenizer  # type: ignore
-                self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
+                    try:
+                        from transformers.models.auto.tokenization_auto import AutoTokenizer  # type: ignore
+                    except Exception:
+                        self._tokenizer_failed = True
+                        return None
+                try:
+                    self._tokenizer = AutoTokenizer.from_pretrained(self._model_path, trust_remote_code=True)
+                except Exception as exc:
+                    self._tokenizer_failed = True
+                    print(f"[warn] input_processor: tokenizer unavailable, decode fallback enabled: {exc}")
+                    return None
         return self._tokenizer
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str | None:
@@ -48,4 +62,3 @@ class InputProcessor:
             tokenize=False,
         )
         return [int(t) for t in tok.encode(text, add_special_tokens=False)]
-
