@@ -1,12 +1,12 @@
 #include "paged_kv.hpp"
 
-#include "../../../utils/check.hpp"
+#include "../../utils/check.hpp"
 
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
-namespace llaisys::runtime::kv_cache {
+namespace llaisys::kv_cache {
 
 BlockPool::BlockPool(size_t num_blocks) : num_blocks_(num_blocks) {
     CHECK_ARGUMENT(num_blocks_ > 0, "block_pool: num_blocks must be > 0");
@@ -590,4 +590,4 @@ bool PagedKvImpl::build_attention_plan_csr(const std::vector<std::vector<int64_t
     return true;
 }
 
-} // namespace llaisys::runtime::kv_cache
+} // namespace llaisys::kv_cache

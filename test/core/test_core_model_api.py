@@ -51,20 +51,10 @@ def test_model_create_forward_sampler_and_runtime_kv_api():
             # CPU sampler path is still under refactor in stage-1.
             assert "samplerSample failed" in str(exc)
 
-        keep0 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(0)))
-        keep1 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(1)))
-        assert keep0 == 5
-        assert keep1 == 5
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
-
-        rm_status = int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(0), c_int64(2), c_int64(3)))
-        assert rm_status == 5
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
         assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
 
         free_status = int(LIB_LLAISYS.llaisysKvStateRequestFree(runtime, c_int64(0)))
         assert free_status == 2
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
 
         stats = LlaisysKvStats()
         stats_rc = int(LIB_LLAISYS.llaisysKvStateStats(runtime, byref(stats)))

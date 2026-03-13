@@ -1,6 +1,6 @@
 #include "qwen2_model.hpp"
 #include "llaisys/models/model.h"
-#include "../runtime/kv_cache/paged_kv.hpp"
+#include "../kv_cache/paged_kv.hpp"
 #include "../../core/llaisys_core.hpp"
 #include <cctype>
 #include <cstdlib>
@@ -9,23 +9,10 @@ namespace llaisys::models::qwen2 {
 
 namespace {
 
-using KvStatus = llaisys::runtime::kv_cache::KvStatus;
-using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
+using KvStatus = llaisys::kv_cache::KvStatus;
 
 bool attention_phase_valid(int32_t phase) {
     return phase == ATTENTION_PHASE_PREFILL || phase == ATTENTION_PHASE_DECODE;
-}
-
-tensor_t kv_layer_k_from_cache(KvCacheBase *cache, size_t layer) {
-    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
-    CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
-    return impl->layer_k(layer);
-}
-
-tensor_t kv_layer_v_from_cache(KvCacheBase *cache, size_t layer) {
-    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
-    CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
-    return impl->layer_v(layer);
 }
 
 #ifdef ENABLE_NVIDIA_API
@@ -129,7 +116,7 @@ void Qwen2Model::init_weight_slots_() {
 void Qwen2Model::init_runtime_state_() {
     const size_t max_model_len = runtime_.max_model_len > 0 ? runtime_.max_model_len : static_cast<size_t>(meta_.maxseq);
     const size_t kv_capacity = runtime_.kv_cache_capacity_tokens > 0 ? runtime_.kv_cache_capacity_tokens : max_model_len;
-    runtime_.kv_cache = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
+    runtime_.kv_cache = std::make_unique<kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
     runtime_.kv_cache->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
     runtime_.kv_peak_used_tokens = 0;
 }
@@ -279,7 +266,7 @@ void Qwen2Model::ensure_workspace_(size_t ntoken) {
     if (!workspace_) {
         const size_t kv_capacity =
             runtime_.kv_cache_capacity_tokens > 0 ? runtime_.kv_cache_capacity_tokens : meta_.maxseq;
-        workspace_ = std::make_unique<runtime::workspace::Qwen2Workspace>(
+        workspace_ = std::make_unique<workspace::Qwen2Workspace>(
             meta_.hs,
             meta_.nh,
             meta_.nkvh,
@@ -376,8 +363,9 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
         ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
     }
 
-    tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), layer);
-    tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), layer);
+    CHECK_ARGUMENT(runtime_.kv_cache != nullptr, "Qwen2: kv_cache is not initialized");
+    tensor_t layer_k_cache = runtime_.kv_cache->layer_k(layer);
+    tensor_t layer_v_cache = runtime_.kv_cache->layer_v(layer);
     CHECK_ARGUMENT(attn_state.slot_mapping != nullptr, "Qwen2: missing slot_mapping");
     {
         LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
@@ -728,12 +716,12 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
 
 tensor_t Qwen2Model::kv_layer_k(size_t layer) const {
     ASSERT(runtime_.kv_cache != nullptr, "Qwen2: kv_cache is null");
-    return kv_layer_k_from_cache(runtime_.kv_cache.get(), layer);
+    return runtime_.kv_cache->layer_k(layer);
 }
 
 tensor_t Qwen2Model::kv_layer_v(size_t layer) const {
     ASSERT(runtime_.kv_cache != nullptr, "Qwen2: kv_cache is null");
-    return kv_layer_v_from_cache(runtime_.kv_cache.get(), layer);
+    return runtime_.kv_cache->layer_v(layer);
 }
 
 void Qwen2Model::destroy_weights_() {
@@ -756,7 +744,7 @@ void Qwen2Model::destroy_weights_() {
         slots.push_back(&weights_.mlp_up_w[i]);
         slots.push_back(&weights_.mlp_down_w[i]);
     }
-    runtime::weights::destroy_unique(slots);
+    weights::destroy_unique(slots);
 }
 
 } // namespace llaisys::models::qwen2

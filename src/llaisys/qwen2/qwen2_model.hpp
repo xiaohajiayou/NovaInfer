@@ -4,9 +4,10 @@
 #include "llaisys/runtime/infer_types.h"
 
 #include "../llaisys_tensor.hpp"
-#include "../runtime/kv_cache/kv_cache.hpp"
-#include "../runtime/workspace/workspace.hpp"
-#include "../runtime/weights/weights.hpp"
+#include "../kv_cache/kv_cache.hpp"
+#include "../kv_cache/paged_kv.hpp"
+#include "../workspace/workspace.hpp"
+#include "../weights/weights.hpp"
 
 #include "../../ops/add/op.hpp"
 #include "../../ops/argmax/op.hpp"
@@ -59,8 +60,8 @@ public:
     bool bind_kv_state_handle(const void *kv_state_handle) noexcept;
     int32_t forward(const ::ModelForwardInput &input, ::ModelForwardOutput *output);
     tensor_t step_logits() const noexcept { return step_logits_; }
-    runtime::kv_cache::KvCacheBase *kv_cache() noexcept { return runtime_.kv_cache.get(); }
-    const runtime::kv_cache::KvCacheBase *kv_cache() const noexcept { return runtime_.kv_cache.get(); }
+    kv_cache::PagedKvImpl *kv_cache() noexcept { return runtime_.kv_cache.get(); }
+    const kv_cache::PagedKvImpl *kv_cache() const noexcept { return runtime_.kv_cache.get(); }
     size_t kv_cache_capacity_tokens() const noexcept { return runtime_.kv_cache_capacity_tokens; }
     int64_t kv_peak_used_tokens() const noexcept { return runtime_.kv_peak_used_tokens; }
     void set_kv_peak_used_tokens(int64_t value) noexcept { runtime_.kv_peak_used_tokens = value; }
@@ -75,7 +76,7 @@ private:
         size_t kv_block_size{16};
         size_t max_model_len{0};
         size_t kv_cache_capacity_tokens{0};
-        std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache{};
+        std::unique_ptr<kv_cache::PagedKvImpl> kv_cache{};
         mutable int64_t kv_peak_used_tokens{0};
     };
 
@@ -87,7 +88,7 @@ private:
     bool validated_{false};
 
     RuntimeState runtime_{};
-    runtime::workspace::qwen2_workspace_t workspace_{};
+    workspace::qwen2_workspace_t workspace_{};
     tensor_t step_logits_{};
 
     // Zero biases used when the source weights do not provide a bias tensor.

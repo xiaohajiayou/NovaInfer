@@ -1,7 +1,4 @@
-from ctypes import c_int64
-
 import llaisys
-from llaisys.libllaisys import LIB_LLAISYS
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 from test.utils.forward_api import TinyMeta, create_tiny_qwen2_model, destroy_model_runtime, run_model_forward
 
@@ -52,8 +49,6 @@ def test_multi_seq_interleaved_decode():
             block_state=block_state,
         )
         assert out1.status == 0
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == -1
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == -1
         assert out1.output_ids == [0, 1, 2, 3]
 
         out2 = _forward(
@@ -66,8 +61,6 @@ def test_multi_seq_interleaved_decode():
             block_state=block_state,
         )
         assert out2.status == 0
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(100))) == -1
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(200))) == -1
     finally:
         destroy_model_runtime(model, runtime)
 

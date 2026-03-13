@@ -1,12 +1,12 @@
 #pragma once
 
-#include "../../../tensor/tensor.hpp"
+#include "../../tensor/tensor.hpp"
 
 #include <cstddef>
 #include <memory>
 #include <vector>
 
-namespace llaisys::runtime::workspace {
+namespace llaisys::workspace {
 
 // Materialized tensor views sliced from workspace arenas for one decode step.
 struct Qwen2WorkspaceView {
@@ -178,4 +178,4 @@ private:
 
 using qwen2_workspace_t = std::unique_ptr<Qwen2Workspace>;
 
-} // namespace llaisys::runtime::workspace
+} // namespace llaisys::workspace

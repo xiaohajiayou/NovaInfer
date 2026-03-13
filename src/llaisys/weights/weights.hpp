@@ -4,7 +4,7 @@
 
 #include <vector>
 
-namespace llaisys::runtime::weights {
+namespace llaisys::weights {
 
 // Replace one weight slot safely:
 // - same handle: no-op
@@ -17,4 +17,4 @@ void replace_slot(llaisysTensor_t *slot, llaisysTensor_t new_handle);
 // slots: list of slot pointers; each slot is nulled after processing.
 void destroy_unique(const std::vector<llaisysTensor_t *> &slots);
 
-} // namespace llaisys::runtime::weights
+} // namespace llaisys::weights

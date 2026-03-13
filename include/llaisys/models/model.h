@@ -112,18 +112,13 @@ __C {
     __export int32_t llaisysSamplerSample(const struct SamplerInput *input,
                                           struct SamplerOutput *output);
 
-    // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):
+    // KV status (mirrors kv_cache::KvStatus; exported as int in C API):
     // 0: OK
     // 1: OOM_KV
     // 2: INVALID_SEQ
     // 3: INVALID_POS
     // 4: EMPTY_RANGE
     // 5: INTERNAL_ERROR
-    __export int llaisysKvStateSeqCp(struct LlaisysKvState *kv_state, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1);
-    __export int llaisysKvStateSeqRm(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1);
-    __export int llaisysKvStateSeqAdd(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta);
-    __export int llaisysKvStateSeqKeep(struct LlaisysKvState *kv_state, int64_t seq_id);
-    __export int64_t llaisysKvStateSeqPosMax(struct LlaisysKvState *kv_state, int64_t seq_id);
     // Free all KV entries that belong to one request/sequence id.
     // Return code follows KV status mapping above.
     __export int llaisysKvStateRequestFree(struct LlaisysKvState *kv_state, int64_t seq_id);

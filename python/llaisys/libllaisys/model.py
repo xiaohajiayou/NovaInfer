@@ -121,21 +121,6 @@ def load_model(lib):
     lib.llaisysSamplerSample.argtypes = [POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
 
-    lib.llaisysKvStateSeqCp.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqCp.restype = c_int
-
-    lib.llaisysKvStateSeqRm.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqRm.restype = c_int
-
-    lib.llaisysKvStateSeqAdd.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqAdd.restype = c_int
-
-    lib.llaisysKvStateSeqKeep.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqKeep.restype = c_int
-
-    lib.llaisysKvStateSeqPosMax.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqPosMax.restype = c_int64
-
     lib.llaisysKvStateRequestFree.argtypes = [llaisysKvState_t, c_int64]
     lib.llaisysKvStateRequestFree.restype = c_int
 
