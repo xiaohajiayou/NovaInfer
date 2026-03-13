@@ -17,6 +17,28 @@ from .qwen2 import load_qwen2
 from .model import load_model
 
 
+def _preload_cudnn_from_env() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    cudnn_home = str(os.getenv("CUDNN_HOME", "")).strip()
+    if not cudnn_home:
+        return
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    base = Path(cudnn_home)
+    candidates = (
+        base / "lib" / "libcudnn.so.9",
+        base / "lib" / "libcudnn.so",
+        base / "lib64" / "libcudnn.so.9",
+        base / "lib64" / "libcudnn.so",
+    )
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        ctypes.CDLL(str(cand), mode=mode)
+        return
+    raise FileNotFoundError(f"libcudnn.so not found under CUDNN_HOME={cudnn_home}")
+
+
 def _preload_nccl_from_python_env() -> None:
     if not sys.platform.startswith("linux"):
         return
@@ -58,6 +80,7 @@ def load_shared_library():
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
 
+    _preload_cudnn_from_env()
     _preload_nccl_from_python_env()
     return ctypes.CDLL(str(lib_path))
 

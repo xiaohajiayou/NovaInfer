@@ -2124,3 +2124,70 @@ Smoke-2（中负载）：
 
 1. `102 passed, 9 skipped`
 2. 注意：测试环境需把 PyTorch NCCL 放在 `LD_LIBRARY_PATH` 最前，避免 `ncclCommWindowRegister` 符号冲突。
+
+### 13.16.12 复验状态（2026-03-13，最终构建口径校正）
+
+本节记录 2026-03-13 晚上的重新验收。重点不是再改 TP 算法，而是把“运行口径”纠正到真正可比较的状态。
+
+#### 13.16.12.1 本轮定位出的两个环境坑
+
+1. 吞吐异常低的主要原因不是 TP 逻辑回归，而是 bench 命令一度遗漏了：
+- `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
+- 缺失后会回到默认后端，导致吞吐口径失真。
+
+2. Python loader 会优先命中 `.venv` 自带的 cuDNN：
+- 实测 `.venv/lib/python3.12/site-packages/nvidia/cudnn/lib/libcudnn.so.9` 版本为 `91002`
+- 这会覆盖用户期望的 `9.18.1`
+- 已修复 `python/llaisys/libllaisys/__init__.py`：先按 `CUDNN_HOME` 显式 preload cuDNN，再 preload NCCL，再加载 `libllaisys.so`
+
+3. TP 多卡构建必须显式带上 NCCL：
+- 正确构建命令：
+```bash
+xmake f -c --mode=release --nv-gpu=y --nv-cudnn=y --nv-nccl=y
+xmake -j1
+xmake install
+```
+- 若缺 `--nv-nccl=y`，`tp_size>1` 会在 warmup 阶段直接报：
+  `Qwen2 TP requires ENABLE_NCCL_API`
+
+#### 13.16.12.2 最终 HF parity 复验结果
+
+环境：
+
+1. `CUDNN_HOME=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive`
+2. `LD_LIBRARY_PATH=$CUDNN_HOME/lib:<venv nccl path>:$LD_LIBRARY_PATH`
+3. `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
+4. 构建口径：`--nv-gpu=y --nv-cudnn=y --nv-nccl=y`
+
+结果：
+
+1. `1.5B, TP=2, GPUs=5,6`：`PASS`
+2. `7B, TP=2, GPUs=5,6`：`PASS`
+3. `7B, TP=4, GPUs=1,2,5,6`：`PASS`
+
+说明：
+
+1. 本轮 parity 是在最终构建产物上复验通过，不再依赖此前残留的“旧二进制刚好可跑”状态。
+
+#### 13.16.12.3 最终吞吐矩阵（NovaInfer，复验有效口径）
+
+`1.5B`，参数：`num_seqs=256, in=[100,1024], out=[100,1024], max_num_batched_tokens=16384`
+
+1. `TP=1`（GPU5）：`8474.88 tok/s`
+2. `TP=2`（GPU5,6）：`10302.56 tok/s`（rank 平均）
+
+`7B`，参数：`num_seqs=128, in=[100,1024], out=[100,1024], max_num_batched_tokens=8192`
+
+1. `TP=1`（GPU6）：`2862.61 tok/s`
+2. `TP=2`（GPU5,6）：`3909.49 tok/s`（rank 平均）
+3. `TP=4`（GPU1,2,5,6）：`4997.47 tok/s`（rank 平均）
+
+阶段结论：
+
+1. 在正确的构建/运行口径下，`tp` 分支不存在“TP=1 明显掉速”的问题。
+2. `1.5B` 上 `TP=2` 相对 `TP=1` 约 `+21.6%`
+3. `7B` 上 `TP=2` 相对 `TP=1` 约 `+36.6%`
+4. `7B` 上 `TP=4` 相对 `TP=1` 约 `+74.6%`
+5. 因此当前主链路已经满足：
+- 正确性：HF parity 通过
+- 性能：TP 扩展后吞吐持续上升，且单卡口径不回退

@@ -7,6 +7,11 @@ from multiprocessing import get_context
 from pathlib import Path
 
 
+def _default_init_method(tag: str) -> str:
+    tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
+
+
 def _parse_device_ids(raw: str) -> tuple[int, ...] | None:
     text = str(raw or "").strip()
     if not text:
@@ -83,7 +88,7 @@ def main() -> int:
         return 1
 
     if not os.getenv("LLAISYS_TP_INIT_METHOD"):
-        os.environ["LLAISYS_TP_INIT_METHOD"] = "file:///tmp/llaisys_tp_nccl_smoke.id"
+        os.environ["LLAISYS_TP_INIT_METHOD"] = _default_init_method("tp2_nccl_smoke")
     if not os.getenv("LLAISYS_TP_SINGLE_PROCESS"):
         os.environ["LLAISYS_TP_SINGLE_PROCESS"] = "0"
 

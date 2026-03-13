@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_init_method(tag: str) -> str:
+    tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
+
+
 def _parse_csv_ints(raw: str) -> tuple[int, ...]:
     text = str(raw or "").strip()
     if not text:
@@ -160,7 +165,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--init-method",
-        default="file:///tmp/llaisys_tp_nccl_parity.id",
+        default="",
         type=str,
     )
     args = parser.parse_args()
@@ -172,9 +177,10 @@ def main() -> int:
     device_ids = _parse_csv_ints(args.tensor_parallel_device_ids)
     device_ids_opt = device_ids if len(device_ids) > 0 else None
 
+    init_method = str(args.init_method).strip() or _default_init_method("tp_nccl_parity")
     os.environ.setdefault("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "cudnn")
     os.environ.setdefault("LLAISYS_TP_SINGLE_PROCESS", "0")
-    os.environ["LLAISYS_TP_INIT_METHOD"] = str(args.init_method)
+    os.environ["LLAISYS_TP_INIT_METHOD"] = init_method
 
     print(f"[tp_hf_parity] hf_generate start prompts={len(prompts)}")
     prompt_token_ids = _encode_prompts_for_llm(str(args.model_path), prompts)

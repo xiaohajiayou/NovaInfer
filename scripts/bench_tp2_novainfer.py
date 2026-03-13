@@ -8,6 +8,11 @@ import tempfile
 from pathlib import Path
 
 
+def _default_init_method(tag: str) -> str:
+    tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
+
+
 def _tail(path: Path, n: int = 40) -> str:
     try:
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -45,7 +50,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--init-method",
-        default="file:///tmp/llaisys_tp_nccl_bench.id",
+        default="",
         type=str,
         help="TP init method shared by both ranks.",
     )
@@ -89,11 +94,12 @@ def main() -> int:
         str(args.tensor_parallel_device_ids),
     ]
 
+    init_method = str(args.init_method).strip() or _default_init_method("tp2_nccl_bench")
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
     env.setdefault("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "cudnn")
     env.setdefault("LLAISYS_TP_SINGLE_PROCESS", "0")
-    env["LLAISYS_TP_INIT_METHOD"] = str(args.init_method)
+    env["LLAISYS_TP_INIT_METHOD"] = init_method
 
     root = Path(tempfile.mkdtemp(prefix="tp2_bench_"))
     r0_log = root / "rank0.log"
