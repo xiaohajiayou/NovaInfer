@@ -4,9 +4,10 @@
 #include "llaisys/runtime/infer_types.h"
 
 #include "../llaisys_tensor.hpp"
-#include "../runtime/kv_cache/kv_cache.hpp"
-#include "../runtime/workspace/workspace.hpp"
-#include "../runtime/weights/weights.hpp"
+#include "../kv_cache/kv_cache.hpp"
+#include "../kv_cache/paged_kv.hpp"
+#include "../workspace/workspace.hpp"
+#include "../weights/weights.hpp"
 
 #include "../../ops/add/op.hpp"
 #include "../../ops/argmax/op.hpp"
@@ -47,8 +48,7 @@ public:
                int ndevice);
     ~Qwen2Model();
 
-    int configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
-                          size_t kv_block_size,
+    int configure_runtime(size_t kv_block_size,
                           size_t kv_cache_capacity_tokens,
                           int64_t max_model_len);
 
@@ -60,9 +60,8 @@ public:
     bool bind_kv_state_handle(const void *kv_state_handle) noexcept;
     int32_t forward(const ::ModelForwardInput &input, ::ModelForwardOutput *output);
     tensor_t step_logits() const noexcept { return step_logits_; }
-    runtime::kv_cache::KvCacheBase *kv_cache() noexcept { return runtime_.kv_cache.get(); }
-    const runtime::kv_cache::KvCacheBase *kv_cache() const noexcept { return runtime_.kv_cache.get(); }
-    runtime::kv_cache::KvCacheLayout kv_layout() const noexcept { return runtime_.kv_layout; }
+    kv_cache::PagedKvImpl *kv_cache() noexcept { return runtime_.kv_cache.get(); }
+    const kv_cache::PagedKvImpl *kv_cache() const noexcept { return runtime_.kv_cache.get(); }
     size_t kv_cache_capacity_tokens() const noexcept { return runtime_.kv_cache_capacity_tokens; }
     int64_t kv_peak_used_tokens() const noexcept { return runtime_.kv_peak_used_tokens; }
     void set_kv_peak_used_tokens(int64_t value) noexcept { runtime_.kv_peak_used_tokens = value; }
@@ -74,11 +73,10 @@ public:
 
 private:
     struct RuntimeState {
-        runtime::kv_cache::KvCacheLayout kv_layout{runtime::kv_cache::KvCacheLayout::BLOCK};
         size_t kv_block_size{16};
         size_t max_model_len{0};
         size_t kv_cache_capacity_tokens{0};
-        std::unique_ptr<runtime::kv_cache::KvCacheBase> kv_cache{};
+        std::unique_ptr<kv_cache::PagedKvImpl> kv_cache{};
         mutable int64_t kv_peak_used_tokens{0};
     };
 
@@ -90,7 +88,7 @@ private:
     bool validated_{false};
 
     RuntimeState runtime_{};
-    runtime::workspace::qwen2_workspace_t workspace_{};
+    workspace::qwen2_workspace_t workspace_{};
     tensor_t step_logits_{};
 
     // Zero biases used when the source weights do not provide a bias tensor.
@@ -126,7 +124,6 @@ private:
         tensor_t cudnn_page_table{};
         tensor_t cudnn_qo_ragged_offset{};
         int32_t cudnn_b_exec{0};
-        std::vector<int32_t> slot_idxs{};
         std::vector<int32_t> used_slots{};
     };
 
@@ -138,20 +135,11 @@ private:
     tensor_t slice_tokens_(const tensor_t &t, size_t len) const;
     tensor_t view_2d_to_3d_(const tensor_t &t, size_t len, size_t nhead, size_t dim) const;
 
-    int32_t prepare_slot_attention_state_(size_t ntoken,
-                                          const tensor_t &seq_ids_t,
-                                          const tensor_t &pos_ids_host_t,
-                                          AttentionExecState *state);
     int32_t validate_and_bind_block_attention_state_(const ::AttentionMetadata &attn,
                                                      size_t ntoken,
                                                      AttentionExecState *state);
     void copy_token_into_cache_(tensor_t &cache, int32_t slot, const tensor_t &src, size_t token_idx);
     tensor_t gather_cache_by_slots_(const tensor_t &cache, const std::vector<int32_t> &slots, size_t len, const tensor_t &buffer);
-    tensor_t run_slot_attention_layer_(size_t layer,
-                                       size_t ntoken,
-                                       const tensor_t &attn_normed,
-                                       const tensor_t &pos_ids,
-                                       const AttentionExecState &attn_state);
     tensor_t run_block_attention_layer_(size_t layer,
                                         size_t ntoken,
                                         const tensor_t &attn_normed,

@@ -6,7 +6,6 @@ import time
 import pytest
 
 from llaisys.engine.types import SamplingParams
-from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.openai_server import (
     OpenAIServer,
@@ -24,7 +23,7 @@ class DummyRunner(DummyModelRunner):
 
 def _make_server() -> OpenAIServer:
     engine = make_engine_with_runner(
-        DummyRunner(max_seq_len=64, end_token_id=4, kv_cache_layout=KvCacheLayout.BLOCK)
+        DummyRunner(max_seq_len=64, end_token_id=4)
     )
     async_engine = AsyncLLMEngine(engine=engine)
     return OpenAIServer(async_engine)

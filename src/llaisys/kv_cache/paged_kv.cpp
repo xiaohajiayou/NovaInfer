@@ -1,12 +1,12 @@
 #include "paged_kv.hpp"
 
-#include "../../../utils/check.hpp"
+#include "../../utils/check.hpp"
 
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
-namespace llaisys::runtime::kv_cache {
+namespace llaisys::kv_cache {
 
 BlockPool::BlockPool(size_t num_blocks) : num_blocks_(num_blocks) {
     CHECK_ARGUMENT(num_blocks_ > 0, "block_pool: num_blocks must be > 0");
@@ -266,7 +266,7 @@ KvStatus PagedKvImpl::allocate_slots_(const KvUBatch &ub,
                 if (block_id < 0) {
                     std::vector<int32_t> alloc;
                     if (!state->pool.alloc_n(1, &alloc) || alloc.empty()) {
-                        return KvStatus::OOM_SLOT;
+                        return KvStatus::OOM_KV;
                     }
                     block_id = alloc[0];
                 } else {
@@ -456,43 +456,6 @@ void PagedKvImpl::used_slots(std::vector<int32_t> *out) const {
     out->erase(std::unique(out->begin(), out->end()), out->end());
 }
 
-bool PagedKvImpl::slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const {
-    if (slot < 0 || seq_ids == nullptr || n_seq_id <= 0) {
-        return false;
-    }
-    const int32_t block_id = static_cast<int32_t>(static_cast<size_t>(slot) / block_size_);
-    const int32_t block_off = static_cast<int32_t>(static_cast<size_t>(slot) % block_size_);
-
-    for (int32_t i = 0; i < n_seq_id; ++i) {
-        const int64_t sid = seq_ids[i];
-        auto it_table = block_tables_.find(sid);
-        if (it_table == block_tables_.end() || !it_table->second) {
-            continue;
-        }
-        const auto &table = *it_table->second;
-        const int64_t pmax = table.max_pos();
-        if (pmax < 0) {
-            continue;
-        }
-        const int64_t vmax = std::min<int64_t>(pmax, qpos);
-        if (vmax < 0) {
-            continue;
-        }
-        const auto &blocks = table.block_ids();
-        const size_t max_bidx = static_cast<size_t>(vmax) / block_size_;
-        for (size_t bidx = 0; bidx <= max_bidx && bidx < blocks.size(); ++bidx) {
-            if (blocks[bidx] != block_id) {
-                continue;
-            }
-            const int64_t pos = static_cast<int64_t>(bidx * block_size_ + static_cast<size_t>(block_off));
-            if (pos <= vmax) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
 bool PagedKvImpl::build_attention_plan(const std::vector<std::vector<int64_t>> &seq_sets,
                                        const std::vector<int64_t> &qpos,
                                        std::vector<int32_t> *used_slots,
@@ -627,4 +590,4 @@ bool PagedKvImpl::build_attention_plan_csr(const std::vector<std::vector<int64_t
     return true;
 }
 
-} // namespace llaisys::runtime::kv_cache
+} // namespace llaisys::kv_cache

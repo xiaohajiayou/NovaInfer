@@ -1,10 +1,10 @@
 #include "weights.hpp"
 
-#include "../../../utils/check.hpp"
+#include "../../utils/check.hpp"
 
 #include <unordered_set>
 
-namespace llaisys::runtime::weights {
+namespace llaisys::weights {
 
 void replace_slot(llaisysTensor_t *slot, llaisysTensor_t new_handle) {
     CHECK_ARGUMENT(slot != nullptr, "weights: slot must not be null");
@@ -35,4 +35,4 @@ void destroy_unique(const std::vector<llaisysTensor_t *> &slots) {
     }
 }
 
-} // namespace llaisys::runtime::weights
+} // namespace llaisys::weights

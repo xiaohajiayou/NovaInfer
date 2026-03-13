@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-from llaisys.libllaisys.model import KvCacheLayout
 from llaisys.server.async_engine import AsyncLLMEngine
 from llaisys.server.openai_server import OpenAIServer
 from llaisys.server.schemas import ChatCompletionRequest, ChatMessage
@@ -16,7 +15,7 @@ class DummyRunner(DummyModelRunner):
 
 def _make_server() -> OpenAIServer:
     engine = make_engine_with_runner(
-        DummyRunner(max_seq_len=64, end_token_id=7, kv_cache_layout=KvCacheLayout.BLOCK)
+        DummyRunner(max_seq_len=64, end_token_id=7)
     )
     async_engine = AsyncLLMEngine(engine=engine)
     return OpenAIServer(async_engine)

@@ -3,9 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from llaisys.libllaisys.model import KvCacheLayout
-
-
 SeqIdLike = int | Sequence[int]
 
 
@@ -22,7 +19,6 @@ class BatchBuildResult:
     logits_mask: list[int]
     seq_ids: list[int]
     pos_values: list[int]
-    mode: KvCacheLayout
     req_num_scheduled_tokens: list[int] | None = None
     req_num_computed_tokens: list[int] | None = None
     block_tables: list[int] | None = None
@@ -69,7 +65,6 @@ def build_decode_batch(
     logits_mask: Sequence[int] | None = None,
     seq_ids: Sequence[SeqIdLike] | None = None,
     pos_ids: Sequence[int] | None = None,
-    layout: KvCacheLayout | int = KvCacheLayout.SLOT,
     block_size: int = 16,
     block_state: BlockBatchState | None = None,
     default_seq_id: int = 0,
@@ -83,8 +78,6 @@ def build_decode_batch(
     if pos_ids is not None and len(pos_ids) != n:
         raise ValueError("pos_ids length mismatch")
 
-    is_block = int(layout) == int(KvCacheLayout.BLOCK)
-    mode = KvCacheLayout.BLOCK if is_block else KvCacheLayout.SLOT
     token_values = [int(t) for t in token_ids]
     logits_values = [int(x) for x in logits_mask] if logits_mask is not None else ([0] * max(0, n - 1) + [1])
 
@@ -99,26 +92,17 @@ def build_decode_batch(
     # Forward API currently expects one seq id per token.
     if any(len(row) != 1 for row in seq_rows):
         seq_single = [int(row[0]) if row else 0 for row in seq_rows]
-        pos_values = _resolve_pos_values(seq_single, pos_ids, block_state if is_block else None)
+        pos_values = _resolve_pos_values(seq_single, pos_ids, block_state)
         return BatchBuildResult(
             token_ids=token_values,
             logits_mask=logits_values,
             seq_ids=seq_single,
             pos_values=pos_values,
-            mode=mode,
             invalid=True,
         )
 
     seq_single = [row[0] for row in seq_rows]
-    pos_values = _resolve_pos_values(seq_single, pos_ids, block_state if is_block else None)
-    if not is_block:
-        return BatchBuildResult(
-            token_ids=token_values,
-            logits_mask=logits_values,
-            seq_ids=seq_single,
-            pos_values=pos_values,
-            mode=mode,
-        )
+    pos_values = _resolve_pos_values(seq_single, pos_ids, block_state)
 
     st = block_state if block_state is not None else BlockBatchState()
     bs = max(1, int(block_size))
@@ -155,7 +139,6 @@ def build_decode_batch(
         logits_mask=logits_values,
         seq_ids=seq_single,
         pos_values=pos_values,
-        mode=mode,
         req_num_scheduled_tokens=req_num_scheduled_tokens,
         req_num_computed_tokens=req_num_computed_tokens,
         block_tables=block_tables,

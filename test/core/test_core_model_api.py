@@ -4,7 +4,7 @@ from ctypes import byref, c_int64
 
 import llaisys
 from llaisys.libllaisys import LIB_LLAISYS
-from llaisys.libllaisys.model import KvCacheLayout, LlaisysKvStats, ModelType
+from llaisys.libllaisys.model import LlaisysKvStats, ModelType
 from test.utils.batch_builders import build_decode_batch
 from test.utils.forward_api import (
     TinyMeta,
@@ -15,14 +15,12 @@ from test.utils.forward_api import (
     sample_from_forward,
 )
 
-TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
 
 
 def _create_model(meta: TinyMeta = TinyMeta(maxseq=64)):
     return create_tiny_qwen2_model(
         meta,
-        layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
 
@@ -33,7 +31,6 @@ def _forward(runtime, model, token_ids: list[int], logits_mask: list[int]):
         logits_mask=logits_mask,
         seq_ids=[0] * len(token_ids),
         pos_ids=[int(i) for i in range(len(token_ids))],
-        layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
     return run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)
@@ -54,32 +51,10 @@ def test_model_create_forward_sampler_and_runtime_kv_api():
             # CPU sampler path is still under refactor in stage-1.
             assert "samplerSample failed" in str(exc)
 
-        keep0 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(0)))
-        keep1 = int(LIB_LLAISYS.llaisysKvStateSeqKeep(runtime, c_int64(1)))
-        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
-            assert keep0 == 5
-            assert keep1 == 5
-            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
-        else:
-            assert keep0 == 0
-            assert keep1 == 2
-            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == 2
-
-        rm_status = int(LIB_LLAISYS.llaisysKvStateSeqRm(runtime, c_int64(0), c_int64(2), c_int64(3)))
-        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
-            assert rm_status == 5
-            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
-            assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
-        else:
-            assert rm_status == 0
-            assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == 1
+        assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
 
         free_status = int(LIB_LLAISYS.llaisysKvStateRequestFree(runtime, c_int64(0)))
-        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
-            assert free_status == 2
-        else:
-            assert free_status == 0
-        assert int(LIB_LLAISYS.llaisysKvStateSeqPosMax(runtime, c_int64(0))) == -1
+        assert free_status == 2
 
         stats = LlaisysKvStats()
         stats_rc = int(LIB_LLAISYS.llaisysKvStateStats(runtime, byref(stats)))
@@ -99,10 +74,7 @@ def test_model_forward_reports_oom_when_exceeding_maxseq():
     try:
         token_ids = [1] * (meta.maxseq + 1)
         out = _forward(runtime, model, token_ids, [0] * meta.maxseq + [1])
-        if TEST_KV_LAYOUT == int(KvCacheLayout.BLOCK):
-            assert out.status != 0
-        else:
-            assert out.status == 1
+        assert out.status != 0
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -110,7 +82,6 @@ def test_model_forward_reports_oom_when_exceeding_maxseq():
 def test_model_forward_fails_fast_on_runtime_handle_change():
     runtime_a, model, meta = _create_model()
     runtime_b = create_runtime(
-        layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
         max_model_len=int(meta.maxseq),
         kv_capacity_tokens=int(meta.maxseq),

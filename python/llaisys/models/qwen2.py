@@ -22,7 +22,7 @@ from ..libllaisys.model import (
     ModelType,
 )
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
-from ..tensor import Tensor
+from ..bindings.tensor import Tensor
 
 
 _LAYER_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (

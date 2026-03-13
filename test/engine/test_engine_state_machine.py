@@ -4,7 +4,6 @@ from unittest.mock import patch
 from llaisys.engine.config import EngineConfig
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.types import RequestStatus, SamplingParams
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
 
 
@@ -18,7 +17,6 @@ class PrefixProbeRunner(DummyRunner):
         super().__init__(
             max_seq_len=max_seq_len,
             end_token_id=end_token_id,
-            kv_cache_layout=KvCacheLayout.BLOCK,
         )
         self.decode_calls = []
 
@@ -66,7 +64,6 @@ class KvStatsProbeRunner(DummyRunner):
         super().__init__(
             max_seq_len=max_seq_len,
             end_token_id=end_token_id,
-            kv_cache_layout=KvCacheLayout.BLOCK,
         )
         self.used_tokens = 0
         self.capacity_tokens = 128
@@ -136,11 +133,7 @@ def _make_engine(runner: DummyModelRunner, **kwargs) -> LLMEngine:
         cfg_kwargs.pop("max_batch_size", None)
     cfg_kwargs.setdefault("max_model_len", int(runner.max_seq_len))
     cfg_kwargs.setdefault("end_token_id", int(runner.end_token_id))
-    cfg_kwargs.setdefault("kv_cache_layout", KvCacheLayout(int(runner.kv_cache_layout)))
-    if (
-        KvCacheLayout(int(cfg_kwargs["kv_cache_layout"])) == KvCacheLayout.BLOCK
-        and int(cfg_kwargs.get("num_kvcache_blocks", 0) or 0) <= 0
-    ):
+    if int(cfg_kwargs.get("num_kvcache_blocks", 0) or 0) <= 0:
         block_size = max(1, int(cfg_kwargs.get("kv_cache_block_size", 256)))
         max_model_len = max(1, int(cfg_kwargs["max_model_len"]))
         cfg_kwargs["num_kvcache_blocks"] = (max_model_len + block_size - 1) // block_size
@@ -304,7 +297,6 @@ def test_prefix_attach_and_uncached_prefill_suffix():
     engine = _make_engine(
         runner,
         kv_cache_block_size=2,
-        kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
     )
 
@@ -335,7 +327,6 @@ def test_prefix_reuses_after_finished_request_freed():
     engine = _make_engine(
         runner,
         kv_cache_block_size=2,
-        kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
     )
 
@@ -363,7 +354,6 @@ def test_finished_request_releases_blocks_in_block_mode():
     engine = _make_engine(
         runner,
         kv_cache_block_size=2,
-        kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
     )
     out = engine.generate(
@@ -379,7 +369,6 @@ def test_engine_runtime_peak_watermark_is_observed_in_block_mode():
     engine = _make_engine(
         runner,
         kv_cache_block_size=2,
-        kv_cache_layout=KvCacheLayout.BLOCK,
         max_batch_size=1,
     )
     out = engine.generate(

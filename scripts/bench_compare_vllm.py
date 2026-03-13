@@ -46,7 +46,6 @@ def _run_novainfer(
     from llaisys.entrypoints.llm import LLM
     from llaisys.engine.types import SamplingParams
     from llaisys.libllaisys import DeviceType
-    from llaisys.libllaisys.model import KvCacheLayout
 
     print(f"[bench] init backend=novainfer model={model_path}")
     t_total0 = time.perf_counter()
@@ -68,7 +67,6 @@ def _run_novainfer(
         model=model_path,
         model_type="qwen2",
         device=DeviceType.NVIDIA,
-        kv_cache_layout=KvCacheLayout.BLOCK,
         kv_cache_block_size=16,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,

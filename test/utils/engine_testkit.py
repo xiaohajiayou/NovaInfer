@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 from llaisys.engine.config import EngineConfig
 from llaisys.engine.llm_engine import LLMEngine
-from llaisys.libllaisys.model import KvCacheLayout
 
 
 class InjectedWorker:
@@ -62,14 +61,7 @@ def make_engine_with_runner(runner, **kwargs) -> LLMEngine:
 
     cfg_kwargs.setdefault("max_model_len", int(getattr(runner, "max_seq_len", 4096)))
     cfg_kwargs.setdefault("end_token_id", int(getattr(runner, "end_token_id", 0)))
-    cfg_kwargs.setdefault(
-        "kv_cache_layout",
-        KvCacheLayout(int(getattr(runner, "kv_cache_layout", KvCacheLayout.BLOCK))),
-    )
-    if (
-        KvCacheLayout(int(cfg_kwargs["kv_cache_layout"])) == KvCacheLayout.BLOCK
-        and int(cfg_kwargs.get("num_kvcache_blocks", 0) or 0) <= 0
-    ):
+    if int(cfg_kwargs.get("num_kvcache_blocks", 0) or 0) <= 0:
         block_size = max(1, int(cfg_kwargs.get("kv_cache_block_size", 256)))
         max_model_len = max(1, int(cfg_kwargs["max_model_len"]))
         cfg_kwargs["num_kvcache_blocks"] = (max_model_len + block_size - 1) // block_size

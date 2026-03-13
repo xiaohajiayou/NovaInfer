@@ -4,7 +4,6 @@ import pytest
 
 from llaisys.engine.types import SamplingParams
 from llaisys.entrypoints.llm import LLM
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
 from test.utils.engine_testkit import InjectedWorker
 
@@ -18,7 +17,6 @@ def _build_llm() -> LLM:
     runner = DummyRunner(
         max_seq_len=32,
         end_token_id=5,
-        kv_cache_layout=KvCacheLayout.BLOCK,
     )
     fake_worker = InjectedWorker(runner)
     with patch("llaisys.engine.llm_engine.Worker", side_effect=lambda *args, **kwargs: fake_worker):
@@ -27,7 +25,6 @@ def _build_llm() -> LLM:
             model_type="dummy",
             max_model_len=32,
             end_token_id=5,
-            kv_cache_layout=KvCacheLayout.BLOCK,
             num_kvcache_blocks=8,
         )
     llm._encode_prompt = lambda prompt: [1, 2] if prompt == "p0" else [2, 3]

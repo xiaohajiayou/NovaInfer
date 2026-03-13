@@ -14,10 +14,6 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
-class KvCacheLayout(IntEnum):
-    SLOT = 0
-    BLOCK = 1
-
 class AttentionPhase(IntEnum):
     PREFILL = 0
     DECODE = 1
@@ -35,7 +31,6 @@ class LlaisysModelCreateParams(Structure):
 
 class LlaisysKvStateCreateParams(Structure):
     _fields_ = [
-        ("kv_cache_layout", c_int32),
         ("kv_cache_block_size", c_int32),
         ("max_model_len", c_int32),
         ("kv_cache_capacity_tokens", c_int32),
@@ -51,10 +46,7 @@ class LlaisysKvStats(Structure):
 
 class AttentionMetadata(Structure):
     _fields_ = [
-        ("mode", c_int32),
         ("phase", c_int32),
-        ("seq_ids", llaisysTensor_t),
-        ("pos_ids_host", llaisysTensor_t),
         ("cu_seqlens_q", llaisysTensor_t),
         ("cu_seqlens_k", llaisysTensor_t),
         ("max_seqlen_q", c_int32),
@@ -129,21 +121,6 @@ def load_model(lib):
     lib.llaisysSamplerSample.argtypes = [POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
 
-    lib.llaisysKvStateSeqCp.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqCp.restype = c_int
-
-    lib.llaisysKvStateSeqRm.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqRm.restype = c_int
-
-    lib.llaisysKvStateSeqAdd.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqAdd.restype = c_int
-
-    lib.llaisysKvStateSeqKeep.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqKeep.restype = c_int
-
-    lib.llaisysKvStateSeqPosMax.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqPosMax.restype = c_int64
-
     lib.llaisysKvStateRequestFree.argtypes = [llaisysKvState_t, c_int64]
     lib.llaisysKvStateRequestFree.restype = c_int
 
@@ -157,7 +134,6 @@ __all__ = [
     "llaisysModel_t",
     "llaisysKvState_t",
     "ModelType",
-    "KvCacheLayout",
     "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysKvStateCreateParams",

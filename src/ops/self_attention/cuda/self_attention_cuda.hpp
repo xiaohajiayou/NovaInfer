@@ -44,15 +44,15 @@ void reshape_and_cache(tensor_t k_cache,
                        tensor_t slot_mapping);
 
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale);
-void dispatch_attention_with_backend(tensor_t attn_val,
-                                     tensor_t q,
-                                     tensor_t k_cache,
-                                     tensor_t v_cache,
-                                     const CommonAttentionMetadata &metadata,
-                                     PagedAttentionBackend backend,
-                                     int32_t block_table_width,
-                                     int32_t block_size,
-                                     float scale);
+void self_attention_paged_with_backend(tensor_t attn_val,
+                                       tensor_t q,
+                                       tensor_t k_cache,
+                                       tensor_t v_cache,
+                                       const CommonAttentionMetadata &metadata,
+                                       PagedAttentionBackend backend,
+                                       int32_t block_table_width,
+                                       int32_t block_size,
+                                       float scale);
 void self_attention_paged(tensor_t attn_val,
                           tensor_t q,
                           tensor_t k_cache,
