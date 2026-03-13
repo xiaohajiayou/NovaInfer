@@ -15,8 +15,8 @@ from ..nvtx import nvtx_range
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType, llaisysDeviceType_t
 from ..libllaisys.model import (
     AttentionMetadata,
+    AttentionMode,
     AttentionPhase,
-    KvCacheLayout,
     LlaisysKvStats,
     ModelForwardInput,
     ModelForwardOutput,
@@ -36,10 +36,6 @@ class PreparedTensors:
     n_outputs: int
     keepalive: list[Tensor]
     phase: int = int(AttentionPhase.PREFILL)
-    # SLOT-only tensors.
-    seq_ids: Tensor | None = None
-    pos_ids_host: Tensor | None = None
-    # BLOCK-only tensors.
     cu_seqlens_q: Tensor | None = None
     cu_seqlens_k: Tensor | None = None
     max_seqlen_q: int = 0
@@ -100,31 +96,29 @@ class GPUModelRunner:
         token_shape = (self._max_num_tokens,)
         self._input_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
         self._pos_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
-        self._seq_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
         self._output_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
 
-        if int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK):
-            self._cu_seqlens_q_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
-            self._cu_seqlens_k_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
-            self._slot_mapping_buf = self._make_buffer((self._max_num_tokens,), DataType.I32, pin_memory=True)
-            self._block_tables_buf = self._make_buffer(
-                (self._max_num_reqs * self._max_block_table_width,),
-                DataType.I32,
-                pin_memory=True,
-            )
-            # CUDNN BLOCK builder uses per-exec-row metadata buffers.
-            self._cudnn_seq_lens_q_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
-            self._cudnn_seq_lens_kv_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
-            self._cudnn_page_table_buf = self._make_buffer(
-                (self._max_num_cudnn_rows * self._max_block_table_width,),
-                DataType.I32,
-                pin_memory=True,
-            )
-            self._cudnn_qo_ragged_offset_buf = self._make_buffer(
-                (self._max_num_cudnn_rows + 1,),
-                DataType.I32,
-                pin_memory=True,
-            )
+        self._cu_seqlens_q_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
+        self._cu_seqlens_k_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
+        self._slot_mapping_buf = self._make_buffer((self._max_num_tokens,), DataType.I32, pin_memory=True)
+        self._block_tables_buf = self._make_buffer(
+            (self._max_num_reqs * self._max_block_table_width,),
+            DataType.I32,
+            pin_memory=True,
+        )
+        # CUDNN BLOCK builder uses per-exec-row metadata buffers.
+        self._cudnn_seq_lens_q_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
+        self._cudnn_seq_lens_kv_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
+        self._cudnn_page_table_buf = self._make_buffer(
+            (self._max_num_cudnn_rows * self._max_block_table_width,),
+            DataType.I32,
+            pin_memory=True,
+        )
+        self._cudnn_qo_ragged_offset_buf = self._make_buffer(
+            (self._max_num_cudnn_rows + 1,),
+            DataType.I32,
+            pin_memory=True,
+        )
 
         self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, 0)
         self._execute_model_state: ExecuteState | None = None
@@ -139,7 +133,6 @@ class GPUModelRunner:
             self._model_type,
             self._model_path,
             self._device,
-            kv_cache_layout=self._config.kv_cache_layout,
             kv_cache_block_size=self._config.kv_cache_block_size,
             max_model_len=self._config.max_model_len,
             max_num_seqs=int(self._config.max_num_seqs),
@@ -150,7 +143,7 @@ class GPUModelRunner:
         self._kv_state = kv_state
         if kv_state_info:
             kv_capacity = kv_state_info.get("kv_cache_capacity_tokens")
-            if self._config.kv_cache_layout == KvCacheLayout.BLOCK and kv_capacity is not None:
+            if kv_capacity is not None:
                 self._config.num_kvcache_blocks = (
                     int(kv_capacity) + int(self._config.kv_cache_block_size) - 1
                 ) // int(self._config.kv_cache_block_size)
@@ -191,11 +184,8 @@ class GPUModelRunner:
 
             with nvtx_range("py/runner/execute_model/build_forward_io"):
                 attn = AttentionMetadata()
-                is_block = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
-                attn.mode = c_int32(int(KvCacheLayout.BLOCK if is_block else KvCacheLayout.SLOT))
+                attn.mode = c_int32(int(AttentionMode.BLOCK))
                 attn.phase = c_int32(int(prepared.phase))
-                attn.seq_ids = prepared.seq_ids.lib_tensor() if prepared.seq_ids is not None else None
-                attn.pos_ids_host = prepared.pos_ids_host.lib_tensor() if prepared.pos_ids_host is not None else None
                 attn.cu_seqlens_q = (
                     prepared.cu_seqlens_q.lib_tensor() if prepared.cu_seqlens_q is not None else None
                 )
@@ -371,7 +361,6 @@ class GPUModelRunner:
         backend = str(getattr(self, "_paged_attn_backend", "native")).strip().lower()
         return (
             device == DeviceType.NVIDIA
-            and int(cfg.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             and backend == "cudnn"
         )
 
@@ -509,7 +498,6 @@ class GPUModelRunner:
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
-        include_seq_ids: bool,
     ) -> tuple[PreparedTensors, object]:
         ntoken = int(len(input_ids))
         n_outputs = int(len(seqs))
@@ -527,21 +515,16 @@ class GPUModelRunner:
             or not isinstance(self._output_ids_buf, CpuGpuBuffer)
         ):
             raise RuntimeError("GPU block common builder requires CpuGpuBuffer tensors")
-        if include_seq_ids:
-            assert self._seq_ids_buf is not None
-            if not isinstance(self._seq_ids_buf, CpuGpuBuffer):
-                raise RuntimeError("GPU slot builder requires CpuGpuBuffer seq_ids buffer")
-
         output_rows = self._build_output_rows(scheduled_token_counts, n_outputs)
         keepalive: list[Tensor] = []
 
         input_ids_host_t = self._input_ids_buf.cpu.slice(0, 0, ntoken)
-        pos_ids_host_t = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
         input_ids_t = self._input_ids_buf.gpu.slice(0, 0, ntoken)
         pos_ids_t = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
         dev_id = int(input_ids_t.device_id())
         h2d_stream = self._get_compute_stream(dev_id)
         input_ids_host_t.copy_from_numpy(np.asarray(input_ids, dtype=np.int64))
+        pos_ids_host_t = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
         pos_ids_host_t.copy_from_numpy(np.asarray(positions, dtype=np.int64))
         input_ids_t.copy_(input_ids_host_t, non_blocking=True, stream=h2d_stream)
         pos_ids_t.copy_(pos_ids_host_t, non_blocking=True, stream=h2d_stream)
@@ -562,18 +545,6 @@ class GPUModelRunner:
             keepalive=keepalive,
         )
 
-        if include_seq_ids:
-            seq_ids_per_req = np.asarray([int(seq_obj.seq_id) for seq_obj in seqs], dtype=np.int64)
-            sched_counts = np.asarray(scheduled_token_counts, dtype=np.int64)
-            seq_token_ids = np.repeat(seq_ids_per_req, sched_counts)
-            seq_ids_host_t = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
-            seq_ids_t = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
-            seq_ids_host_t.copy_from_numpy(seq_token_ids)
-            seq_ids_t.copy_(seq_ids_host_t, non_blocking=True, stream=h2d_stream)
-            keepalive.extend([seq_ids_t, pos_ids_host_t])
-            prepared.seq_ids = seq_ids_t
-            prepared.pos_ids_host = pos_ids_host_t
-
         return prepared, h2d_stream
 
     def _build_block_common_tensors(
@@ -589,7 +560,6 @@ class GPUModelRunner:
             input_ids=input_ids,
             positions=positions,
             scheduled_token_counts=scheduled_token_counts,
-            include_seq_ids=False,
         )
 
     def _stage_block_tables_tensor(
@@ -796,24 +766,6 @@ class GPUModelRunner:
             prepared.cudnn_qo_ragged_offset = ragged_t
         prepared.cudnn_b_exec = int(b_exec)
 
-    def _build_slot_tensors(
-        self,
-        *,
-        seqs: list,
-        input_ids: list[int],
-        positions: list[int],
-        scheduled_token_counts: list[int],
-    ) -> PreparedTensors:
-        with nvtx_range("py/runner/prepare_inputs/slot/build"):
-            prepared, _ = self._build_common_io_tensors(
-                seqs=seqs,
-                input_ids=input_ids,
-                positions=positions,
-                scheduled_token_counts=scheduled_token_counts,
-                include_seq_ids=True,
-            )
-            return prepared
-
     def _build_block_tensors(
         self,
         *,
@@ -882,7 +834,6 @@ class GPUModelRunner:
         seqs: list,
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/prefill"):
-            is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             nseq = len(seqs)
             if nseq <= 0:
                 return None
@@ -917,16 +868,6 @@ class GPUModelRunner:
                 positions[row_start:row_end] = np.arange(tok_start, tok_end, dtype=np.int64)
             if len(input_ids) <= 0:
                 return None
-
-            if not is_block_layout:
-                prepared = self._build_slot_tensors(
-                    seqs=seqs,
-                    input_ids=input_ids,
-                    positions=positions,
-                    scheduled_token_counts=scheduled_token_counts,
-                )
-                prepared.phase = int(AttentionPhase.PREFILL)
-                return prepared
 
             seqlen_q = scheduled_token_counts.astype(np.int32, copy=False)
             seqlen_k = seqlens.astype(np.int32, copy=False)
@@ -992,7 +933,6 @@ class GPUModelRunner:
         seqs: list,
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/decode"):
-            is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             nseq = len(seqs)
             if nseq <= 0:
                 return None
@@ -1005,16 +945,6 @@ class GPUModelRunner:
                 positions[i] = max(0, seqlen - 1)
                 seqlens_k[i] = int(seqlen)
             scheduled_token_counts = np.ones((nseq,), dtype=np.int64)
-
-            if not is_block_layout:
-                prepared = self._build_slot_tensors(
-                    seqs=seqs,
-                    input_ids=input_ids,
-                    positions=positions,
-                    scheduled_token_counts=scheduled_token_counts,
-                )
-                prepared.phase = int(AttentionPhase.DECODE)
-                return prepared
 
             cu_seqlens_q = np.arange(nseq + 1, dtype=np.int32)
             cu_seqlens_k = np.concatenate(

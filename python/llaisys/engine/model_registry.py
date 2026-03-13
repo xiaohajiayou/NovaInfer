@@ -5,9 +5,6 @@ from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
-
-
 ModelFactory = Callable[..., object]
 KvStateFactory = Callable[..., Tuple[object, dict]]
 
@@ -61,7 +58,6 @@ def _create_qwen2(
 def _create_qwen2_kv_state(
     model_path: Path | str,
     device: DeviceType,
-    kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
     kv_cache_block_size: int = 16,
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
@@ -78,7 +74,6 @@ def _create_qwen2_kv_state(
         kv_cache_memory_utilization=kv_cache_memory_utilization,
     )
     kv_state = create_kv_state(
-        kv_cache_layout=kv_cache_layout,
         kv_cache_block_size=kv_cache_block_size,
         plan=plan,
     )

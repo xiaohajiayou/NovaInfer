@@ -1,7 +1,6 @@
 #include "qwen2_model.hpp"
 #include "llaisys/models/model.h"
 #include "../runtime/kv_cache/paged_kv.hpp"
-#include "../runtime/kv_cache/unified_kv.hpp"
 #include "../../core/llaisys_core.hpp"
 #include <cctype>
 #include <cstdlib>
@@ -11,47 +10,24 @@ namespace llaisys::models::qwen2 {
 namespace {
 
 using KvStatus = llaisys::runtime::kv_cache::KvStatus;
-using KvCacheLayout = llaisys::runtime::kv_cache::KvCacheLayout;
 using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
 
 bool attention_mode_supported(llaisysDeviceType_t device_type, int32_t mode) {
-    if (mode == ATTENTION_MODE_BLOCK) {
-        (void)device_type;
-        return true;
-    }
-    if (mode == ATTENTION_MODE_SLOT) {
-#ifdef ENABLE_NVIDIA_API
-        if (device_type == LLAISYS_DEVICE_NVIDIA) {
-            // SLOT path is currently CPU-only in this implementation.
-            return false;
-        }
-#endif
-        return true;
-    }
-    return false;
+    (void)device_type;
+    return mode == ATTENTION_MODE_BLOCK;
 }
 
 bool attention_phase_valid(int32_t phase) {
     return phase == ATTENTION_PHASE_PREFILL || phase == ATTENTION_PHASE_DECODE;
 }
 
-tensor_t kv_layer_k_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not UnifiedKvImpl");
-        return impl->layer_k(layer);
-    }
+tensor_t kv_layer_k_from_cache(KvCacheBase *cache, size_t layer) {
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
     return impl->layer_k(layer);
 }
 
-tensor_t kv_layer_v_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not UnifiedKvImpl");
-        return impl->layer_v(layer);
-    }
+tensor_t kv_layer_v_from_cache(KvCacheBase *cache, size_t layer) {
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     CHECK_ARGUMENT(impl != nullptr, "Qwen2: KvCacheBase is not PagedKvImpl");
     return impl->layer_v(layer);
@@ -158,17 +134,12 @@ void Qwen2Model::init_weight_slots_() {
 void Qwen2Model::init_runtime_state_() {
     const size_t max_model_len = runtime_.max_model_len > 0 ? runtime_.max_model_len : static_cast<size_t>(meta_.maxseq);
     const size_t kv_capacity = runtime_.kv_cache_capacity_tokens > 0 ? runtime_.kv_cache_capacity_tokens : max_model_len;
-    if (runtime_.kv_layout == runtime::kv_cache::KvCacheLayout::SLOT) {
-        runtime_.kv_cache = std::make_unique<runtime::kv_cache::UnifiedKvImpl>(kv_capacity, 1);
-    } else {
-        runtime_.kv_cache = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
-    }
+    runtime_.kv_cache = std::make_unique<runtime::kv_cache::PagedKvImpl>(kv_capacity, 1, runtime_.kv_block_size);
     runtime_.kv_cache->init_storage(meta_.nlayer, meta_.nkvh, meta_.dh, meta_.dtype, device_type_, device_id_);
     runtime_.kv_peak_used_tokens = 0;
 }
 
-int Qwen2Model::configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
-                                  size_t kv_block_size,
+int Qwen2Model::configure_runtime(size_t kv_block_size,
                                   size_t kv_cache_capacity_tokens,
                                   int64_t max_model_len) {
     if (kv_block_size == 0) {
@@ -183,7 +154,6 @@ int Qwen2Model::configure_runtime(runtime::kv_cache::KvCacheLayout kv_layout,
         return -1;
     }
 
-    runtime_.kv_layout = kv_layout;
     runtime_.kv_block_size = kv_block_size;
     runtime_.max_model_len = max_len;
     runtime_.kv_cache_capacity_tokens = kv_capacity;
@@ -377,63 +347,6 @@ tensor_t Qwen2Model::gather_cache_by_slots_(const tensor_t &cache, const std::ve
     return buffer->slice(0, 0, len);
 }
 
-tensor_t Qwen2Model::run_slot_attention_layer_(size_t layer,
-                                               size_t ntoken,
-                                               const tensor_t &attn_normed,
-                                               const tensor_t &pos_ids,
-                                               const AttentionExecState &attn_state) {
-    LLAISYS_NVTX_SCOPE("forward/attention_layer_slot");
-    const auto &ws = workspace_->view();
-    const size_t nh = meta_.nh;
-    const size_t nkvh = meta_.nkvh;
-    const size_t dh = meta_.dh;
-    const float scale = 1.0f / std::sqrt(static_cast<float>(dh));
-
-    tensor_t q_proj = slice_tokens_(ws.q_proj, ntoken);
-    tensor_t k_proj = slice_tokens_(ws.k_proj, ntoken);
-    tensor_t v_proj = slice_tokens_(ws.v_proj, ntoken);
-    {
-        LLAISYS_NVTX_SCOPE("forward/attn/qkv_proj");
-        ops::linear(q_proj, attn_normed, weights_.attn_q_w[layer]->tensor, bias_or_zero_(weights_.attn_q_b[layer], zero_bias_attn_q_));
-        ops::linear(k_proj, attn_normed, weights_.attn_k_w[layer]->tensor, bias_or_zero_(weights_.attn_k_b[layer], zero_bias_attn_k_));
-        ops::linear(v_proj, attn_normed, weights_.attn_v_w[layer]->tensor, bias_or_zero_(weights_.attn_v_b[layer], zero_bias_attn_v_));
-    }
-
-    tensor_t q_3d = view_2d_to_3d_(q_proj, ntoken, nh, dh);
-    tensor_t k_new_3d = view_2d_to_3d_(k_proj, ntoken, nkvh, dh);
-    tensor_t v_new_3d = view_2d_to_3d_(v_proj, ntoken, nkvh, dh);
-
-    tensor_t rope_q = slice_tokens_(ws.rope_q, ntoken);
-    tensor_t rope_k = slice_tokens_(ws.rope_k, ntoken);
-    {
-        LLAISYS_NVTX_SCOPE("forward/attn/rope");
-        ops::rope(rope_q, q_3d, pos_ids, meta_.theta);
-        ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
-    }
-
-    tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
-    tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
-    CHECK_ARGUMENT(attn_state.slot_idxs.size() >= ntoken, "Qwen2: slot_idxs size mismatch");
-    {
-        LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
-        for (size_t i = 0; i < ntoken; ++i) {
-            const int32_t slot = attn_state.slot_idxs[i];
-            copy_token_into_cache_(layer_k_cache, slot, rope_k, i);
-            copy_token_into_cache_(layer_v_cache, slot, v_new_3d, i);
-        }
-    }
-
-    tensor_t attn_out = slice_tokens_(ws.attn_out, ntoken);
-    const size_t kvlen = attn_state.used_slots.size();
-    tensor_t k_full = gather_cache_by_slots_(layer_k_cache, attn_state.used_slots, kvlen, ws.k_ctx);
-    tensor_t v_full = gather_cache_by_slots_(layer_v_cache, attn_state.used_slots, kvlen, ws.v_ctx);
-    {
-        LLAISYS_NVTX_SCOPE("forward/attn/core");
-        ops::self_attention_masked(attn_out, rope_q, k_full, v_full, attn_state.attn_mask, scale);
-    }
-    return attn_out->view({ntoken, nh * dh});
-}
-
 tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
                                                 size_t ntoken,
                                                 const tensor_t &attn_normed,
@@ -468,8 +381,8 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
         ops::rope(rope_k, k_new_3d, pos_ids, meta_.theta);
     }
 
-    tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
-    tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
+    tensor_t layer_k_cache = kv_layer_k_from_cache(runtime_.kv_cache.get(), layer);
+    tensor_t layer_v_cache = kv_layer_v_from_cache(runtime_.kv_cache.get(), layer);
     CHECK_ARGUMENT(attn_state.slot_mapping != nullptr, "Qwen2: missing slot_mapping");
     {
         LLAISYS_NVTX_SCOPE("forward/attn/cache_update");
@@ -551,87 +464,6 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
         }
     }
     return attn_out->view({ntoken, nh * dh});
-}
-
-int32_t Qwen2Model::prepare_slot_attention_state_(size_t ntoken,
-                                                  const tensor_t &seq_ids_t,
-                                                  const tensor_t &pos_ids_host_t,
-                                                  AttentionExecState *state) {
-    LLAISYS_NVTX_SCOPE("attn_meta/slot/prepare");
-    ASSERT(state != nullptr, "Qwen2: attention state is null");
-    const auto &ws = workspace_->view();
-    const auto *seq_host = reinterpret_cast<const int64_t *>(seq_ids_t->data());
-    const auto *pos_host = reinterpret_cast<const int64_t *>(pos_ids_host_t->data());
-
-    std::vector<std::vector<int64_t>> seq_sets(ntoken);
-    std::vector<int64_t> pos_values(ntoken, 0);
-    for (size_t i = 0; i < ntoken; ++i) {
-        seq_sets[i].push_back(seq_host[i]);
-        pos_values[i] = pos_host[i];
-    }
-
-    runtime::kv_cache::KvUBatch kv_ubatch;
-    kv_ubatch.seq_sets = seq_sets;
-    kv_ubatch.pos_values = pos_values;
-    runtime::kv_cache::KvSlotInfo slot_info;
-    bool kv_applied = false;
-    try {
-        auto sinfos = runtime_.kv_cache->prepare({kv_ubatch});
-        if (sinfos.empty()) {
-            return 1;
-        }
-        slot_info = sinfos[0];
-        const KvStatus apply_rc = runtime_.kv_cache->apply_ubatch(slot_info, kv_ubatch);
-        if (apply_rc == KvStatus::OOM_SLOT) {
-            return 1;
-        }
-        if (apply_rc != KvStatus::OK) {
-            return -1;
-        }
-        kv_applied = true;
-        CHECK_ARGUMENT(slot_info.n_stream() == 1, "Qwen2: unsupported slot_info stream shape");
-        CHECK_ARGUMENT(slot_info.size() == ntoken, "Qwen2: slot_info size mismatch");
-        state->slot_idxs = slot_info.idxs[0];
-
-        runtime_.kv_cache->used_slots(&state->used_slots);
-        const size_t kvlen = state->used_slots.size();
-        CHECK_ARGUMENT(kvlen > 0, "Qwen2: no used KV slots");
-
-        std::vector<uint8_t> host_mask(ntoken * kvlen, static_cast<uint8_t>(0));
-        {
-            LLAISYS_NVTX_SCOPE("attn_meta/slot/build_mask");
-            for (size_t i = 0; i < ntoken; ++i) {
-                bool has_visible = false;
-                for (size_t k = 0; k < kvlen; ++k) {
-                    const bool visible = runtime_.kv_cache->slot_visible_for(
-                        state->used_slots[k], seq_sets[i].data(), static_cast<int32_t>(seq_sets[i].size()), pos_values[i]);
-                    host_mask[i * kvlen + k] = visible ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-                    has_visible = has_visible || visible;
-                }
-                CHECK_ARGUMENT(has_visible, "Qwen2: empty attention context for token");
-            }
-        }
-
-        tensor_t attn_mask_flat = ws.attn_mask_flat->slice(0, 0, ntoken * kvlen);
-        {
-            LLAISYS_NVTX_SCOPE("attn_meta/slot/upload_mask");
-            attn_mask_flat->load(host_mask.data());
-        }
-        state->attn_mask = attn_mask_flat->view({ntoken, kvlen});
-        state->paged_attention = false;
-        state->block_table_width = 0;
-        return 0;
-    } catch (const std::invalid_argument &) {
-        if (kv_applied) {
-            runtime_.kv_cache->rollback_ubatch(slot_info, kv_ubatch);
-        }
-        return 1;
-    } catch (...) {
-        if (kv_applied) {
-            runtime_.kv_cache->rollback_ubatch(slot_info, kv_ubatch);
-        }
-        return -2;
-    }
 }
 
 int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMetadata &attn,
@@ -782,7 +614,7 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             return fail("ntoken mismatch");
         }
 
-        if (input.attention.mode != ATTENTION_MODE_SLOT && input.attention.mode != ATTENTION_MODE_BLOCK) {
+        if (input.attention.mode != ATTENTION_MODE_BLOCK) {
             return fail("invalid attention mode");
         }
         if (!attention_phase_valid(input.attention.phase)) {
@@ -791,37 +623,8 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         if (!attention_mode_supported(device_type_, input.attention.mode)) {
             return fail("attention mode unsupported");
         }
-        if ((runtime_.kv_layout == KvCacheLayout::BLOCK && input.attention.mode != ATTENTION_MODE_BLOCK) ||
-            (runtime_.kv_layout == KvCacheLayout::SLOT && input.attention.mode != ATTENTION_MODE_SLOT)) {
+        if (input.attention.mode != ATTENTION_MODE_BLOCK) {
             return fail("attention mode != kv layout");
-        }
-
-        tensor_t pos_ids_host_t = nullptr;
-        tensor_t seq_ids_t = nullptr;
-        if (input.attention.mode == ATTENTION_MODE_SLOT) {
-            if (input.attention.pos_ids_host == nullptr || input.attention.pos_ids_host->tensor == nullptr) {
-                return fail("missing pos_ids_host");
-            }
-            pos_ids_host_t = input.attention.pos_ids_host->tensor;
-            if (pos_ids_host_t == nullptr) {
-                return fail("null pos_ids_host tensor");
-            }
-            if (pos_ids_host_t->ndim() != 1 || pos_ids_host_t->dtype() != LLAISYS_DTYPE_I64 || !pos_ids_host_t->isContiguous() ||
-                pos_ids_host_t->shape()[0] != ntoken || pos_ids_host_t->deviceType() != LLAISYS_DEVICE_CPU) {
-                return fail("invalid pos_ids_host");
-            }
-
-            if (input.attention.seq_ids == nullptr || input.attention.seq_ids->tensor == nullptr) {
-                return fail("missing seq_ids");
-            }
-            seq_ids_t = input.attention.seq_ids->tensor;
-            if (seq_ids_t == nullptr) {
-                return fail("null seq_ids tensor");
-            }
-            if (seq_ids_t->ndim() != 1 || seq_ids_t->dtype() != LLAISYS_DTYPE_I64 || !seq_ids_t->isContiguous() ||
-                seq_ids_t->shape()[0] != ntoken || seq_ids_t->deviceType() != LLAISYS_DEVICE_CPU) {
-                return fail("invalid seq_ids tensor");
-            }
         }
 
         if (input.logits_indices == nullptr || input.logits_indices->tensor == nullptr) {
@@ -854,19 +657,10 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
         AttentionExecState attn_state{};
         {
             LLAISYS_NVTX_SCOPE("forward/prepare_attention_state");
-            if (input.attention.mode == ATTENTION_MODE_SLOT) {
-                const int32_t rc = prepare_slot_attention_state_(ntoken, seq_ids_t, pos_ids_host_t, &attn_state);
-                if (rc != 0) {
-                    std::cerr << "[Qwen2Model::forward] prepare slot attention state rc=" << rc << std::endl;
-                    return rc;
-                }
-                attn_state.attention_phase = int(input.attention.phase);
-            } else {
-                const int32_t rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
-                if (rc != 0) {
-                    std::cerr << "[Qwen2Model::forward] bind block attention state rc=" << rc << std::endl;
-                    return rc;
-                }
+            const int32_t rc = validate_and_bind_block_attention_state_(input.attention, ntoken, &attn_state);
+            if (rc != 0) {
+                std::cerr << "[Qwen2Model::forward] bind block attention state rc=" << rc << std::endl;
+                return rc;
             }
         }
 
@@ -875,22 +669,12 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
             tensor_t attn_normed = slice_tokens_(ws.normed, ntoken);
             ops::rms_norm(attn_normed, hidden, weights_.attn_norm_w[layer]->tensor, meta_.epsilon);
 
-            tensor_t attn_out_2d{};
-            if (input.attention.mode == ATTENTION_MODE_SLOT) {
-                attn_out_2d = run_slot_attention_layer_(
-                    layer,
-                    ntoken,
-                    attn_normed,
-                    pos_ids,
-                    attn_state);
-            } else {
-                attn_out_2d = run_block_attention_layer_(
-                    layer,
-                    ntoken,
-                    attn_normed,
-                    pos_ids,
-                    attn_state);
-            }
+            tensor_t attn_out_2d = run_block_attention_layer_(
+                layer,
+                ntoken,
+                attn_normed,
+                pos_ids,
+                attn_state);
             tensor_t attn_proj = slice_tokens_(ws.attn_proj, ntoken);
             {
                 LLAISYS_NVTX_SCOPE("forward/layer/attn_out_proj");
@@ -958,12 +742,12 @@ int32_t Qwen2Model::forward(const ::ModelForwardInput &input, ::ModelForwardOutp
 
 tensor_t Qwen2Model::kv_layer_k(size_t layer) const {
     ASSERT(runtime_.kv_cache != nullptr, "Qwen2: kv_cache is null");
-    return kv_layer_k_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
+    return kv_layer_k_from_cache(runtime_.kv_cache.get(), layer);
 }
 
 tensor_t Qwen2Model::kv_layer_v(size_t layer) const {
     ASSERT(runtime_.kv_cache != nullptr, "Qwen2: kv_cache is null");
-    return kv_layer_v_from_cache(runtime_.kv_cache.get(), runtime_.kv_layout, layer);
+    return kv_layer_v_from_cache(runtime_.kv_cache.get(), layer);
 }
 
 void Qwen2Model::destroy_weights_() {

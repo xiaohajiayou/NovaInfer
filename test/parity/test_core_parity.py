@@ -10,7 +10,6 @@ import llaisys
 from llaisys.engine.runtime_factory import create_kv_state, plan_qwen2_kv_cache
 from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 from test.utils.forward_api import run_model_forward, sample_from_forward
 
@@ -41,7 +40,7 @@ def _restore_attn_backend(old: str | None):
         os.environ[key] = old
 
 
-def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
+def _create_qwen2_with_runtime(model_path: str, device):
     plan = plan_qwen2_kv_cache(
         model_path=model_path,
         device=device,
@@ -51,7 +50,6 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
         max_num_seqs=None,
     )
     runtime_handle = create_kv_state(
-        kv_cache_layout=kv_layout,
         kv_cache_block_size=16,
         plan=plan,
     )
@@ -84,7 +82,6 @@ def _decode_batch(
     logits_mask,
     *,
     device,
-    is_block_layout=False,
     block_state=None,
     block_size=16,
 ):
@@ -93,7 +90,6 @@ def _decode_batch(
         logits_mask=logits_mask,
         seq_ids=seq_ids,
         pos_ids=poss,
-        layout=KvCacheLayout.BLOCK if is_block_layout else KvCacheLayout.SLOT,
         block_size=block_size,
         block_state=block_state,
     )
@@ -140,7 +136,6 @@ def _hf_generate_batch(model, prompt_ids, max_new_tokens):
 def _llaisys_argmax_batch(
     llaisys_model,
     runtime_handle,
-    kv_layout: KvCacheLayout,
     prompt_ids,
     max_new_tokens,
 ):
@@ -148,7 +143,6 @@ def _llaisys_argmax_batch(
     generated = [[] for _ in range(len(prompt_ids))]
     handle = llaisys_model._model
     device = getattr(llaisys_model, "_device", llaisys.DeviceType.CPU)
-    is_block_layout = int(kv_layout) == int(KvCacheLayout.BLOCK)
     block_size = 16
     block_state = BlockBatchState()
 
@@ -174,7 +168,6 @@ def _llaisys_argmax_batch(
             bpos,
             blogits,
             device=device,
-            is_block_layout=is_block_layout,
             block_state=block_state,
             block_size=block_size,
         )
@@ -205,7 +198,6 @@ def _llaisys_argmax_batch(
             bpos,
             blogits,
             device=device,
-            is_block_layout=is_block_layout,
             block_state=block_state,
             block_size=block_size,
         )
@@ -265,7 +257,6 @@ def test_core_parity(require_model_path, prompts, ll_device, backend, kv_layout)
             llaisys_model, runtime_handle = _create_qwen2_with_runtime(
                 model_path=require_model_path,
                 device=llaisys.DeviceType.NVIDIA if ll_device == "nvidia" else llaisys.DeviceType.CPU,
-                kv_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
             )
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
@@ -274,10 +265,9 @@ def test_core_parity(require_model_path, prompts, ll_device, backend, kv_layout)
         ll_tokens = _llaisys_argmax_batch(
             llaisys_model,
             runtime_handle,
-            KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
-            prompt_ids,
-            max_new_tokens=5,
-        )
+                prompt_ids,
+                max_new_tokens=5,
+            )
         assert ll_tokens == hf_tokens
     finally:
         if llaisys_model is not None:

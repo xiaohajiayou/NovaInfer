@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
 
 
 @dataclass
@@ -16,8 +15,7 @@ class EngineConfig:
     end_token_id: int | None = None
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 4096
-    
-    kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK
+
     kv_cache_memory_utilization: float = 0.9
     num_kvcache_blocks: int = 0
     kv_cache_block_size: int = 256
@@ -39,5 +37,3 @@ class EngineConfig:
             self.num_kvcache_blocks = max(0, int(self.num_kvcache_blocks))
         self.enable_prefix_caching = bool(self.enable_prefix_caching)
         self.kv_cache_memory_utilization = float(min(0.98, max(0.01, self.kv_cache_memory_utilization)))
-        if self.kv_cache_layout != KvCacheLayout.BLOCK:
-            assert self.num_kvcache_blocks == 0

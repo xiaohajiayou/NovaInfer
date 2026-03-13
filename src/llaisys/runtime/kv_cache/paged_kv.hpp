@@ -78,7 +78,6 @@ public:
     KvStatus reset_prefix_cache() override;
     int64_t seq_pos_max(int64_t seq_id) const noexcept override;
     void used_slots(std::vector<int32_t> *out) const override;
-    bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const override;
     bool build_attention_plan(const std::vector<std::vector<int64_t>> &seq_sets,
                               const std::vector<int64_t> &qpos,
                               std::vector<int32_t> *used_slots,

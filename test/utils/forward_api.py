@@ -11,8 +11,8 @@ from llaisys.engine.sampler import Sampler
 from llaisys.libllaisys import LIB_LLAISYS, DataType, DeviceType
 from llaisys.libllaisys.model import (
     AttentionMetadata,
+    AttentionMode,
     AttentionPhase,
-    KvCacheLayout,
     LlaisysModelCreateParams,
     LlaisysKvStateCreateParams,
     ModelForwardInput,
@@ -82,13 +82,11 @@ def build_meta(meta: TinyMeta) -> LlaisysQwen2Meta:
 
 def create_runtime(
     *,
-    layout: KvCacheLayout | int = KvCacheLayout.BLOCK,
     block_size: int = 16,
     max_model_len: int = 0,
     kv_capacity_tokens: int = 0,
 ):
     params = LlaisysKvStateCreateParams(
-        int(layout),
         int(block_size),
         int(max_model_len),
         int(kv_capacity_tokens),
@@ -102,11 +100,9 @@ def create_runtime(
 def create_tiny_qwen2_model(
     meta: TinyMeta = TinyMeta(),
     *,
-    layout: KvCacheLayout | int = KvCacheLayout.BLOCK,
     block_size: int = 16,
 ):
     runtime = create_runtime(
-        layout=layout,
         block_size=block_size,
         max_model_len=int(meta.maxseq),
         kv_capacity_tokens=int(meta.maxseq),
@@ -150,8 +146,8 @@ def create_tiny_qwen2_model(
     return runtime, model, meta
 
 
-def create_mock_model(*, layout: KvCacheLayout | int = KvCacheLayout.BLOCK, block_size: int = 16):
-    runtime = create_runtime(layout=layout, block_size=block_size)
+def create_mock_model(*, block_size: int = 16):
+    runtime = create_runtime(block_size=block_size)
     params = LlaisysModelCreateParams(
         int(ModelType.MOCK),
         None,
@@ -241,14 +237,9 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
     pos_ids_t = _make_tensor_1d(batch.pos_values, DataType.I64, device)
     output_ids = [i for i, m in enumerate(batch.logits_mask) if int(m) != 0]
     output_ids_t = _make_tensor_1d(output_ids, DataType.I64, device)
-    seq_ids_t = _make_tensor_1d(batch.seq_ids, DataType.I64, DeviceType.CPU)
-    pos_ids_host_t = _make_tensor_1d(batch.pos_values, DataType.I64, DeviceType.CPU)
-
     attn = AttentionMetadata()
     attn.mode = int(batch.mode)
     attn.phase = int(AttentionPhase.PREFILL)
-    attn.seq_ids = seq_ids_t.lib_tensor()
-    attn.pos_ids_host = pos_ids_host_t.lib_tensor()
     attn.cu_seqlens_q = None
     attn.cu_seqlens_k = None
     attn.max_seqlen_q = 0
@@ -262,7 +253,7 @@ def run_model_forward(model, runtime, batch: BatchBuildResult, *, device: Device
     attn.cudnn_qo_ragged_offset = None
     attn.cudnn_b_exec = 0
 
-    if not batch.invalid and int(batch.mode) == int(KvCacheLayout.BLOCK):
+    if not batch.invalid and int(batch.mode) == int(AttentionMode.BLOCK):
         if (
             batch.req_num_scheduled_tokens is None
             or batch.req_num_computed_tokens is None

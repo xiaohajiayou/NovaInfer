@@ -10,7 +10,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import llaisys
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
-from llaisys.libllaisys.model import KvCacheLayout
 
 
 MULTI_PROMPTS = [
@@ -78,12 +77,11 @@ def hf_completion_tokens(
     return full_tokens[len(prompt_tokens) :]
 
 
-def load_llaisys_llm(model_path, device_name, kv_layout: str = "block"):
+def load_llaisys_llm(model_path, device_name):
     return llaisys.LLM(
         model=model_path,
         model_type="qwen2",
         device=llaisys_device(device_name),
-        kv_cache_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
     )
 
 def _set_attn_backend(backend: str | None):
@@ -149,7 +147,7 @@ def test_offline_parity_single(require_model_path, ll_device, backend, kv_layout
     llm = None
     try:
         try:
-            llm = load_llaisys_llm(require_model_path, ll_device, kv_layout=kv_layout)
+            llm = load_llaisys_llm(require_model_path, ll_device)
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
@@ -201,7 +199,7 @@ def test_offline_parity_multi(require_model_path, ll_device, backend, kv_layout)
     llm = None
     try:
         try:
-            llm = load_llaisys_llm(require_model_path, ll_device, kv_layout=kv_layout)
+            llm = load_llaisys_llm(require_model_path, ll_device)
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
                 pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")

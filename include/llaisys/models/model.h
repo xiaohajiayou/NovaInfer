@@ -11,11 +11,6 @@ __C {
         LLAISYS_MODEL_TYPE_MOCK = 2,
     } LlaisysModelType;
 
-    typedef enum LlaisysKvCacheLayout {
-        LLAISYS_KV_CACHE_LAYOUT_SLOT = 0,
-        LLAISYS_KV_CACHE_LAYOUT_BLOCK = 1,
-    } LlaisysKvCacheLayout;
-
     struct LlaisysModelCreateParams {
         LlaisysModelType model_type;
         const void *meta; // points to model-specific meta struct
@@ -25,7 +20,6 @@ __C {
     };
 
     struct LlaisysKvStateCreateParams {
-        int32_t kv_cache_layout;          // LlaisysKvCacheLayout, <0 means default(BLOCK)
         int32_t kv_cache_block_size;      // <=0 means default(16)
         int32_t max_model_len;            // <=0 means use model meta.maxseq
         int32_t kv_cache_capacity_tokens; // <=0 means use max_model_len
@@ -39,7 +33,6 @@ __C {
     };
 
     typedef enum AttentionMode {
-        ATTENTION_MODE_SLOT = 0,
         ATTENTION_MODE_BLOCK = 1,
     } AttentionMode;
 
@@ -51,8 +44,6 @@ __C {
     struct AttentionMetadata {
         int32_t mode; // AttentionMode
         int32_t phase; // AttentionPhase
-        llaisysTensor_t seq_ids; // [n_tokens], i64, SLOT metadata
-        llaisysTensor_t pos_ids_host;    // [n_tokens], i64, SLOT metadata
         llaisysTensor_t cu_seqlens_q;    // [n_batch_seq + 1], i32, BLOCK required
         llaisysTensor_t cu_seqlens_k;    // [n_batch_seq + 1], i32, BLOCK required
         int32_t max_seqlen_q;            // BLOCK required
@@ -60,7 +51,7 @@ __C {
         llaisysTensor_t slot_mapping;    // [n_tokens], i32, BLOCK required
         llaisysTensor_t block_tables;    // [n_batch_seq * block_table_width], i32, BLOCK metadata
         int32_t block_table_width;
-        // CUDNN-only BLOCK metadata. These fields are ignored by native BLOCK/SLOT paths.
+        // CUDNN-only BLOCK metadata. These fields are ignored by native BLOCK path.
         llaisysTensor_t cudnn_seq_lens_q;   // [cudnn_b_exec], i32
         llaisysTensor_t cudnn_seq_lens_kv;  // [cudnn_b_exec], i32
         llaisysTensor_t cudnn_page_table;   // [cudnn_b_exec * block_table_width], i32
@@ -128,7 +119,7 @@ __C {
 
     // KV status (mirrors runtime::kv_cache::KvStatus; exported as int in C API):
     // 0: OK
-    // 1: OOM_SLOT
+    // 1: OOM_KV
     // 2: INVALID_SEQ
     // 3: INVALID_POS
     // 4: EMPTY_RANGE

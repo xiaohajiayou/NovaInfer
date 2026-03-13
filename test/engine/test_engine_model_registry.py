@@ -3,14 +3,13 @@ from unittest.mock import patch
 from llaisys.engine.llm_engine import LLMEngine
 from llaisys.engine.model_registry import ModelRegistry
 from llaisys.engine.types import SamplingParams
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.dummy_model_runner import DummyModelRunner
 from test.utils.engine_testkit import InjectedWorker
 
 
 def test_engine_passes_model_registry_to_worker():
     registry = ModelRegistry(_factories={})
-    runner = DummyModelRunner(max_seq_len=16, end_token_id=5, kv_cache_layout=KvCacheLayout.BLOCK)
+    runner = DummyModelRunner(max_seq_len=16, end_token_id=5)
     fake_worker = InjectedWorker(runner)
 
     with patch("llaisys.engine.llm_engine.Worker", side_effect=lambda *args, **kwargs: fake_worker) as worker_ctor:

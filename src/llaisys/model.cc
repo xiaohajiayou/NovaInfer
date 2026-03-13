@@ -5,7 +5,6 @@
 #include "llaisys_tensor.hpp"
 #include "qwen2/qwen2_model.hpp"
 #include "runtime/kv_cache/paged_kv.hpp"
-#include "runtime/kv_cache/unified_kv.hpp"
 #include "runtime/weights/weights.hpp"
 #include "../core/context/context.hpp"
 #include "../utils.hpp"
@@ -25,31 +24,21 @@ namespace {
 using llaisys::models::qwen2::Qwen2Model;
 using KvStatus = llaisys::runtime::kv_cache::KvStatus;
 using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
-using KvCacheLayout = llaisys::runtime::kv_cache::KvCacheLayout;
-
 int to_kv_code(KvStatus status) {
     return static_cast<int>(status);
 }
 
-llaisys::tensor_t kv_layer_k_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
+llaisys::tensor_t kv_layer_k_from_cache(KvCacheBase *cache, size_t layer) {
     if (cache == nullptr) {
         return nullptr;
-    }
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        return impl ? impl->layer_k(layer) : nullptr;
     }
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     return impl ? impl->layer_k(layer) : nullptr;
 }
 
-llaisys::tensor_t kv_layer_v_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
+llaisys::tensor_t kv_layer_v_from_cache(KvCacheBase *cache, size_t layer) {
     if (cache == nullptr) {
         return nullptr;
-    }
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        return impl ? impl->layer_v(layer) : nullptr;
     }
     auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
     return impl ? impl->layer_v(layer) : nullptr;
@@ -158,14 +147,12 @@ public:
 class ModelKVCacheManager final : public RuntimeKVCacheManager {
 public:
     ModelKVCacheManager(KvCacheBase *kv_cache,
-                        KvCacheLayout kv_layout,
                         size_t kv_nlayer,
                         size_t kv_nkvh,
                         size_t kv_dh,
                         llaisysDataType_t kv_dtype,
                         size_t kv_capacity_tokens)
         : kv_cache_(kv_cache),
-          kv_layout_(kv_layout),
           kv_nlayer_(kv_nlayer),
           kv_nkvh_(kv_nkvh),
           kv_dh_(kv_dh),
@@ -194,8 +181,8 @@ public:
                 continue;
             }
             for (size_t layer = 0; layer < kv_nlayer_; ++layer) {
-                llaisys::tensor_t layer_k_cache = kv_layer_k_from_cache(kv_cache_, kv_layout_, layer);
-                llaisys::tensor_t layer_v_cache = kv_layer_v_from_cache(kv_cache_, kv_layout_, layer);
+                llaisys::tensor_t layer_k_cache = kv_layer_k_from_cache(kv_cache_, layer);
+                llaisys::tensor_t layer_v_cache = kv_layer_v_from_cache(kv_cache_, layer);
                 if (layer_k_cache == nullptr || layer_v_cache == nullptr) {
                     return KvStatus::INTERNAL_ERROR;
                 }
@@ -256,7 +243,6 @@ public:
 
 private:
     KvCacheBase *kv_cache_{nullptr};
-    KvCacheLayout kv_layout_{KvCacheLayout::BLOCK};
     size_t kv_nlayer_{0};
     size_t kv_nkvh_{0};
     size_t kv_dh_{0};
@@ -345,25 +331,18 @@ struct LlaisysKvStateImpl {
                 return false;
             }
 
-            llaisys::runtime::kv_cache::KvCacheLayout kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
-            if (params.kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
-                kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::SLOT;
-            } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
-                return false;
-            }
             const size_t kv_block_size =
                 params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
             const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
                                                         ? static_cast<size_t>(params.kv_cache_capacity_tokens)
                                                         : static_cast<size_t>(0);
             const int64_t max_model_len = params.max_model_len > 0 ? static_cast<int64_t>(params.max_model_len) : int64_t{0};
-            if (impl->qwen2->configure_runtime(kv_layout, kv_block_size, kv_cache_capacity_tokens, max_model_len) != 0 ||
+            if (impl->qwen2->configure_runtime(kv_block_size, kv_cache_capacity_tokens, max_model_len) != 0 ||
                 impl->qwen2->kv_cache() == nullptr) {
                 return false;
             }
 
             kv_cache_manager = std::make_unique<ModelKVCacheManager>(impl->qwen2->kv_cache(),
-                                                                     impl->qwen2->kv_layout(),
                                                                      impl->qwen2->nlayer(),
                                                                      impl->qwen2->nkvh(),
                                                                      impl->qwen2->dh(),

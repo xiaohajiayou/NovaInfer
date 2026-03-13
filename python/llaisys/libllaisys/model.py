@@ -14,8 +14,7 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
-class KvCacheLayout(IntEnum):
-    SLOT = 0
+class AttentionMode(IntEnum):
     BLOCK = 1
 
 class AttentionPhase(IntEnum):
@@ -35,7 +34,6 @@ class LlaisysModelCreateParams(Structure):
 
 class LlaisysKvStateCreateParams(Structure):
     _fields_ = [
-        ("kv_cache_layout", c_int32),
         ("kv_cache_block_size", c_int32),
         ("max_model_len", c_int32),
         ("kv_cache_capacity_tokens", c_int32),
@@ -53,8 +51,6 @@ class AttentionMetadata(Structure):
     _fields_ = [
         ("mode", c_int32),
         ("phase", c_int32),
-        ("seq_ids", llaisysTensor_t),
-        ("pos_ids_host", llaisysTensor_t),
         ("cu_seqlens_q", llaisysTensor_t),
         ("cu_seqlens_k", llaisysTensor_t),
         ("max_seqlen_q", c_int32),
@@ -157,7 +153,7 @@ __all__ = [
     "llaisysModel_t",
     "llaisysKvState_t",
     "ModelType",
-    "KvCacheLayout",
+    "AttentionMode",
     "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysKvStateCreateParams",

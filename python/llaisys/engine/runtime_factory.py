@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.model import KvCacheLayout, LlaisysKvStateCreateParams
+from ..libllaisys.model import LlaisysKvStateCreateParams
 from ..models import qwen2 as qwen2_impl
 
 
@@ -141,12 +141,10 @@ def _estimate_cuda_kv_capacity_tokens(
 
 def create_kv_state(
     *,
-    kv_cache_layout: KvCacheLayout,
     kv_cache_block_size: int,
     plan: KvCachePlan,
 ):
     params = LlaisysKvStateCreateParams(
-        int(kv_cache_layout),
         int(kv_cache_block_size),
         int(plan.max_model_len),
         int(plan.kv_cache_capacity_tokens),

@@ -11,16 +11,11 @@ namespace llaisys::runtime::kv_cache {
 
 enum class KvStatus : int32_t {
     OK = 0,
-    OOM_SLOT = 1,
+    OOM_KV = 1,
     INVALID_SEQ = 2,
     INVALID_POS = 3,
     EMPTY_RANGE = 4,
     INTERNAL_ERROR = 5,
-};
-
-enum class KvCacheLayout : uint8_t {
-    SLOT = 0,
-    BLOCK = 1,
 };
 
 struct KvSlotInfo {
@@ -155,7 +150,6 @@ public:
     }
     virtual int64_t seq_pos_max(int64_t seq_id) const noexcept = 0;
     virtual void used_slots(std::vector<int32_t> *out) const = 0;
-    virtual bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const = 0;
 };
 
 } // namespace llaisys::runtime::kv_cache

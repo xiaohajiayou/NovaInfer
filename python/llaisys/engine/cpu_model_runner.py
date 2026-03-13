@@ -29,64 +29,6 @@ class CPUModelRunner(GPUModelRunner):
     def _make_buffer(self, shape: tuple[int, ...], dtype: DataType, pin_memory: bool = True) -> Tensor:
         return Tensor(shape, dtype, DeviceType.CPU, 0, pin_memory=pin_memory)
 
-    def _build_slot_tensors(
-        self,
-        *,
-        seqs: list,
-        input_ids: list[int],
-        positions: list[int],
-        scheduled_token_counts: list[int],
-    ) -> PreparedTensors:
-        ntoken = len(input_ids)
-        n_outputs = len(seqs)
-        if ntoken > self._max_num_tokens:
-            raise RuntimeError("ntoken exceeds configured max_num_batched_tokens")
-        if n_outputs > self._max_num_reqs:
-            raise RuntimeError("n_outputs exceeds configured max_num_seqs")
-
-        assert self._input_ids_buf is not None
-        assert self._pos_ids_buf is not None
-        assert self._seq_ids_buf is not None
-        assert self._output_ids_buf is not None
-        if (
-            isinstance(self._input_ids_buf, CpuGpuBuffer)
-            or isinstance(self._pos_ids_buf, CpuGpuBuffer)
-            or isinstance(self._seq_ids_buf, CpuGpuBuffer)
-            or isinstance(self._output_ids_buf, CpuGpuBuffer)
-        ):
-            raise RuntimeError("CPU slot builder requires CPU tensors")
-
-        output_rows = self._build_output_rows(scheduled_token_counts, n_outputs)
-        keepalive: list[Tensor] = []
-
-        input_ids_t = self._input_ids_buf.slice(0, 0, ntoken)
-        pos_ids_t = self._pos_ids_buf.slice(0, 0, ntoken)
-        input_ids_t.copy_from_sequence(input_ids)
-        pos_ids_t.copy_from_sequence(positions)
-        keepalive.extend([input_ids_t, pos_ids_t])
-
-        seq_token_ids: list[int] = []
-        for seq_obj, n_sched in zip(seqs, scheduled_token_counts):
-            seq_token_ids.extend([int(seq_obj.seq_id)] * int(n_sched))
-        seq_ids_t = self._seq_ids_buf.slice(0, 0, ntoken)
-        seq_ids_t.copy_from_sequence(seq_token_ids)
-        keepalive.append(seq_ids_t)
-
-        logits_indices_t = self._output_ids_buf.slice(0, 0, n_outputs)
-        if n_outputs > 0:
-            logits_indices_t.copy_from_sequence(output_rows)
-        keepalive.append(logits_indices_t)
-
-        return PreparedTensors(
-            input_ids=input_ids_t,
-            pos_ids=pos_ids_t,
-            logits_indices=logits_indices_t,
-            n_outputs=n_outputs,
-            keepalive=keepalive,
-            seq_ids=seq_ids_t,
-            pos_ids_host=pos_ids_t,
-        )
-
     def _build_block_tensors(
         self,
         *,
