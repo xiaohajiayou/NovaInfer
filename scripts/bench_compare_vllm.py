@@ -1,13 +1,71 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
+import os
 import random
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+def _summarize_paths(raw: str, limit: int = 4) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in str(raw or "").split(":"):
+        item = item.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        parts.append(item)
+    if not parts:
+        return "<unset>"
+    head = parts[: max(1, int(limit))]
+    suffix = "" if len(parts) <= len(head) else f" ... (+{len(parts) - len(head)} more)"
+    return " | ".join(head) + suffix
+
+
+def _runtime_diag() -> None:
+    backend = str(os.environ.get("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "")).strip() or "<unset>"
+    cuda_visible = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip() or "<unset>"
+    cudnn_home = str(os.environ.get("CUDNN_HOME", "")).strip() or "<unset>"
+    loaded_cudnn = "<not-loaded>"
+    loaded_nccl = "<not-loaded>"
+    try:
+        with open("/proc/self/maps", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if loaded_cudnn == "<not-loaded>" and "libcudnn.so" in line:
+                    loaded_cudnn = line.strip().split()[-1]
+                if loaded_nccl == "<not-loaded>" and "libnccl.so" in line:
+                    loaded_nccl = line.strip().split()[-1]
+                if loaded_cudnn != "<not-loaded>" and loaded_nccl != "<not-loaded>":
+                    break
+    except Exception:
+        pass
+
+    cudnn_version = 0
+    for soname in ("libcudnn.so.9", "libcudnn.so"):
+        try:
+            lib = ctypes.CDLL(soname)
+            lib.cudnnGetVersion.restype = ctypes.c_size_t
+            cudnn_version = int(lib.cudnnGetVersion())
+            break
+        except Exception:
+            continue
+
+    print(
+        "[bench] runtime_env "
+        f"backend={backend} "
+        f"cuda_visible_devices={cuda_visible} "
+        f"cudnn_home={cudnn_home} "
+        f"ld_library_path={_summarize_paths(os.environ.get('LD_LIBRARY_PATH', ''))} "
+        f"loaded_cudnn={loaded_cudnn} "
+        f"cudnn_version={cudnn_version} "
+        f"loaded_nccl={loaded_nccl}"
+    )
 
 
 def _build_dataset(
@@ -248,6 +306,7 @@ def main() -> int:
     parser.add_argument("--result-json", default="", type=str)
     args = parser.parse_args()
     tp_device_ids = _parse_device_ids(args.tensor_parallel_device_ids)
+    _runtime_diag()
 
     prompts, out_lens = _build_dataset(
         seed=int(args.seed),

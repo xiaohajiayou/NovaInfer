@@ -23,6 +23,22 @@ def _tail(path: Path, n: int = 80) -> str:
     return "\n".join(lines[-n:])
 
 
+def _summarize_paths(raw: str, limit: int = 4) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in str(raw or "").split(":"):
+        item = item.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        parts.append(item)
+    if not parts:
+        return "<unset>"
+    head = parts[: max(1, int(limit))]
+    suffix = "" if len(parts) <= len(head) else f" ... (+{len(parts) - len(head)} more)"
+    return " | ".join(head) + suffix
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run NovaInfer TP bench in N processes.")
     parser.add_argument("--model-path", required=True, type=Path)
@@ -102,6 +118,13 @@ def main() -> int:
     env.setdefault("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "cudnn")
     env.setdefault("LLAISYS_TP_SINGLE_PROCESS", "0")
     env["LLAISYS_TP_INIT_METHOD"] = init_method
+    print(
+        "[tp_bench] runtime_env "
+        f"backend={env.get('LLAISYS_CUDA_PAGED_ATTN_BACKEND', '<unset>')} "
+        f"cuda_visible_devices={env.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+        f"cudnn_home={env.get('CUDNN_HOME', '<unset>')} "
+        f"ld_library_path={_summarize_paths(env.get('LD_LIBRARY_PATH', ''))}"
+    )
 
     root = Path(tempfile.mkdtemp(prefix=f"tp{tp_size}_bench_"))
     procs: list[subprocess.Popen] = []
@@ -153,6 +176,10 @@ def main() -> int:
 
     tputs = [float(r.get("actual_tokens_per_sec", 0.0)) for r in rows]
     run_secs = [float(r.get("run_seconds", r.get("seconds", 0.0))) for r in rows]
+    total_tokens = [int(r.get("actual_total_tokens", r.get("total_tokens", 0))) for r in rows]
+    global_tokens = total_tokens[0] if total_tokens else 0
+    global_run_seconds = max(run_secs) if run_secs else 0.0
+    global_throughput = (float(global_tokens) / float(global_run_seconds)) if global_run_seconds > 0.0 else 0.0
     for rank, row in enumerate(rows):
         print(
             "[tp_bench] "
@@ -161,6 +188,9 @@ def main() -> int:
         )
     print(
         "[tp_bench] summary "
+        f"global_tokens={global_tokens} "
+        f"global_run_seconds={global_run_seconds:.4f} "
+        f"global_throughput={global_throughput:.4f} "
         f"throughput_actual_avg={sum(tputs)/max(1, len(tputs)):.4f} "
         f"throughput_actual_min={min(tputs):.4f} "
         f"throughput_actual_max={max(tputs):.4f} "
