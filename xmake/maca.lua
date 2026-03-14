@@ -65,7 +65,7 @@ target("llaisys-device-nvidia")
     add_includedirs(cu_bridge_path .. "/include", maca_path .. "/include", maca_path .. "/include/mcblas")
     add_linkdirs(maca_path .. "/lib")
     add_rpathdirs(maca_path .. "/lib")
-    add_files(".maca_sources/device/*.maca", {rules = "maca.cu"})
+    add_files("../src/device/maca/*.maca", {rules = "maca.cu"})
 
     on_install(function (target) end)
 target_end()
@@ -92,7 +92,7 @@ target("llaisys-ops-cuda")
             add_values("mxccflags", "-Wno-unused-function")
         end
     end
-    add_files(".maca_sources/ops/*.maca", {rules = "maca.cu"})
+    add_files("../src/ops/*/maca/*.maca", {rules = "maca.cu"})
 
     on_install(function (target) end)
 target_end()
