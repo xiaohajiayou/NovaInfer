@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from ctypes import byref
 from typing import Optional, Sequence
+import math
+
+import numpy as np
 
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType
 from ..libllaisys.model import SamplerInput, SamplerOutput
@@ -24,6 +27,58 @@ class Sampler:
         )
         self._device = cfg.device
         self._max_num_seqs = max(1, int(cfg.max_num_seqs))
+        self._temperatures = Tensor((self._max_num_seqs,), DataType.F32, self._device, 0)
+        self._top_ps = Tensor((self._max_num_seqs,), DataType.F32, self._device, 0)
+        self._top_ks = Tensor((self._max_num_seqs,), DataType.I32, self._device, 0)
+        self._seeds = Tensor((self._max_num_seqs,), DataType.I64, self._device, 0)
+        self._has_seeds = Tensor((self._max_num_seqs,), DataType.I32, self._device, 0)
+
+    @staticmethod
+    def _is_greedy_row(
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        has_seed: int,
+    ) -> bool:
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            return True
+        if int(top_k) == 1:
+            return True
+        return (
+            int(top_k) <= 0
+            and float(top_p) >= 1.0
+            and abs(float(temperature) - 1.0) <= 1e-6
+            and int(has_seed) == 0
+        )
+
+    def _controls_are_all_greedy(
+        self,
+        n_outputs: int,
+        temperatures: Optional[Sequence[float]],
+        top_ps: Optional[Sequence[float]],
+        top_ks: Optional[Sequence[int]],
+        has_seeds: Optional[Sequence[int]],
+    ) -> bool:
+        if temperatures is None or top_ps is None or top_ks is None or has_seeds is None:
+            return True
+        for i in range(int(n_outputs)):
+            if not self._is_greedy_row(
+                float(temperatures[i]),
+                float(top_ps[i]),
+                int(top_ks[i]),
+                int(has_seeds[i]),
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _copy_prefix(dst: Tensor, values: Sequence[int | float], dtype: np.dtype, n: int) -> Tensor:
+        arr = np.asarray(values, dtype=dtype)
+        if arr.ndim != 1 or int(arr.size) != int(n):
+            raise RuntimeError("sampler control shape mismatch")
+        view = dst if int(n) == int(dst.shape()[0]) else dst.slice(0, 0, int(n))
+        view.copy_from_numpy(arr)
+        return view
 
     def sample_tokens(
         self,
@@ -36,10 +91,6 @@ class Sampler:
         seeds: Optional[Sequence[int]] = None,
         has_seeds: Optional[Sequence[int]] = None,
     ) -> Optional[Tensor]:
-        # Stage-1 native sampler currently uses argmax path in C++ and does not
-        # consume these controls yet.
-        del temperatures, top_ps, top_ks, seeds, has_seeds
-
         if logits_tensor is None:
             return None
 
@@ -63,6 +114,22 @@ class Sampler:
         sin.top_ks = None
         sin.seeds = None
         sin.has_seeds = None
+        keepalive: list[Tensor] = []
+
+        if not self._controls_are_all_greedy(n_outputs, temperatures, top_ps, top_ks, has_seeds):
+            if temperatures is None or top_ps is None or top_ks is None or seeds is None or has_seeds is None:
+                raise RuntimeError("sampler controls must be fully specified for non-greedy sampling")
+            temp_t = self._copy_prefix(self._temperatures, temperatures, np.float32, n_outputs)
+            top_p_t = self._copy_prefix(self._top_ps, top_ps, np.float32, n_outputs)
+            top_k_t = self._copy_prefix(self._top_ks, top_ks, np.int32, n_outputs)
+            seeds_t = self._copy_prefix(self._seeds, seeds, np.int64, n_outputs)
+            has_seeds_t = self._copy_prefix(self._has_seeds, has_seeds, np.int32, n_outputs)
+            keepalive.extend([temp_t, top_p_t, top_k_t, seeds_t, has_seeds_t])
+            sin.temperatures = temp_t.lib_tensor()
+            sin.top_ps = top_p_t.lib_tensor()
+            sin.top_ks = top_k_t.lib_tensor()
+            sin.seeds = seeds_t.lib_tensor()
+            sin.has_seeds = has_seeds_t.lib_tensor()
 
         sout = SamplerOutput()
         sout.sampled_ids = out_ids_dev.lib_tensor()

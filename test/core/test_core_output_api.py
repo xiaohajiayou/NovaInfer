@@ -38,12 +38,8 @@ def test_output_rows_match_logits_mask_and_sampler():
         assert out.status == 0
         assert out.n_outputs == 2
         assert out.output_ids == [0, 2]
-
-        try:
-            sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
-            assert len(sampled_ids) == 2
-        except RuntimeError as exc:
-            assert "samplerSample failed" in str(exc)
+        sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
+        assert len(sampled_ids) == 2
     finally:
         destroy_model_runtime(model, runtime)
 
@@ -60,10 +56,7 @@ def test_default_logits_behavior_returns_last_row_only():
         assert out.status == 0
         assert out.n_outputs == 1
         assert out.output_ids == [2]
-        try:
-            sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
-            assert len(sampled_ids) == 1
-        except RuntimeError as exc:
-            assert "samplerSample failed" in str(exc)
+        sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
+        assert len(sampled_ids) == 1
     finally:
         destroy_model_runtime(model, runtime)

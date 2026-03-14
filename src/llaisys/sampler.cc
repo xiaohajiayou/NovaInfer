@@ -2,6 +2,7 @@
 
 #include "llaisys_tensor.hpp"
 #include "../ops/argmax/op.hpp"
+#include "../ops/sampler/op.hpp"
 #include "../tensor/tensor.hpp"
 #include "../utils/nvtx.hpp"
 
@@ -84,15 +85,47 @@ __C int32_t llaisysSamplerSample(const struct SamplerInput *input,
             sampled_ids = sampled_ids->slice(0, 0, n_outputs);
         }
 
-        llaisys::tensor_t max_idx = sampled_ids;
-        llaisys::tensor_t max_val =
-            sampler_scratch_state().ensure_max_val(n_outputs, logits->dtype(), logits->deviceType(), logits->deviceId());
-        if (max_val == nullptr) {
+        const bool has_controls = input->temperatures != nullptr || input->top_ps != nullptr || input->top_ks != nullptr ||
+                                  input->seeds != nullptr || input->has_seeds != nullptr;
+        if (!has_controls) {
+            llaisys::tensor_t max_idx = sampled_ids;
+            llaisys::tensor_t max_val =
+                sampler_scratch_state().ensure_max_val(n_outputs, logits->dtype(), logits->deviceType(), logits->deviceId());
+            if (max_val == nullptr) {
+                return -1;
+            }
+            {
+                LLAISYS_NVTX_SCOPE("sample/argmax_rows");
+                llaisys::ops::argmax_rows(max_idx, max_val, logits);
+            }
+            return 0;
+        }
+
+        if (input->temperatures == nullptr || input->top_ps == nullptr || input->top_ks == nullptr ||
+            input->seeds == nullptr || input->has_seeds == nullptr) {
+            return -1;
+        }
+        const llaisys::tensor_t temperatures = input->temperatures->tensor;
+        const llaisys::tensor_t top_ps = input->top_ps->tensor;
+        const llaisys::tensor_t top_ks = input->top_ks->tensor;
+        const llaisys::tensor_t seeds = input->seeds->tensor;
+        const llaisys::tensor_t has_seeds = input->has_seeds->tensor;
+        if (temperatures == nullptr || top_ps == nullptr || top_ks == nullptr || seeds == nullptr || has_seeds == nullptr) {
+            return -1;
+        }
+        if (temperatures->deviceType() != logits->deviceType() || top_ps->deviceType() != logits->deviceType() ||
+            top_ks->deviceType() != logits->deviceType() || seeds->deviceType() != logits->deviceType() ||
+            has_seeds->deviceType() != logits->deviceType()) {
+            return -1;
+        }
+        if (temperatures->deviceId() != logits->deviceId() || top_ps->deviceId() != logits->deviceId() ||
+            top_ks->deviceId() != logits->deviceId() || seeds->deviceId() != logits->deviceId() ||
+            has_seeds->deviceId() != logits->deviceId()) {
             return -1;
         }
         {
-            LLAISYS_NVTX_SCOPE("sample/argmax_rows");
-            llaisys::ops::argmax_rows(max_idx, max_val, logits);
+            LLAISYS_NVTX_SCOPE("sample/sample_rows");
+            llaisys::ops::sample_rows(sampled_ids, logits, temperatures, top_ps, top_ks, seeds, has_seeds);
         }
         return 0;
     } catch (...) {

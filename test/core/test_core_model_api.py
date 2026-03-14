@@ -41,11 +41,8 @@ def test_model_create_forward_sampler_and_runtime_kv_api():
         out = _forward(runtime, model, [1, 2, 3], [0, 0, 1])
         assert out.status == 0
         assert out.n_outputs == 1
-        try:
-            sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
-            assert len(sampled_ids) == 1
-        except RuntimeError as exc:
-            assert "samplerSample failed" in str(exc)
+        sampled_ids = sample_from_forward(out, device=llaisys.DeviceType.CPU)
+        assert len(sampled_ids) == 1
 
         assert int(LIB_LLAISYS.llaisysKvStateResetPrefixCache(runtime)) == 0
 
