@@ -93,6 +93,9 @@ class LlaisysHTTPServer:
                 if path == "/health":
                     self._write_json(200, {"status": "ok"})
                     return
+                if path == "/debug/kv_cache_stats":
+                    self._write_json(200, outer._openai_server.kv_cache_stats())
+                    return
                 self._write_json(404, {"error": "not_found"})
 
             def do_POST(self):

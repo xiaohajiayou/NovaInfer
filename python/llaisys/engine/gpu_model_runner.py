@@ -49,6 +49,8 @@ class PreparedTensors:
     cudnn_page_table: Tensor | None = None
     cudnn_qo_ragged_offset: Tensor | None = None
     cudnn_b_exec: int = 0
+    cudnn_warmup_b: int = 0
+    cudnn_warmup_s_q: int = 0
 
 
 @dataclass
@@ -87,6 +89,8 @@ class CudnnBlockMeta:
     cudnn_page_table: Tensor
     cudnn_qo_ragged_offset: Tensor | None
     cudnn_b_exec: int
+    cudnn_warmup_b: int
+    cudnn_warmup_s_q: int
     keepalive: list[Tensor]
 
 
@@ -318,6 +322,8 @@ class GPUModelRunner:
                     prepared.cudnn_qo_ragged_offset.lib_tensor() if prepared.cudnn_qo_ragged_offset is not None else None
                 )
                 attn.cudnn_b_exec = c_int32(int(prepared.cudnn_b_exec))
+                attn.cudnn_warmup_b = c_int32(int(prepared.cudnn_warmup_b))
+                attn.cudnn_warmup_s_q = c_int32(int(prepared.cudnn_warmup_s_q))
 
                 fin = ModelForwardInput()
                 fin.input_ids = prepared.input_ids.lib_tensor()
@@ -375,12 +381,25 @@ class GPUModelRunner:
         has_seeds: list[int] = []
         for seq_obj in seqs:
             params = seq_obj.sampling_params
-            temperatures.append(float(params.temperature))
-            top_ps.append(float(params.top_p))
-            top_ks.append(int(params.top_k))
+            temperature = float(params.temperature)
+            top_p = float(params.top_p)
+            top_k = int(params.top_k)
+            temperatures.append(temperature)
+            top_ps.append(top_p)
+            top_ks.append(top_k)
             if params.seed is None:
-                has_seeds.append(0)
-                seeds.append(0)
+                if self.sampler._is_greedy_row(temperature, top_p, top_k, 0):
+                    has_seeds.append(0)
+                    seeds.append(0)
+                    continue
+                seq_id = int(getattr(seq_obj, "seq_id", 0))
+                step = int(getattr(seq_obj, "num_completion_tokens", 0))
+                auto_seed = self.sampler._mix64(
+                    (seq_id + 1) * 0x9E3779B97F4A7C15
+                    ^ (step + 1) * 0xBF58476D1CE4E5B9
+                )
+                has_seeds.append(1)
+                seeds.append(int(auto_seed))
             else:
                 has_seeds.append(1)
                 seeds.append(int(params.seed))
@@ -904,6 +923,8 @@ class GPUModelRunner:
             cudnn_page_table=cudnn_page_table_t,
             cudnn_qo_ragged_offset=ragged_t,
             cudnn_b_exec=int(b_exec),
+            cudnn_warmup_b=int(self._config.max_num_seqs),
+            cudnn_warmup_s_q=int(self._config.cudnn_prefill_warmup_max_seqlen_q),
             keepalive=keepalive,
         )
 

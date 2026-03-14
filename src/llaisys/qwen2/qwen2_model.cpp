@@ -538,6 +538,8 @@ tensor_t Qwen2Model::run_block_attention_layer_(size_t layer,
                 reinterpret_cast<const int32_t *>(
                     attn_state.cudnn_qo_ragged_offset != nullptr ? attn_state.cudnn_qo_ragged_offset->data() : nullptr),
                 int(attn_state.cudnn_b_exec),
+                int(attn_state.cudnn_warmup_b),
+                int(attn_state.cudnn_warmup_s_q),
                 int(attn_state.n_batch_seq),
                 int(attn_state.max_seqlen_q),
                 int(attn_state.max_seqlen_k),
@@ -657,6 +659,8 @@ int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMe
         state->cudnn_page_table = validate_block_meta_tensor_1d(attn.cudnn_page_table, LLAISYS_DTYPE_I32, "cudnn_page_table");
         state->cudnn_qo_ragged_offset = nullptr;
         state->cudnn_b_exec = int(attn.cudnn_b_exec);
+        state->cudnn_warmup_b = std::max<int32_t>(state->cudnn_b_exec, int(attn.cudnn_warmup_b));
+        state->cudnn_warmup_s_q = std::max<int32_t>(state->max_seqlen_q, int(attn.cudnn_warmup_s_q));
         CHECK_ARGUMENT(state->cudnn_b_exec > 0, "Qwen2: invalid cudnn_b_exec");
         CHECK_ARGUMENT(state->cudnn_seq_lens_q->shape()[0] == static_cast<size_t>(state->cudnn_b_exec),
                        "Qwen2: cudnn_seq_lens_q size mismatch");
@@ -679,6 +683,8 @@ int32_t Qwen2Model::validate_and_bind_block_attention_state_(const ::AttentionMe
         state->cudnn_page_table = nullptr;
         state->cudnn_qo_ragged_offset = nullptr;
         state->cudnn_b_exec = 0;
+        state->cudnn_warmup_b = 0;
+        state->cudnn_warmup_s_q = 0;
 
         state->cu_seqlens_q = validate_block_meta_tensor_1d(attn.cu_seqlens_q, LLAISYS_DTYPE_I32, "cu_seqlens_q");
         CHECK_ARGUMENT(state->cu_seqlens_q->shape()[0] >= 2, "Qwen2: cu_seqlens_q must have at least 2 elements");

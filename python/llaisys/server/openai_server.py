@@ -165,6 +165,14 @@ class OpenAIServer:
     def cancel(self, request_id: str) -> bool:
         return self._async_engine.cancel(request_id)
 
+    def kv_cache_stats(self) -> dict:
+        engine = self._async_engine.inner_engine
+        fn = getattr(engine, "kv_cache_stats", None)
+        if not callable(fn):
+            return {}
+        out = fn()
+        return out if isinstance(out, dict) else {}
+
     def _messages_to_prompt(self, messages: list[ChatMessage] | tuple[ChatMessage, ...]) -> list[int]:
         payload = [{"role": m.role, "content": m.content} for m in messages]
         return self._async_engine.encode_chat_messages(payload)

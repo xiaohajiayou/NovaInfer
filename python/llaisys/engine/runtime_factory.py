@@ -219,6 +219,16 @@ def select_tp_device_ids(tp_size: int, explicit_ids: tuple[int, ...] | None) -> 
             raise RuntimeError("tensor_parallel_device_ids contains duplicates")
         if any(v < 0 for v in ids):
             raise RuntimeError("tensor_parallel_device_ids contains negative id")
+        cudart = _load_cudart()
+        if cudart is None:
+            raise RuntimeError("failed to load CUDA runtime (libcudart) for TP device validation")
+        ndev = _cuda_visible_device_count(cudart)
+        if any(v >= ndev for v in ids):
+            raise RuntimeError(
+                "tensor_parallel_device_ids must be logical visible device ids: "
+                f"requested={list(ids)} visible_count={ndev}. "
+                "If CUDA_VISIBLE_DEVICES is set, pass ids like 0,1 within that visible set."
+            )
         return ids
 
     if tp == 1:

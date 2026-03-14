@@ -31,6 +31,8 @@ struct CommonAttentionMetadata {
     const int32_t *cudnn_page_table{nullptr};
     const int32_t *cudnn_qo_ragged_offset{nullptr};
     int32_t cudnn_b_exec{0};
+    int32_t cudnn_warmup_b{0};
+    int32_t cudnn_warmup_s_q{0};
     int32_t nseq{0};
     int32_t max_seqlen_q{0};
     int32_t max_seqlen_k{0};

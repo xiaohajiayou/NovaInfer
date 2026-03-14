@@ -7,6 +7,7 @@ from llaisys.engine.buffers import CpuGpuBuffer
 from llaisys.engine.config import EngineConfig
 from llaisys.engine.cpu_model_runner import CPUModelRunner
 from llaisys.engine.gpu_model_runner import GPUModelRunner
+from llaisys.engine.sampler import Sampler
 from llaisys.engine.sequence import Sequence
 from llaisys.engine.types import SamplingParams
 
@@ -108,3 +109,42 @@ def test_cpu_runner_block_metadata_capacity_guard():
 
     with pytest.raises(RuntimeError, match="n_block_elems exceeds configured BLOCK metadata capacity"):
         runner.prepare_prefill([seq1, seq2])
+
+
+def test_prepare_sample_auto_seed_is_stable_across_batch_order():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.sampler = Sampler(llaisys.DeviceType.CPU, max_num_seqs=8)
+
+    params = SamplingParams(max_new_tokens=4, top_k=40, top_p=0.95, temperature=0.6)
+    seq_a = Sequence(seq_id=101, token_ids=[1, 2, 3], sampling_params=params, block_size=1)
+    seq_b = Sequence(seq_id=202, token_ids=[4, 5, 6], sampling_params=params, block_size=1)
+
+    temps_ab, top_ps_ab, top_ks_ab, seeds_ab, has_seeds_ab = runner.prepare_sample([seq_a, seq_b])
+    temps_ba, top_ps_ba, top_ks_ba, seeds_ba, has_seeds_ba = runner.prepare_sample([seq_b, seq_a])
+
+    assert temps_ab == temps_ba[::-1]
+    assert top_ps_ab == top_ps_ba[::-1]
+    assert top_ks_ab == top_ks_ba[::-1]
+    assert has_seeds_ab == [1, 1]
+    assert has_seeds_ba == [1, 1]
+
+    seeds_by_seq_ab = {seq.seq_id: seed for seq, seed in zip([seq_a, seq_b], seeds_ab)}
+    seeds_by_seq_ba = {seq.seq_id: seed for seq, seed in zip([seq_b, seq_a], seeds_ba)}
+    assert seeds_by_seq_ab == seeds_by_seq_ba
+
+    seq_a.append_token(7)
+    _, _, _, advanced_seeds, advanced_has_seeds = runner.prepare_sample([seq_a])
+    assert advanced_has_seeds == [1]
+    assert advanced_seeds[0] != seeds_by_seq_ab[seq_a.seq_id]
+
+
+def test_prepare_sample_keeps_greedy_rows_seedless():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.sampler = Sampler(llaisys.DeviceType.CPU, max_num_seqs=4)
+
+    greedy = SamplingParams(max_new_tokens=2, top_k=0, top_p=1.0, temperature=1.0)
+    seq = Sequence(seq_id=7, token_ids=[1, 2], sampling_params=greedy, block_size=1)
+
+    _, _, _, seeds, has_seeds = runner.prepare_sample([seq])
+    assert seeds == [0]
+    assert has_seeds == [0]

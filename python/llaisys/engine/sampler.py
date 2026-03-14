@@ -29,6 +29,7 @@ class Sampler:
         self._device = cfg.device
         self._device_id = int(device_id)
         self._max_num_seqs = max(1, int(cfg.max_num_seqs))
+        self._sample_counter = 0
         self._temperatures = Tensor((self._max_num_seqs,), DataType.F32, self._device, self._device_id)
         self._top_ps = Tensor((self._max_num_seqs,), DataType.F32, self._device, self._device_id)
         self._top_ks = Tensor((self._max_num_seqs,), DataType.I32, self._device, self._device_id)
@@ -72,6 +73,48 @@ class Sampler:
             ):
                 return False
         return True
+
+    @staticmethod
+    def _mix64(x: int) -> int:
+        x = (int(x) + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        x ^= x >> 30
+        x = (x * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        x ^= x >> 27
+        x = (x * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        x ^= x >> 31
+        return x & 0x7FFFFFFFFFFFFFFF
+
+    def _prepare_effective_seeds(
+        self,
+        n_outputs: int,
+        temperatures: Sequence[float],
+        top_ps: Sequence[float],
+        top_ks: Sequence[int],
+        seeds: Sequence[int],
+        has_seeds: Sequence[int],
+    ) -> tuple[list[int], list[int]]:
+        self._sample_counter = (int(self._sample_counter) + 1) & 0xFFFFFFFFFFFFFFFF
+        nonce = self._sample_counter
+        out_seeds: list[int] = [0] * int(n_outputs)
+        out_has_seeds: list[int] = [0] * int(n_outputs)
+        for i in range(int(n_outputs)):
+            has_seed = int(has_seeds[i])
+            if has_seed != 0:
+                out_seeds[i] = int(seeds[i])
+                out_has_seeds[i] = 1
+                continue
+            if self._is_greedy_row(float(temperatures[i]), float(top_ps[i]), int(top_ks[i]), 0):
+                out_seeds[i] = 0
+                out_has_seeds[i] = 0
+                continue
+            mixed = self._mix64(
+                nonce
+                ^ ((int(i) + 1) * 0x9E3779B97F4A7C15)
+                ^ ((int(self._device_id) + 1) * 0xBF58476D1CE4E5B9)
+            )
+            out_seeds[i] = int(mixed)
+            out_has_seeds[i] = 1
+        return out_seeds, out_has_seeds
 
     @staticmethod
     def _copy_prefix(dst: Tensor, values: Sequence[int | float], dtype: np.dtype, n: int) -> Tensor:
@@ -121,11 +164,19 @@ class Sampler:
         if not self._controls_are_all_greedy(n_outputs, temperatures, top_ps, top_ks, has_seeds):
             if temperatures is None or top_ps is None or top_ks is None or seeds is None or has_seeds is None:
                 raise RuntimeError("sampler controls must be fully specified for non-greedy sampling")
+            eff_seeds, eff_has_seeds = self._prepare_effective_seeds(
+                n_outputs,
+                temperatures,
+                top_ps,
+                top_ks,
+                seeds,
+                has_seeds,
+            )
             temp_t = self._copy_prefix(self._temperatures, temperatures, np.float32, n_outputs)
             top_p_t = self._copy_prefix(self._top_ps, top_ps, np.float32, n_outputs)
             top_k_t = self._copy_prefix(self._top_ks, top_ks, np.int32, n_outputs)
-            seeds_t = self._copy_prefix(self._seeds, seeds, np.int64, n_outputs)
-            has_seeds_t = self._copy_prefix(self._has_seeds, has_seeds, np.int32, n_outputs)
+            seeds_t = self._copy_prefix(self._seeds, eff_seeds, np.int64, n_outputs)
+            has_seeds_t = self._copy_prefix(self._has_seeds, eff_has_seeds, np.int32, n_outputs)
             keepalive.extend([temp_t, top_p_t, top_k_t, seeds_t, has_seeds_t])
             sin.temperatures = temp_t.lib_tensor()
             sin.top_ps = top_p_t.lib_tensor()

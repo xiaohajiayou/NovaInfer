@@ -208,7 +208,7 @@ PYTHONPATH=python python -m llaisys.server \
   --device nvidia \
   --tensor-parallel-size 2 \
   --distributed-executor-backend mp \
-  --tensor-parallel-device-ids 5,6 \
+  --tensor-parallel-device-ids 0,1 \
   --kv-cache-memory-utilization 0.9 \
   --host 127.0.0.1 \
   --port 8675 \

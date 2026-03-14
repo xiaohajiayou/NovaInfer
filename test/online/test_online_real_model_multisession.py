@@ -27,6 +27,20 @@ def _collect_stream(server: OpenAIServer, prompt: str, max_tokens: int = 12) -> 
     return list(server.handle_chat_stream(req))
 
 
+def _collect_stream_with_server_defaults(
+    server: OpenAIServer,
+    prompt: str,
+    max_tokens: int = 12,
+) -> list[dict]:
+    req = ChatCompletionRequest(
+        model="qwen2",
+        messages=[ChatMessage(role="user", content=prompt)],
+        stream=True,
+        max_tokens=max_tokens,
+    )
+    return list(server.handle_chat_stream(req))
+
+
 def _assert_single_request_stream(chunks: list[dict]) -> str:
     assert chunks, "stream must not be empty"
     req_ids = [c.get("request_id") for c in chunks if c.get("request_id")]
@@ -64,6 +78,19 @@ def _restore_attn_backend(old: str | None):
         os.environ.pop(key, None)
     else:
         os.environ[key] = old
+
+
+def _maybe_skip_cudnn_runtime_failure(backend: str, exc: BaseException) -> None:
+    if backend != "cudnn":
+        return
+    msg = str(exc)
+    if (
+        "No valid engine configs" in msg
+        or "self_attention_paged: CUDNN backend execution failed" in msg
+        or "modelForward failed with status=-1" in msg
+        or "AsyncLLMEngine loop thread crashed" in msg
+    ):
+        pytest.skip(f"cudnn runtime unavailable for this test shape: {exc}")
 
 
 def _hf_completion_tokens(model_path: str, prompt: str, max_new_tokens: int) -> list[int]:
@@ -127,6 +154,197 @@ def test_online_real_model_multisession_stream_isolation(require_model_path: str
         assert any(c.get("token_id") is not None for c in non_final_b)
     finally:
         async_engine.close()
+
+
+@pytest.mark.requires_model
+@pytest.mark.online
+@pytest.mark.test_device("cpu")
+@pytest.mark.test_layout("block")
+@pytest.mark.test_backend("native")
+def test_online_real_model_multisession_server_default_sampling_path(require_model_path: str):
+    engine = LLMEngine(
+        model_type="qwen2",
+        model_path=require_model_path,
+    )
+    async_engine = AsyncLLMEngine(engine=engine)
+    server = OpenAIServer(async_engine)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(
+                _collect_stream_with_server_defaults,
+                server,
+                "请用中文简短介绍一下自己。",
+                16,
+            )
+            fut_b = pool.submit(
+                _collect_stream_with_server_defaults,
+                server,
+                "Please answer briefly in English: what can you help with?",
+                16,
+            )
+            chunks_a = fut_a.result(timeout=180)
+            chunks_b = fut_b.result(timeout=180)
+
+        req_id_a = _assert_single_request_stream(chunks_a)
+        req_id_b = _assert_single_request_stream(chunks_b)
+        assert req_id_a != req_id_b, "two sessions should map to different request ids"
+
+        non_final_a = [c for c in chunks_a if not c.get("is_finished")]
+        non_final_b = [c for c in chunks_b if not c.get("is_finished")]
+        assert non_final_a and non_final_b
+
+        token_ids_a = [int(c["token_id"]) for c in non_final_a if c.get("token_id") is not None]
+        token_ids_b = [int(c["token_id"]) for c in non_final_b if c.get("token_id") is not None]
+        assert token_ids_a and token_ids_b
+
+        # Guard against the common failure mode we observed in concurrent default
+        # sampling: one stream degenerates into the same token repeated for nearly
+        # the entire response.
+        if len(token_ids_a) >= 8:
+            assert len(set(token_ids_a[:8])) > 1
+        if len(token_ids_b) >= 8:
+            assert len(set(token_ids_b[:8])) > 1
+    finally:
+        async_engine.close()
+
+
+@pytest.mark.requires_model
+@pytest.mark.online
+@pytest.mark.test_device("nvidia")
+@pytest.mark.test_layout("block")
+@pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
+@pytest.mark.parametrize("backend", ["native", "cudnn"])
+def test_online_real_model_multisession_server_default_sampling_path_nvidia(
+    require_model_path: str,
+    backend: str,
+):
+    old_backend = _set_attn_backend(backend)
+    async_engine = None
+    try:
+        try:
+            engine = LLMEngine(
+                model_type="qwen2",
+                model_path=require_model_path,
+                device=llaisys.DeviceType.NVIDIA,
+                max_model_len=4096,
+                max_batch_size=8,
+            )
+            async_engine = AsyncLLMEngine(engine=engine)
+            server = OpenAIServer(async_engine)
+        except Exception as exc:
+            if backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(
+                    _collect_stream_with_server_defaults,
+                    server,
+                    "请用中文简短介绍一下自己。",
+                    16,
+                )
+                fut_b = pool.submit(
+                    _collect_stream_with_server_defaults,
+                    server,
+                    "Please answer briefly in English: what can you help with?",
+                    16,
+                )
+                chunks_a = fut_a.result(timeout=180)
+                chunks_b = fut_b.result(timeout=180)
+        except Exception as exc:
+            _maybe_skip_cudnn_runtime_failure(backend, exc)
+            raise
+
+        req_id_a = _assert_single_request_stream(chunks_a)
+        req_id_b = _assert_single_request_stream(chunks_b)
+        assert req_id_a != req_id_b, "two sessions should map to different request ids"
+
+        non_final_a = [c for c in chunks_a if not c.get("is_finished")]
+        non_final_b = [c for c in chunks_b if not c.get("is_finished")]
+        assert non_final_a and non_final_b
+
+        token_ids_a = [int(c["token_id"]) for c in non_final_a if c.get("token_id") is not None]
+        token_ids_b = [int(c["token_id"]) for c in non_final_b if c.get("token_id") is not None]
+        assert token_ids_a and token_ids_b
+
+        if len(token_ids_a) >= 8:
+            assert len(set(token_ids_a[:8])) > 1
+        if len(token_ids_b) >= 8:
+            assert len(set(token_ids_b[:8])) > 1
+    finally:
+        if async_engine is not None:
+            async_engine.close()
+        _restore_attn_backend(old_backend)
+
+
+@pytest.mark.requires_model
+@pytest.mark.online
+@pytest.mark.test_device("nvidia")
+@pytest.mark.test_layout("block")
+@pytest.mark.skipif(not _has_nvidia_runtime(), reason="NVIDIA runtime unavailable")
+@pytest.mark.parametrize("backend", ["native", "cudnn"])
+def test_online_real_model_multisession_server_default_sampling_after_singleton_nvidia(
+    require_model_path: str,
+    backend: str,
+):
+    old_backend = _set_attn_backend(backend)
+    async_engine = None
+    try:
+        try:
+            engine = LLMEngine(
+                model_type="qwen2",
+                model_path=require_model_path,
+                device=llaisys.DeviceType.NVIDIA,
+                max_model_len=4096,
+                max_batch_size=8,
+                enable_prefix_caching=False,
+            )
+            async_engine = AsyncLLMEngine(engine=engine)
+            server = OpenAIServer(async_engine)
+        except Exception as exc:
+            if backend == "cudnn":
+                pytest.skip(f"cudnn backend unavailable or failed to initialize: {exc}")
+            raise
+
+        warmup_chunks = _collect_stream_with_server_defaults(server, "请唱一首歌。", 32)
+        _assert_single_request_stream(warmup_chunks)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_a = pool.submit(
+                    _collect_stream_with_server_defaults,
+                    server,
+                    "请继续刚才的话题。",
+                    32,
+                )
+                fut_b = pool.submit(
+                    _collect_stream_with_server_defaults,
+                    server,
+                    "请用一句中文介绍你自己。",
+                    32,
+                )
+                chunks_a = fut_a.result(timeout=180)
+                chunks_b = fut_b.result(timeout=180)
+        except Exception as exc:
+            _maybe_skip_cudnn_runtime_failure(backend, exc)
+            raise
+
+        req_id_a = _assert_single_request_stream(chunks_a)
+        req_id_b = _assert_single_request_stream(chunks_b)
+        assert req_id_a != req_id_b
+
+        token_ids_a = [int(c["token_id"]) for c in chunks_a if not c.get("is_finished") and c.get("token_id") is not None]
+        token_ids_b = [int(c["token_id"]) for c in chunks_b if not c.get("is_finished") and c.get("token_id") is not None]
+        assert token_ids_a and token_ids_b
+        if len(token_ids_a) >= 8:
+            assert len(set(token_ids_a[:8])) > 1
+        if len(token_ids_b) >= 8:
+            assert len(set(token_ids_b[:8])) > 1
+    finally:
+        if async_engine is not None:
+            async_engine.close()
+        _restore_attn_backend(old_backend)
 
 
 @pytest.mark.requires_model

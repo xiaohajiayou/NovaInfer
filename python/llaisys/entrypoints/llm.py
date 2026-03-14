@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import os
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -21,23 +19,7 @@ class LLM:
         model_registry: ModelRegistry | None = None,
         **kwargs,
     ):
-        hint_max_num_seqs = (
-            config.max_num_seqs
-            if config is not None
-            else kwargs.get("max_num_seqs", kwargs.get("max_batch_size"))
-        )
-        hint_max_model_len = config.max_model_len if config is not None else kwargs.get("max_model_len")
-        hint_kv_block_size = (
-            config.kv_cache_block_size
-            if config is not None
-            else kwargs.get("kv_cache_block_size", 16)
-        )
         self._tokenizer = None
-        self._configure_cudnn_prebuild_hint_(
-            max_num_seqs=hint_max_num_seqs,
-            max_model_len=hint_max_model_len,
-            kv_cache_block_size=hint_kv_block_size,
-        )
         kwargs.setdefault("model_path", model)
         engine = LLMEngine(
             config=config,
@@ -50,33 +32,6 @@ class LLM:
             resolved_model_path = cfg.model_path
         self._model_path = Path(resolved_model_path)
         self._engine_client = EngineClient(engine)
-
-    def _configure_cudnn_prebuild_hint_(
-        self,
-        max_num_seqs: int | None,
-        max_model_len: int | None,
-        kv_cache_block_size: int,
-    ) -> None:
-        # Auto-derive cuDNN prebuild bucket from scheduler shape limits.
-        backend = os.environ.get("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "").strip().lower()
-        if backend != "cudnn":
-            return
-
-        # Respect explicit user override if already set.
-        if not os.environ.get("LLAISYS_CUDNN_PREBUILD_MAX_B"):
-            seq_cap = max(1, int(max_num_seqs)) if max_num_seqs is not None else 8
-            b_hint = 1
-            while b_hint < seq_cap:
-                b_hint <<= 1
-            b_hint = max(64, b_hint)
-            os.environ["LLAISYS_CUDNN_PREBUILD_MAX_B"] = str(b_hint)
-
-        # Stabilize page-table capacity across decode steps by using config upper
-        # bound, so cuDNN does not repeatedly rebuild plans on width growth.
-        if not os.environ.get("LLAISYS_CUDNN_BLOCK_TABLE_CAP"):
-            if max_model_len is not None and int(max_model_len) > 0 and int(kv_cache_block_size) > 0:
-                cap = max(1, int(max_model_len) // int(kv_cache_block_size))
-                os.environ["LLAISYS_CUDNN_BLOCK_TABLE_CAP"] = str(cap)
 
     def submit(
         self,
