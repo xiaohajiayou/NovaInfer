@@ -1,0 +1,1 @@
+#include "../../../src/ops/self_attention/cuda/self_attention_cuda.cu"

@@ -1,0 +1,1 @@
+#include "../../../src/ops/argmax/cuda/argmax_cuda.cu"

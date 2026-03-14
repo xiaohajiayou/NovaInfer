@@ -37,6 +37,22 @@ bool cuda_call_noexcept(cudaError_t rc, const char *what, const char *file, int 
 
 } // namespace
 
+size_t getDeviceFreeMemory(int device_id) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    (void)LLAISYS_CUDA_CALL_NOEXCEPT(cudaSetDevice(device_id));
+    (void)LLAISYS_CUDA_CALL_NOEXCEPT(cudaMemGetInfo(&free_b, &total_b));
+    return free_b;
+}
+
+size_t getDeviceTotalMemory(int device_id) {
+    size_t free_b = 0;
+    size_t total_b = 0;
+    (void)LLAISYS_CUDA_CALL_NOEXCEPT(cudaSetDevice(device_id));
+    (void)LLAISYS_CUDA_CALL_NOEXCEPT(cudaMemGetInfo(&free_b, &total_b));
+    return total_b;
+}
+
 namespace runtime_api {
 int getDeviceCount() {
     int count = 0;

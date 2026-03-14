@@ -8,7 +8,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from test.parity.backend_matrix import parity_device_backend_layout_cases
+from test.parity.backend_matrix import has_llaisys_nvidia_runtime, has_torch_cuda, parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
 
 
@@ -18,14 +18,12 @@ MULTI_PROMPTS = [
 ]
 
 def _has_nvidia_runtime() -> bool:
-    try:
-        api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
-        return api.get_device_count() > 0 and torch.cuda.is_available()
-    except Exception:
-        return False
+    return has_llaisys_nvidia_runtime()
 
 
 def load_hf_model(model_path: str, device_name="cpu"):
+    if device_name == "nvidia" and not has_torch_cuda():
+        device_name = "cpu"
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
