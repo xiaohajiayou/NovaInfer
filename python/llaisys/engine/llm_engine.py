@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Dict, Sequence
 
-from ..libllaisys.model import KvCacheLayout
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from .config import EngineConfig
 from .executor import Executor
 from .model_registry import ModelRegistry
@@ -76,11 +75,8 @@ class LLMEngine:
             config=cfg,
             model_registry=model_registry,
         )
-        self._prefix_cache_enabled = (
-            cfg.kv_cache_layout == KvCacheLayout.BLOCK and bool(cfg.enable_prefix_caching)
-        )
+        self._prefix_cache_enabled = bool(cfg.enable_prefix_caching)
         # Runtime-derived capacity/length are synced into cfg during model runner init.
-        # Prefix caching is forced off when not using BLOCK layout.
         cfg.enable_prefix_caching = bool(self._prefix_cache_enabled)
         if cfg.end_token_id is None:
             raise ValueError("end_token_id is required")

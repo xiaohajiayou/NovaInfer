@@ -1,317 +1,158 @@
 #include "llaisys/models/model.h"
 
-#include "../ops/argmax/op.hpp"
-#include "../ops/embedding/op.hpp"
-#include "llaisys_tensor.hpp"
-#include "qwen2/qwen2_model.hpp"
-#include "runtime/kv_cache/paged_kv.hpp"
-#include "runtime/kv_cache/unified_kv.hpp"
-#include "runtime/weights/weights.hpp"
 #include "../core/context/context.hpp"
 #include "../utils.hpp"
+#include "kv_cache/paged_kv.hpp"
+#include "llaisys_tensor.hpp"
+#include "qwen2/qwen2_model.hpp"
+#include "weights/weights.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <new>
 #include <string>
-#include <type_traits>
-#include <unordered_map>
+#include <thread>
 #include <vector>
+
+#ifdef ENABLE_NCCL_API
+#include <nccl.h>
+#endif
 
 namespace {
 
 using llaisys::models::qwen2::Qwen2Model;
-using KvStatus = llaisys::runtime::kv_cache::KvStatus;
-using KvCacheBase = llaisys::runtime::kv_cache::KvCacheBase;
-using KvCacheLayout = llaisys::runtime::kv_cache::KvCacheLayout;
+using KvStatus = llaisys::kv_cache::KvStatus;
 
 int to_kv_code(KvStatus status) {
     return static_cast<int>(status);
-}
-
-llaisys::tensor_t kv_layer_k_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
-    if (cache == nullptr) {
-        return nullptr;
-    }
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        return impl ? impl->layer_k(layer) : nullptr;
-    }
-    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
-    return impl ? impl->layer_k(layer) : nullptr;
-}
-
-llaisys::tensor_t kv_layer_v_from_cache(KvCacheBase *cache, KvCacheLayout layout, size_t layer) {
-    if (cache == nullptr) {
-        return nullptr;
-    }
-    if (layout == KvCacheLayout::SLOT) {
-        auto *impl = dynamic_cast<llaisys::runtime::kv_cache::UnifiedKvImpl *>(cache);
-        return impl ? impl->layer_v(layer) : nullptr;
-    }
-    auto *impl = dynamic_cast<llaisys::runtime::kv_cache::PagedKvImpl *>(cache);
-    return impl ? impl->layer_v(layer) : nullptr;
 }
 
 std::string str_or_empty(const char *s) {
     return s == nullptr ? std::string{} : std::string{s};
 }
 
-class MockModel {
-public:
-    KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
-        auto it = seq_pos_max_.find(src_seq);
-        if (it == seq_pos_max_.end()) {
-            return KvStatus::INVALID_SEQ;
+class MockModel {};
+
+struct LlaisysParallelContextImpl {
+    int32_t tensor_parallel_size{1};
+    int32_t rank{0};
+    int32_t local_rank{0};
+    std::string distributed_backend{};
+    std::string init_method{};
+    std::vector<int> device_ids{};
+#ifdef ENABLE_NCCL_API
+    ncclComm_t nccl_comm{nullptr};
+#endif
+
+    ~LlaisysParallelContextImpl() {
+#ifdef ENABLE_NCCL_API
+        if (nccl_comm != nullptr) {
+            ncclCommDestroy(nccl_comm);
+            nccl_comm = nullptr;
         }
-        if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return KvStatus::INVALID_POS;
-        }
-        if (p0 == p1) {
-            return KvStatus::EMPTY_RANGE;
-        }
-        seq_pos_max_[dst_seq] = static_cast<int64_t>(p1 - p0 - 1);
-        return KvStatus::OK;
+#endif
     }
-    KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
-        auto it = seq_pos_max_.find(seq_id);
-        if (it == seq_pos_max_.end()) {
-            return KvStatus::INVALID_SEQ;
+
+    int initialize() {
+        if (tensor_parallel_size <= 1) {
+            return 0;
         }
-        if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return KvStatus::INVALID_POS;
+#ifndef ENABLE_NCCL_API
+        std::fprintf(stderr, "[ERROR] TP requires ENABLE_NCCL_API build\n");
+        return -1;
+#else
+        if (!distributed_backend.empty() && distributed_backend != "nccl") {
+            std::fprintf(stderr, "[ERROR] unsupported distributed_backend=%s\n", distributed_backend.c_str());
+            return -1;
         }
-        if (p0 == p1) {
-            return KvStatus::EMPTY_RANGE;
+        if (static_cast<int32_t>(device_ids.size()) != tensor_parallel_size) {
+            std::fprintf(stderr,
+                         "[ERROR] parallel context invalid device_ids: tp_size=%d rank=%d local_rank=%d ndevice=%d\n",
+                         tensor_parallel_size,
+                         rank,
+                         local_rank,
+                         static_cast<int>(device_ids.size()));
+            return -1;
         }
-        if (p0 == 0 && p1 == it->second + 1) {
-            seq_pos_max_.erase(it);
+
+        std::string id_file;
+        if (!init_method.empty() && init_method.rfind("file://", 0) == 0) {
+            id_file = init_method.substr(7);
+        }
+        if (id_file.empty()) {
+            id_file = "/tmp/llaisys_tp_nccl.id";
+        }
+
+        llaisys::core::context().setDevice(LLAISYS_DEVICE_NVIDIA, device_ids[static_cast<size_t>(rank)]);
+
+        ncclUniqueId uid{};
+        if (rank == 0) {
+            const ncclResult_t uid_rc = ncclGetUniqueId(&uid);
+            if (uid_rc != ncclSuccess) {
+                std::fprintf(stderr, "[ERROR] ncclGetUniqueId failed: %s\n", ncclGetErrorString(uid_rc));
+                return -1;
+            }
+            std::ofstream ofs(id_file, std::ios::binary | std::ios::trunc);
+            if (!ofs.good()) {
+                std::fprintf(stderr, "[ERROR] open NCCL id file failed: %s\n", id_file.c_str());
+                return -1;
+            }
+            ofs.write(reinterpret_cast<const char *>(&uid), sizeof(uid));
+            ofs.flush();
+            if (!ofs.good()) {
+                std::fprintf(stderr, "[ERROR] write NCCL id file failed: %s\n", id_file.c_str());
+                return -1;
+            }
         } else {
-            it->second = p0 - 1;
-        }
-        return KvStatus::OK;
-    }
-    KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-        auto it = seq_pos_max_.find(seq_id);
-        if (it == seq_pos_max_.end()) {
-            return KvStatus::INVALID_SEQ;
-        }
-        if (p0 < 0 || p1 < 0 || p0 > p1 || p1 > it->second + 1) {
-            return KvStatus::INVALID_POS;
-        }
-        if (p0 == p1) {
-            return KvStatus::EMPTY_RANGE;
-        }
-        if (delta != 0) {
-            return KvStatus::INVALID_POS;
-        }
-        return KvStatus::OK;
-    }
-    KvStatus kv_seq_keep(int64_t seq_id) {
-        if (seq_pos_max_.find(seq_id) == seq_pos_max_.end()) {
-            return KvStatus::INVALID_SEQ;
-        }
-        std::vector<int64_t> remove_keys;
-        remove_keys.reserve(seq_pos_max_.size());
-        for (const auto &kv : seq_pos_max_) {
-            if (kv.first != seq_id) {
-                remove_keys.push_back(kv.first);
-            }
-        }
-        for (const int64_t k : remove_keys) {
-            seq_pos_max_.erase(k);
-        }
-        return KvStatus::OK;
-    }
-    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept {
-        auto it = seq_pos_max_.find(seq_id);
-        if (it == seq_pos_max_.end()) {
-            return -1;
-        }
-        return it->second;
-    }
-
-    KvStatus request_free(int64_t seq_id) {
-        auto it = seq_pos_max_.find(seq_id);
-        if (it == seq_pos_max_.end()) {
-            return KvStatus::INVALID_SEQ;
-        }
-        seq_pos_max_.erase(it);
-        return KvStatus::OK;
-    }
-
-private:
-    std::unordered_map<int64_t, int64_t> seq_pos_max_{};
-};
-
-class RuntimeKVCacheManager {
-public:
-    virtual ~RuntimeKVCacheManager() = default;
-    virtual KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) = 0;
-    virtual KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) = 0;
-    virtual KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) = 0;
-    virtual KvStatus kv_seq_keep(int64_t seq_id) = 0;
-    virtual int64_t kv_seq_pos_max(int64_t seq_id) const noexcept = 0;
-    virtual KvStatus request_free(int64_t seq_id) = 0;
-    virtual int kv_stats(LlaisysKvStats *out_stats) noexcept = 0;
-    virtual KvStatus kv_reset_prefix_cache() = 0;
-};
-
-class ModelKVCacheManager final : public RuntimeKVCacheManager {
-public:
-    ModelKVCacheManager(KvCacheBase *kv_cache,
-                        KvCacheLayout kv_layout,
-                        size_t kv_nlayer,
-                        size_t kv_nkvh,
-                        size_t kv_dh,
-                        llaisysDataType_t kv_dtype,
-                        size_t kv_capacity_tokens)
-        : kv_cache_(kv_cache),
-          kv_layout_(kv_layout),
-          kv_nlayer_(kv_nlayer),
-          kv_nkvh_(kv_nkvh),
-          kv_dh_(kv_dh),
-          kv_dtype_(kv_dtype),
-          kv_capacity_tokens_(kv_capacity_tokens) {}
-
-    KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) override {
-        LLAISYS_NVTX_SCOPE("runtime/kv_seq_cp");
-        if (kv_cache_ == nullptr) {
-            return KvStatus::INTERNAL_ERROR;
-        }
-        std::vector<int32_t> src_slots;
-        std::vector<int32_t> dst_slots;
-        const KvStatus rc = kv_cache_->seq_cp(dst_seq, src_seq, p0, p1, &src_slots, &dst_slots);
-        if (rc != KvStatus::OK) {
-            return rc;
-        }
-        LLAISYS_NVTX_SCOPE("runtime/kv_seq_cp_memcpy");
-        const size_t copy_len = src_slots.size();
-        const size_t stride_elems = kv_nkvh_ * kv_dh_;
-        const size_t stride_bytes = stride_elems * llaisys::utils::dsize(kv_dtype_);
-        for (size_t i = 0; i < copy_len; ++i) {
-            const int32_t src_slot = src_slots[i];
-            const int32_t dst_slot = dst_slots[i];
-            if (src_slot == dst_slot) {
-                continue;
-            }
-            for (size_t layer = 0; layer < kv_nlayer_; ++layer) {
-                llaisys::tensor_t layer_k_cache = kv_layer_k_from_cache(kv_cache_, kv_layout_, layer);
-                llaisys::tensor_t layer_v_cache = kv_layer_v_from_cache(kv_cache_, kv_layout_, layer);
-                if (layer_k_cache == nullptr || layer_v_cache == nullptr) {
-                    return KvStatus::INTERNAL_ERROR;
+            bool ok = false;
+            constexpr int kMaxRetry = 2000;
+            for (int i = 0; i < kMaxRetry; ++i) {
+                std::ifstream ifs(id_file, std::ios::binary);
+                if (ifs.good()) {
+                    ifs.read(reinterpret_cast<char *>(&uid), sizeof(uid));
+                    if (ifs.gcount() == static_cast<std::streamsize>(sizeof(uid))) {
+                        ok = true;
+                        break;
+                    }
                 }
-                std::byte *k_dst =
-                    layer_k_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
-                std::byte *v_dst =
-                    layer_v_cache->data() + static_cast<ptrdiff_t>(dst_slot) * static_cast<ptrdiff_t>(stride_bytes);
-                const std::byte *k_src =
-                    layer_k_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
-                const std::byte *v_src =
-                    layer_v_cache->data() + static_cast<ptrdiff_t>(src_slot) * static_cast<ptrdiff_t>(stride_bytes);
-                std::memcpy(k_dst, k_src, stride_bytes);
-                std::memcpy(v_dst, v_src, stride_bytes);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!ok) {
+                std::fprintf(stderr,
+                             "[ERROR] read NCCL id file timeout: path=%s tp_size=%d rank=%d local_rank=%d\n",
+                             id_file.c_str(),
+                             tensor_parallel_size,
+                             rank,
+                             local_rank);
+                return -1;
             }
         }
-        return KvStatus::OK;
-    }
 
-    KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) override {
-        return kv_cache_ ? kv_cache_->seq_rm(seq_id, p0, p1) : KvStatus::INTERNAL_ERROR;
-    }
-
-    KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) override {
-        return kv_cache_ ? kv_cache_->seq_add(seq_id, p0, p1, delta) : KvStatus::INTERNAL_ERROR;
-    }
-
-    KvStatus kv_seq_keep(int64_t seq_id) override {
-        return kv_cache_ ? kv_cache_->seq_keep(seq_id) : KvStatus::INTERNAL_ERROR;
-    }
-
-    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept override {
-        return kv_cache_ ? kv_cache_->seq_pos_max(seq_id) : -1;
-    }
-
-    KvStatus request_free(int64_t seq_id) override {
-        return kv_cache_ ? kv_cache_->request_free(seq_id) : KvStatus::INTERNAL_ERROR;
-    }
-
-    int kv_stats(LlaisysKvStats *out_stats) noexcept override {
-        if (out_stats == nullptr || kv_cache_ == nullptr) {
+        const ncclResult_t init_rc = ncclCommInitRank(&nccl_comm, tensor_parallel_size, uid, rank);
+        if (init_rc != ncclSuccess || nccl_comm == nullptr) {
+            std::fprintf(stderr,
+                         "[ERROR] ncclCommInitRank failed: %s tp_size=%d rank=%d dev=%d\n",
+                         ncclGetErrorString(init_rc),
+                         tensor_parallel_size,
+                         rank,
+                         device_ids[static_cast<size_t>(rank)]);
             return -1;
         }
-        std::vector<int32_t> used_slots;
-        kv_cache_->used_slots(&used_slots);
-        out_stats->capacity_tokens = static_cast<int64_t>(kv_capacity_tokens_);
-        out_stats->used_tokens = static_cast<int64_t>(used_slots.size());
-        out_stats->free_tokens = std::max<int64_t>(0, out_stats->capacity_tokens - out_stats->used_tokens);
-        if (out_stats->used_tokens > kv_peak_used_tokens_) {
-            kv_peak_used_tokens_ = out_stats->used_tokens;
-        }
-        out_stats->peak_used_tokens = kv_peak_used_tokens_;
         return 0;
+#endif
     }
-
-    KvStatus kv_reset_prefix_cache() override {
-        return kv_cache_ ? kv_cache_->reset_prefix_cache() : KvStatus::INTERNAL_ERROR;
-    }
-
-private:
-    KvCacheBase *kv_cache_{nullptr};
-    KvCacheLayout kv_layout_{KvCacheLayout::BLOCK};
-    size_t kv_nlayer_{0};
-    size_t kv_nkvh_{0};
-    size_t kv_dh_{0};
-    llaisysDataType_t kv_dtype_{LLAISYS_DTYPE_F32};
-    size_t kv_capacity_tokens_{0};
-    int64_t kv_peak_used_tokens_{0};
-};
-
-class MockKVCacheManager final : public RuntimeKVCacheManager {
-public:
-    explicit MockKVCacheManager(MockModel *mock) : mock_(mock) {}
-
-    KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) override {
-        return mock_ ? mock_->kv_seq_cp(dst_seq, src_seq, p0, p1) : KvStatus::INTERNAL_ERROR;
-    }
-    KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) override {
-        return mock_ ? mock_->kv_seq_rm(seq_id, p0, p1) : KvStatus::INTERNAL_ERROR;
-    }
-    KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) override {
-        return mock_ ? mock_->kv_seq_add(seq_id, p0, p1, delta) : KvStatus::INTERNAL_ERROR;
-    }
-    KvStatus kv_seq_keep(int64_t seq_id) override {
-        return mock_ ? mock_->kv_seq_keep(seq_id) : KvStatus::INTERNAL_ERROR;
-    }
-    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept override {
-        return mock_ ? mock_->kv_seq_pos_max(seq_id) : -1;
-    }
-    KvStatus request_free(int64_t seq_id) override {
-        return mock_ ? mock_->request_free(seq_id) : KvStatus::INTERNAL_ERROR;
-    }
-    int kv_stats(LlaisysKvStats *out_stats) noexcept override {
-        if (out_stats == nullptr) {
-            return -1;
-        }
-        out_stats->capacity_tokens = 0;
-        out_stats->used_tokens = 0;
-        out_stats->free_tokens = 0;
-        out_stats->peak_used_tokens = 0;
-        return 0;
-    }
-    KvStatus kv_reset_prefix_cache() override { return KvStatus::OK; }
-
-private:
-    MockModel *mock_{nullptr};
 };
 
 struct LlaisysModelImpl {
     LlaisysModelType type{LLAISYS_MODEL_TYPE_UNKNOWN};
     std::unique_ptr<Qwen2Model> qwen2{};
     std::unique_ptr<MockModel> mock{};
+    std::shared_ptr<LlaisysParallelContextImpl> parallel_context{};
 
     int32_t forward(const ModelForwardInput &input, ModelForwardOutput *output) {
         switch (type) {
@@ -324,172 +165,155 @@ struct LlaisysModelImpl {
         }
     }
 
+    int32_t bind_parallel_context(const std::shared_ptr<LlaisysParallelContextImpl> &ctx) {
+        if (!ctx) {
+            return -1;
+        }
+        if (parallel_context && parallel_context.get() != ctx.get()) {
+            std::fprintf(stderr, "[ERROR] model already bound to a different parallel context\n");
+            return -1;
+        }
+        switch (type) {
+        case LLAISYS_MODEL_TYPE_QWEN2: {
+            if (!qwen2) {
+                return -1;
+            }
+#ifdef ENABLE_NCCL_API
+            void *nccl_comm = reinterpret_cast<void *>(ctx->nccl_comm);
+#else
+            void *nccl_comm = nullptr;
+#endif
+            const int rc = qwen2->bind_parallel_context(
+                ctx->tensor_parallel_size,
+                ctx->rank,
+                ctx->local_rank,
+                ctx->device_ids.empty() ? nullptr : ctx->device_ids.data(),
+                static_cast<int32_t>(ctx->device_ids.size()),
+                nccl_comm);
+            if (rc != 0) {
+                return rc;
+            }
+            parallel_context = ctx;
+            return 0;
+        }
+        case LLAISYS_MODEL_TYPE_MOCK:
+            parallel_context = ctx;
+            return 0;
+        default:
+            return -1;
+        }
+    }
 };
 
 struct LlaisysKvStateImpl {
-    struct RuntimeParallelConfig {
-        int32_t tensor_parallel_size{1};
-        int32_t pipeline_parallel_size{1};
-        int32_t world_size{1};
-        int32_t rank{0};
-        int32_t local_rank{0};
-        std::string distributed_executor_backend{};
-        std::string distributed_backend{};
-        std::string master_addr{};
-        int32_t master_port{0};
-        int32_t node_rank{0};
-        int32_t nnodes{1};
-        std::string init_method{};
-        std::string tp_group_name{};
-        bool use_single_process_tp{false};
-        std::vector<int> device_ids{};
-        bool initialized{false};
-    };
-
     LlaisysKvStateCreateParams params{};
-    RuntimeParallelConfig parallel{};
-    std::unique_ptr<RuntimeKVCacheManager> kv_cache_manager{};
     std::weak_ptr<LlaisysModelImpl> bound_model{};
+    int64_t kv_peak_used_tokens{0};
 
     bool ensure_model_bound(const std::shared_ptr<LlaisysModelImpl> &impl) {
         if (!impl) {
             return false;
         }
-
-        if (auto current = bound_model.lock(); current && current.get() == impl.get() && kv_cache_manager != nullptr) {
+        if (auto current = bound_model.lock(); current && current.get() == impl.get()) {
             return true;
         }
-
-        kv_cache_manager.reset();
         bound_model.reset();
+        kv_peak_used_tokens = 0;
 
-        bool ok = false;
         switch (impl->type) {
         case LLAISYS_MODEL_TYPE_QWEN2: {
-            if (!impl->qwen2) {
-                return false;
-            }
-
-            llaisys::runtime::kv_cache::KvCacheLayout kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::BLOCK;
-            if (params.kv_cache_layout == LLAISYS_KV_CACHE_LAYOUT_SLOT) {
-                kv_layout = llaisys::runtime::kv_cache::KvCacheLayout::SLOT;
-            } else if (params.kv_cache_layout >= 0 && params.kv_cache_layout != LLAISYS_KV_CACHE_LAYOUT_BLOCK) {
-                return false;
-            }
-            const int32_t tp_size = parallel.initialized ? std::max<int32_t>(1, parallel.tensor_parallel_size) : int32_t{1};
-            const int32_t tp_rank = parallel.initialized ? std::max<int32_t>(0, parallel.rank) : int32_t{0};
-            const int32_t local_rank = parallel.initialized ? std::max<int32_t>(0, parallel.local_rank) : int32_t{0};
-            const int *tp_device_ids = parallel.device_ids.empty() ? nullptr : parallel.device_ids.data();
-            const int32_t tp_ndevice = static_cast<int32_t>(parallel.device_ids.size());
-            const char *dist_backend = parallel.distributed_backend.empty() ? nullptr : parallel.distributed_backend.c_str();
-            const char *init_method = parallel.init_method.empty() ? nullptr : parallel.init_method.c_str();
-            const int32_t use_single_process_tp = parallel.use_single_process_tp ? int32_t{1} : int32_t{0};
-            if (impl->qwen2->bind_parallel_context(
-                    tp_size, tp_rank, local_rank, tp_device_ids, tp_ndevice, dist_backend, init_method, use_single_process_tp) != 0) {
+            if (!impl->qwen2 || !impl->parallel_context) {
                 return false;
             }
             const size_t kv_block_size =
                 params.kv_cache_block_size > 0 ? static_cast<size_t>(params.kv_cache_block_size) : static_cast<size_t>(16);
-            const size_t kv_cache_capacity_tokens = params.kv_cache_capacity_tokens > 0
-                                                        ? static_cast<size_t>(params.kv_cache_capacity_tokens)
-                                                        : static_cast<size_t>(0);
+            const size_t kv_cache_capacity_tokens =
+                params.kv_cache_capacity_tokens > 0 ? static_cast<size_t>(params.kv_cache_capacity_tokens) : static_cast<size_t>(0);
             const int64_t max_model_len = params.max_model_len > 0 ? static_cast<int64_t>(params.max_model_len) : int64_t{0};
-            if (impl->qwen2->configure_runtime(kv_layout, kv_block_size, kv_cache_capacity_tokens, max_model_len) != 0 ||
+            if (impl->qwen2->configure_runtime(kv_block_size, kv_cache_capacity_tokens, max_model_len) != 0 ||
                 impl->qwen2->kv_cache() == nullptr) {
                 return false;
             }
-
-            kv_cache_manager = std::make_unique<ModelKVCacheManager>(impl->qwen2->kv_cache(),
-                                                                     impl->qwen2->kv_layout(),
-                                                                     impl->qwen2->nlayer(),
-                                                                     impl->qwen2->nkvh(),
-                                                                     impl->qwen2->dh(),
-                                                                     impl->qwen2->dtype(),
-                                                                     impl->qwen2->kv_cache_capacity_tokens());
-            ok = true;
             break;
         }
         case LLAISYS_MODEL_TYPE_MOCK:
-            if (!impl->mock) {
+            if (!impl->mock || !impl->parallel_context) {
                 return false;
             }
-            kv_cache_manager = std::make_unique<MockKVCacheManager>(impl->mock.get());
-            ok = true;
             break;
         default:
-            return false;
-        }
-        if (!ok || kv_cache_manager == nullptr) {
-            kv_cache_manager.reset();
-            bound_model.reset();
             return false;
         }
         bound_model = impl;
         return true;
     }
 
-    bool has_live_model_binding() {
-        if (bound_model.expired()) {
-            kv_cache_manager.reset();
-            return false;
-        }
-        return kv_cache_manager != nullptr;
-    }
-
-    KvStatus kv_seq_cp(int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
-        if (!has_live_model_binding()) {
-            return KvStatus::INTERNAL_ERROR;
-        }
-        return kv_cache_manager->kv_seq_cp(dst_seq, src_seq, p0, p1);
-    }
-
-    KvStatus kv_seq_rm(int64_t seq_id, int64_t p0, int64_t p1) {
-        if (!has_live_model_binding()) {
-            return KvStatus::INTERNAL_ERROR;
-        }
-        return kv_cache_manager->kv_seq_rm(seq_id, p0, p1);
-    }
-
-    KvStatus kv_seq_add(int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-        if (!has_live_model_binding()) {
-            return KvStatus::INTERNAL_ERROR;
-        }
-        return kv_cache_manager->kv_seq_add(seq_id, p0, p1, delta);
-    }
-
-    KvStatus kv_seq_keep(int64_t seq_id) {
-        if (!has_live_model_binding()) {
-            return KvStatus::INTERNAL_ERROR;
-        }
-        return kv_cache_manager->kv_seq_keep(seq_id);
-    }
-
-    int64_t kv_seq_pos_max(int64_t seq_id) const noexcept {
-        if (bound_model.expired() || kv_cache_manager == nullptr) {
-            return -1;
-        }
-        return kv_cache_manager->kv_seq_pos_max(seq_id);
-    }
-
     KvStatus request_free(int64_t seq_id) {
-        if (!has_live_model_binding()) {
+        auto current = bound_model.lock();
+        if (!current) {
             return KvStatus::INTERNAL_ERROR;
         }
-        return kv_cache_manager->request_free(seq_id);
+        switch (current->type) {
+        case LLAISYS_MODEL_TYPE_QWEN2:
+            return current->qwen2 && current->qwen2->kv_cache()
+                       ? current->qwen2->kv_cache()->request_free(seq_id)
+                       : KvStatus::INTERNAL_ERROR;
+        case LLAISYS_MODEL_TYPE_MOCK:
+            return KvStatus::INVALID_SEQ;
+        default:
+            return KvStatus::INTERNAL_ERROR;
+        }
     }
 
     int kv_stats(LlaisysKvStats *out_stats) noexcept {
-        if (!has_live_model_binding()) {
+        if (out_stats == nullptr) {
             return -1;
         }
-        return kv_cache_manager->kv_stats(out_stats);
+        auto current = bound_model.lock();
+        if (!current) {
+            return -1;
+        }
+        switch (current->type) {
+        case LLAISYS_MODEL_TYPE_QWEN2: {
+            auto *cache = current->qwen2 ? current->qwen2->kv_cache() : nullptr;
+            if (cache == nullptr) {
+                return -1;
+            }
+            std::vector<int32_t> used_slots;
+            cache->used_slots(&used_slots);
+            out_stats->capacity_tokens = static_cast<int64_t>(current->qwen2->kv_cache_capacity_tokens());
+            out_stats->used_tokens = static_cast<int64_t>(used_slots.size());
+            out_stats->free_tokens = std::max<int64_t>(0, out_stats->capacity_tokens - out_stats->used_tokens);
+            kv_peak_used_tokens = std::max<int64_t>(kv_peak_used_tokens, out_stats->used_tokens);
+            out_stats->peak_used_tokens = kv_peak_used_tokens;
+            return 0;
+        }
+        case LLAISYS_MODEL_TYPE_MOCK:
+            out_stats->capacity_tokens = 0;
+            out_stats->used_tokens = 0;
+            out_stats->free_tokens = 0;
+            out_stats->peak_used_tokens = 0;
+            return 0;
+        default:
+            return -1;
+        }
     }
 
     KvStatus kv_reset_prefix_cache() {
-        if (!has_live_model_binding()) {
+        auto current = bound_model.lock();
+        if (!current) {
             return KvStatus::INTERNAL_ERROR;
         }
-        return kv_cache_manager->kv_reset_prefix_cache();
+        switch (current->type) {
+        case LLAISYS_MODEL_TYPE_QWEN2:
+            return current->qwen2 && current->qwen2->kv_cache()
+                       ? current->qwen2->kv_cache()->reset_prefix_cache()
+                       : KvStatus::INTERNAL_ERROR;
+        case LLAISYS_MODEL_TYPE_MOCK:
+            return KvStatus::OK;
+        default:
+            return KvStatus::INTERNAL_ERROR;
+        }
     }
 };
 
@@ -505,6 +329,10 @@ struct LlaisysKvState {
     std::unique_ptr<LlaisysKvStateImpl> impl;
 };
 
+struct LlaisysParallelContext {
+    std::shared_ptr<LlaisysParallelContextImpl> impl;
+};
+
 __export struct LlaisysKvState *llaisysKvStateCreate(const struct LlaisysKvStateCreateParams *params) {
     if (params == nullptr) {
         return nullptr;
@@ -517,6 +345,61 @@ __export struct LlaisysKvState *llaisysKvStateCreate(const struct LlaisysKvState
     } catch (...) {
         return nullptr;
     }
+}
+
+__export void llaisysKvStateDestroy(struct LlaisysKvState *kv_state) {
+    delete kv_state;
+}
+
+__export struct LlaisysParallelContext *llaisysParallelContextCreate(
+    const struct LlaisysParallelContextCreateParams *params) {
+    if (params == nullptr) {
+        return nullptr;
+    }
+    try {
+        const int32_t tp_size = params->tensor_parallel_size > 0 ? params->tensor_parallel_size : int32_t{1};
+        const int32_t rank = params->rank >= 0 ? params->rank : int32_t{0};
+        const int32_t local_rank = params->local_rank >= 0 ? params->local_rank : int32_t{0};
+        const int32_t ndevice = params->ndevice;
+        if (tp_size < 1 || rank < 0 || rank >= tp_size || local_rank < 0 || ndevice < 0) {
+            return nullptr;
+        }
+        if (ndevice > 0 && params->device_ids == nullptr) {
+            return nullptr;
+        }
+        if (tp_size > 1 && ndevice != tp_size) {
+            std::fprintf(stderr,
+                         "[ERROR] parallel context invalid device_ids: tp_size=%d rank=%d local_rank=%d ndevice=%d\n",
+                         tp_size,
+                         rank,
+                         local_rank,
+                         ndevice);
+            return nullptr;
+        }
+
+        auto *handle = new LlaisysParallelContext{};
+        handle->impl = std::make_shared<LlaisysParallelContextImpl>();
+        handle->impl->tensor_parallel_size = tp_size;
+        handle->impl->rank = rank;
+        handle->impl->local_rank = local_rank;
+        handle->impl->distributed_backend = str_or_empty(params->distributed_backend);
+        handle->impl->init_method = str_or_empty(params->init_method);
+        handle->impl->device_ids.reserve(static_cast<size_t>(std::max(0, ndevice)));
+        for (int32_t i = 0; i < ndevice; ++i) {
+            handle->impl->device_ids.push_back(params->device_ids[i]);
+        }
+        if (handle->impl->initialize() != 0) {
+            delete handle;
+            return nullptr;
+        }
+        return handle;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+__export void llaisysParallelContextDestroy(struct LlaisysParallelContext *parallel_context) {
+    delete parallel_context;
 }
 
 __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreateParams *params) {
@@ -538,10 +421,9 @@ __export struct LlaisysModel *llaisysModelCreate(const struct LlaisysModelCreate
             handle->impl->qwen2 = std::make_unique<Qwen2Model>(meta, params->device, params->device_ids, params->ndevice);
             break;
         }
-        case LLAISYS_MODEL_TYPE_MOCK: {
+        case LLAISYS_MODEL_TYPE_MOCK:
             handle->impl->mock = std::make_unique<MockModel>();
             break;
-        }
         default:
             delete handle;
             return nullptr;
@@ -557,84 +439,16 @@ __export void llaisysModelDestroy(struct LlaisysModel *model) {
     delete model;
 }
 
-__export void llaisysKvStateDestroy(struct LlaisysKvState *kv_state) {
-    delete kv_state;
-}
-
-__export int32_t llaisysKvStateParallelInit(struct LlaisysKvState *kv_state,
-                                            const struct LlaisysParallelInitParams *params) {
-    if (kv_state == nullptr || kv_state->impl == nullptr || params == nullptr) {
+__export int32_t llaisysModelBindParallelContext(struct LlaisysModel *model,
+                                                 struct LlaisysParallelContext *parallel_context) {
+    if (model == nullptr || model->impl == nullptr || parallel_context == nullptr || parallel_context->impl == nullptr) {
         return -1;
     }
-
-    auto &parallel = kv_state->impl->parallel;
-    const int32_t tp_size = params->tensor_parallel_size > 0 ? params->tensor_parallel_size : int32_t{1};
-    const int32_t pp_size = params->pipeline_parallel_size > 0 ? params->pipeline_parallel_size : int32_t{1};
-    const int32_t world_size = params->world_size > 0 ? params->world_size : tp_size;
-    const int32_t rank = params->rank >= 0 ? params->rank : int32_t{0};
-    const int32_t local_rank = params->local_rank >= 0 ? params->local_rank : int32_t{0};
-    const int32_t ndevice = params->ndevice;
-
-    if (tp_size < 1 || pp_size < 1 || world_size < 1) {
+    try {
+        return model->impl->bind_parallel_context(parallel_context->impl);
+    } catch (...) {
         return -1;
     }
-    if (rank < 0 || rank >= world_size) {
-        return -1;
-    }
-    if (local_rank < 0) {
-        return -1;
-    }
-    if (ndevice < 0) {
-        return -1;
-    }
-    if (ndevice > 0 && params->device_ids == nullptr) {
-        return -1;
-    }
-    if (tp_size > 1 && ndevice != tp_size) {
-        std::fprintf(stderr,
-                     "[ERROR] kv_state parallel init invalid device_ids: tp_size=%d rank=%d local_rank=%d "
-                     "backend=%s op=kv_state_parallel_init ndevice=%d\n",
-                     tp_size,
-                     rank,
-                     local_rank,
-                     str_or_empty(params->distributed_backend).c_str(),
-                     ndevice);
-        return -1;
-    }
-
-    parallel.tensor_parallel_size = tp_size;
-    parallel.pipeline_parallel_size = pp_size;
-    parallel.world_size = world_size;
-    parallel.rank = rank;
-    parallel.local_rank = local_rank;
-    parallel.distributed_executor_backend = str_or_empty(params->distributed_executor_backend);
-    parallel.distributed_backend = str_or_empty(params->distributed_backend);
-    parallel.master_addr = str_or_empty(params->master_addr);
-    parallel.master_port = params->master_port;
-    parallel.node_rank = params->node_rank;
-    parallel.nnodes = params->nnodes > 0 ? params->nnodes : int32_t{1};
-    parallel.init_method = str_or_empty(params->init_method);
-    parallel.tp_group_name = str_or_empty(params->tp_group_name);
-    parallel.use_single_process_tp = (params->use_single_process_tp != 0);
-    parallel.device_ids.clear();
-    parallel.device_ids.reserve(static_cast<size_t>(std::max(0, ndevice)));
-    for (int32_t i = 0; i < ndevice; ++i) {
-        parallel.device_ids.push_back(params->device_ids[i]);
-    }
-    parallel.initialized = true;
-
-    std::fprintf(stderr,
-                 "[kv_state.parallel] initialized tp_size=%d pp_size=%d world_size=%d rank=%d local_rank=%d "
-                 "ndevice=%d backend=%s exec_backend=%s\n",
-                 parallel.tensor_parallel_size,
-                 parallel.pipeline_parallel_size,
-                 parallel.world_size,
-                 parallel.rank,
-                 parallel.local_rank,
-                 static_cast<int>(parallel.device_ids.size()),
-                 parallel.distributed_backend.c_str(),
-                 parallel.distributed_executor_backend.c_str());
-    return 0;
 }
 
 __export LlaisysModelType llaisysModelType(const struct LlaisysModel *model) {
@@ -648,7 +462,6 @@ __export void *llaisysModelWeights(struct LlaisysModel *model) {
     if (model == nullptr || model->impl == nullptr) {
         return nullptr;
     }
-
     switch (model->impl->type) {
     case LLAISYS_MODEL_TYPE_QWEN2:
         return model->impl->qwen2 ? model->impl->qwen2->weights() : nullptr;
@@ -679,7 +492,7 @@ __export int llaisysModelReplaceWeight(struct LlaisysModel *model,
         if (slot == nullptr) {
             return -3;
         }
-        llaisys::runtime::weights::replace_slot(slot, new_weight);
+        llaisys::weights::replace_slot(slot, new_weight);
         return 0;
     };
 
@@ -764,41 +577,6 @@ __export int32_t llaisysModelForward(struct LlaisysModel *model,
     } catch (...) {
         return -2;
     }
-}
-
-__export int llaisysKvStateSeqCp(struct LlaisysKvState *kv_state, int64_t dst_seq, int64_t src_seq, int64_t p0, int64_t p1) {
-    if (kv_state == nullptr || kv_state->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(kv_state->impl->kv_seq_cp(dst_seq, src_seq, p0, p1));
-}
-
-__export int llaisysKvStateSeqRm(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1) {
-    if (kv_state == nullptr || kv_state->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(kv_state->impl->kv_seq_rm(seq_id, p0, p1));
-}
-
-__export int llaisysKvStateSeqAdd(struct LlaisysKvState *kv_state, int64_t seq_id, int64_t p0, int64_t p1, int64_t delta) {
-    if (kv_state == nullptr || kv_state->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(kv_state->impl->kv_seq_add(seq_id, p0, p1, delta));
-}
-
-__export int llaisysKvStateSeqKeep(struct LlaisysKvState *kv_state, int64_t seq_id) {
-    if (kv_state == nullptr || kv_state->impl == nullptr) {
-        return to_kv_code(KvStatus::INTERNAL_ERROR);
-    }
-    return to_kv_code(kv_state->impl->kv_seq_keep(seq_id));
-}
-
-__export int64_t llaisysKvStateSeqPosMax(struct LlaisysKvState *kv_state, int64_t seq_id) {
-    if (kv_state == nullptr || kv_state->impl == nullptr) {
-        return -1;
-    }
-    return kv_state->impl->kv_seq_pos_max(seq_id);
 }
 
 __export int llaisysKvStateRequestFree(struct LlaisysKvState *kv_state, int64_t seq_id) {

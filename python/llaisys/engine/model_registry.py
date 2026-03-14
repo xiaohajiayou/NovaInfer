@@ -5,17 +5,18 @@ from pathlib import Path
 from typing import Callable, Dict, Tuple
 
 from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
 
 
 ModelFactory = Callable[..., object]
 KvStateFactory = Callable[..., Tuple[object, dict]]
+ParallelContextFactory = Callable[..., object]
 
 
 @dataclass
 class ModelRegistry:
     _factories: Dict[str, ModelFactory]
     _kv_state_factories: Dict[str, KvStateFactory] = field(default_factory=dict)
+    _parallel_context_factories: Dict[str, ParallelContextFactory] = field(default_factory=dict)
 
     def register(self, model_type: str, factory: ModelFactory) -> None:
         key = model_type.strip().lower()
@@ -43,6 +44,19 @@ class ModelRegistry:
             return None, {}
         return factory(model_path, device, **kv_kwargs)
 
+    def register_parallel_context(self, model_type: str, factory: ParallelContextFactory) -> None:
+        key = model_type.strip().lower()
+        if not key:
+            raise ValueError("model_type must be non-empty")
+        self._parallel_context_factories[key] = factory
+
+    def create_parallel_context(self, model_type: str, model_path: Path | str, device: DeviceType, **parallel_kwargs):
+        key = model_type.strip().lower()
+        factory = self._parallel_context_factories.get(key)
+        if factory is None:
+            return None
+        return factory(model_path, device, **parallel_kwargs)
+
 
 def _create_qwen2(
     model_path: Path | str,
@@ -67,19 +81,10 @@ def _create_qwen2(
 def _create_qwen2_kv_state(
     model_path: Path | str,
     device: DeviceType,
-    kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK,
     kv_cache_block_size: int = 16,
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
     kv_cache_memory_utilization: float = 0.9,
-    # tp setting
-    tensor_parallel_size: int = 1,
-    pipeline_parallel_size: int = 1,
-    distributed_executor_backend: str = "uni",
-    distributed_backend: str = "nccl",
-    tensor_parallel_device_ids: tuple[int, ...] | None = None,
-    tp_rank: int = 0,
-    tp_local_rank: int = 0,
 ) -> tuple[object, dict]:
     from .runtime_factory import create_kv_state, plan_qwen2_kv_cache
 
@@ -93,16 +98,8 @@ def _create_qwen2_kv_state(
     )
     kv_state = create_kv_state(
         device=device,
-        kv_cache_layout=kv_cache_layout,
         kv_cache_block_size=kv_cache_block_size,
         plan=plan,
-        tensor_parallel_size=tensor_parallel_size,
-        pipeline_parallel_size=pipeline_parallel_size,
-        distributed_executor_backend=distributed_executor_backend,
-        distributed_backend=distributed_backend,
-        tensor_parallel_device_ids=tensor_parallel_device_ids,
-        tp_rank=tp_rank,
-        tp_local_rank=tp_local_rank,
     )
     return kv_state, {
         "max_model_len": int(plan.max_model_len),
@@ -110,8 +107,31 @@ def _create_qwen2_kv_state(
     }
 
 
+def _create_qwen2_parallel_context(
+    model_path: Path | str,
+    device: DeviceType,
+    tensor_parallel_size: int = 1,
+    distributed_backend: str = "nccl",
+    tensor_parallel_device_ids: tuple[int, ...] | None = None,
+    tp_rank: int = 0,
+    tp_local_rank: int = 0,
+):
+    del model_path
+    from .runtime_factory import create_parallel_context
+
+    return create_parallel_context(
+        device=device,
+        tensor_parallel_size=tensor_parallel_size,
+        distributed_backend=distributed_backend,
+        tensor_parallel_device_ids=tensor_parallel_device_ids,
+        tp_rank=tp_rank,
+        tp_local_rank=tp_local_rank,
+    )
+
+
 def create_default_registry() -> ModelRegistry:
     registry = ModelRegistry(_factories={})
     registry.register("qwen2", _create_qwen2)
     registry.register_kv_state("qwen2", _create_qwen2_kv_state)
+    registry.register_parallel_context("qwen2", _create_qwen2_parallel_context)
     return registry

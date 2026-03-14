@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import llaisys
 from llaisys.engine.scheduler import SchedulerOutputs
-from llaisys.libllaisys.model import KvCacheLayout
 
 
 @dataclass
@@ -12,10 +11,8 @@ class DummyModelRunner:
     max_seq_len: int = 32
     end_token_id: int = 4
     vocab_size: int = 16
-    kv_cache_layout: KvCacheLayout = KvCacheLayout.BLOCK
 
     def __post_init__(self):
-        self._kv_cache_layout = KvCacheLayout(int(self.kv_cache_layout))
         self._request_free_calls: list[int] = []
         self._execute_state = None
 
@@ -49,25 +46,23 @@ class DummyModelRunner:
         req_num_scheduled_tokens: list[int] = []
         req_num_computed_tokens: list[int] = []
         block_table_width = 0
-        block_layout = int(self._kv_cache_layout) == int(KvCacheLayout.BLOCK)
-        if block_layout:
-            for seq in active_seqs:
-                if not seq.block_table:
-                    raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
-            total_sched = 0
-            for seq in active_seqs:
-                if outputs.is_prefill:
-                    n_sched = max(0, int(len(seq.prompt_token_ids) - int(seq.num_cached_tokens)))
-                    n_comp = max(0, int(seq.num_cached_tokens))
-                else:
-                    n_sched = 1
-                    n_comp = max(0, int(len(seq) - 1))
-                req_num_scheduled_tokens.append(int(n_sched))
-                req_num_computed_tokens.append(int(n_comp))
-                total_sched += int(n_sched)
-            if total_sched != len(token_ids):
-                raise RuntimeError("sum(req_num_scheduled_tokens) must equal token_ids length")
-            block_table_width = max((len(s.block_table) for s in active_seqs), default=0)
+        for seq in active_seqs:
+            if not seq.block_table:
+                raise RuntimeError("BLOCK layout requires non-empty block_table for every scheduled sequence")
+        total_sched = 0
+        for seq in active_seqs:
+            if outputs.is_prefill:
+                n_sched = max(0, int(len(seq.prompt_token_ids) - int(seq.num_cached_tokens)))
+                n_comp = max(0, int(seq.num_cached_tokens))
+            else:
+                n_sched = 1
+                n_comp = max(0, int(len(seq) - 1))
+            req_num_scheduled_tokens.append(int(n_sched))
+            req_num_computed_tokens.append(int(n_comp))
+            total_sched += int(n_sched)
+        if total_sched != len(token_ids):
+            raise RuntimeError("sum(req_num_scheduled_tokens) must equal token_ids length")
+        block_table_width = max((len(s.block_table) for s in active_seqs), default=0)
 
         step = {
             "scheduled_seqs": list(active_seqs),

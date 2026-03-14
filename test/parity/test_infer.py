@@ -8,11 +8,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import llaisys
-from llaisys.engine.runtime_factory import create_kv_state, plan_qwen2_kv_cache
+from llaisys.engine.runtime_factory import create_kv_state, create_parallel_context, plan_qwen2_kv_cache
 from llaisys.libllaisys import LIB_LLAISYS
 from test.parity.backend_matrix import parity_device_backend_layout_cases
 from test.test_utils import llaisys_device, torch_device
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 from test.utils.forward_api import run_model_forward, sample_from_forward
 
@@ -43,7 +42,7 @@ def _restore_attn_backend(old: str | None):
         os.environ[key] = old
 
 
-def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout):
+def _create_qwen2_with_runtime(model_path: str, device):
     plan = plan_qwen2_kv_cache(
         model_path=model_path,
         device=device,
@@ -54,7 +53,6 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
     )
     runtime_handle = create_kv_state(
         device=device,
-        kv_cache_layout=kv_layout,
         kv_cache_block_size=16,
         plan=plan,
     )
@@ -64,6 +62,11 @@ def _create_qwen2_with_runtime(model_path: str, device, kv_layout: KvCacheLayout
             device=device,
             max_model_len=int(plan.max_model_len),
         )
+        parallel_context = create_parallel_context(device=device, tensor_parallel_size=1)
+        rc = int(model.bind_parallel_context(parallel_context))
+        if rc != 0:
+            raise RuntimeError(f"modelBindParallelContext failed with status={rc}")
+        model._test_parallel_context = parallel_context
     except Exception:
         LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         raise
@@ -112,7 +115,6 @@ def llaisys_model_runner_infer(
     tokenizer,
     model_wrapper,
     runtime_handle,
-    kv_layout: KvCacheLayout,
     max_new_tokens=128,
     top_p=0.8,
     top_k=50,
@@ -126,7 +128,6 @@ def llaisys_model_runner_infer(
     )
     input_tokens = tokenizer.encode(input_content)
     output_tokens = [int(t) for t in input_tokens]
-    is_block_layout = int(kv_layout) == int(KvCacheLayout.BLOCK)
     block_size = 16
     device = getattr(model_wrapper, "_device", llaisys.DeviceType.CPU)
     model_handle = model_wrapper._model
@@ -141,7 +142,6 @@ def llaisys_model_runner_infer(
             logits_mask=None,
             seq_ids=[seq_id] * n,
             pos_ids=pos_ids,
-            layout=KvCacheLayout.BLOCK,
             block_size=block_size,
             block_state=block_state,
         )
@@ -151,20 +151,7 @@ def llaisys_model_runner_infer(
         sampled_ids = sample_from_forward(out, device=device)
         return out.output_ids, sampled_ids
 
-    if is_block_layout:
-        _, sampled_ids = _decode_block(input_tokens, pos_start=0)
-    else:
-        built = build_decode_batch(
-            input_tokens,
-            logits_mask=None,
-            seq_ids=[seq_id] * len(input_tokens),
-            pos_ids=[int(i) for i in range(len(input_tokens))],
-            layout=KvCacheLayout.SLOT,
-        )
-        out = run_model_forward(model_handle, runtime_handle, built, device=device)
-        if out.status != 0:
-            raise RuntimeError(f"modelForward failed with status={out.status}")
-        sampled_ids = sample_from_forward(out, device=device)
+    _, sampled_ids = _decode_block(input_tokens, pos_start=0)
     if not sampled_ids:
         raise RuntimeError("ModelRunner prefill returned no sampled ids")
 
@@ -175,20 +162,7 @@ def llaisys_model_runner_infer(
     for _ in range(max(0, int(max_new_tokens) - 1)):
         if next_token == int(model_wrapper.end_token_id):
             break
-        if is_block_layout:
-            _, sampled_ids = _decode_block([next_token], pos_start=decode_pos)
-        else:
-            built = build_decode_batch(
-                [next_token],
-                logits_mask=None,
-                seq_ids=[seq_id],
-                pos_ids=[decode_pos],
-                layout=KvCacheLayout.SLOT,
-            )
-            out = run_model_forward(model_handle, runtime_handle, built, device=device)
-            if out.status != 0:
-                raise RuntimeError(f"modelForward failed with status={out.status}")
-            sampled_ids = sample_from_forward(out, device=device)
+        _, sampled_ids = _decode_block([next_token], pos_start=decode_pos)
         if not sampled_ids:
             raise RuntimeError("ModelRunner decode returned no sampled ids")
         next_token = int(sampled_ids[-1])
@@ -233,7 +207,6 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
             model_runner, runtime_handle = _create_qwen2_with_runtime(
                 model_path=model_path,
                 device=llaisys_device(ll_device),
-                kv_layout=KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
             )
         except Exception as exc:
             if ll_device == "nvidia" and backend == "cudnn":
@@ -245,7 +218,6 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
                 tokenizer,
                 model_runner,
                 runtime_handle,
-                KvCacheLayout.BLOCK if kv_layout == "block" else KvCacheLayout.SLOT,
                 max_new_tokens=max_steps,
                 top_p=top_p,
                 top_k=top_k,
@@ -257,8 +229,11 @@ def test_infer_parity(require_model_path, ll_device, backend, kv_layout):
             raise
         assert mr_tokens == hf_tokens
     finally:
+        parallel_context = getattr(model_runner, "_test_parallel_context", None) if model_runner is not None else None
         if model_runner is not None:
             model_runner.close()
+        if parallel_context is not None:
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
         if runtime_handle is not None:
             LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         _restore_attn_backend(old_backend)
@@ -278,28 +253,24 @@ def test_infer_smoke(require_model_path):
     model_runner, runtime_handle = _create_qwen2_with_runtime(
         model_path=model_path,
         device=llaisys_device("cpu"),
-        kv_layout=KvCacheLayout.BLOCK,
     )
     try:
-        try:
-            out_tokens = llaisys_model_runner_infer(
-                prompt,
-                tokenizer,
-                model_runner,
-                runtime_handle,
-                KvCacheLayout.BLOCK,
-                max_new_tokens=max_steps,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-            )
-        except RuntimeError as exc:
-            if backend == "cudnn":
-                pytest.skip(f"cudnn backend unavailable during forward: {exc}")
-            raise
+        out_tokens = llaisys_model_runner_infer(
+            prompt,
+            tokenizer,
+            model_runner,
+            runtime_handle,
+            max_new_tokens=max_steps,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+        )
         assert len(out_tokens) > 0
     finally:
+        parallel_context = getattr(model_runner, "_test_parallel_context", None)
         model_runner.close()
+        if parallel_context is not None:
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
         LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
 
 
@@ -323,7 +294,6 @@ def test_infer_smoke_nvidia(require_model_path, backend):
             model_runner, runtime_handle = _create_qwen2_with_runtime(
                 model_path=model_path,
                 device=llaisys_device("nvidia"),
-                kv_layout=KvCacheLayout.BLOCK,
             )
         except Exception as exc:
             if backend == "cudnn":
@@ -334,7 +304,6 @@ def test_infer_smoke_nvidia(require_model_path, backend):
             tokenizer,
             model_runner,
             runtime_handle,
-            KvCacheLayout.BLOCK,
             max_new_tokens=max_steps,
             top_p=top_p,
             top_k=top_k,
@@ -342,8 +311,11 @@ def test_infer_smoke_nvidia(require_model_path, backend):
         )
         assert len(out_tokens) > 0
     finally:
+        parallel_context = getattr(model_runner, "_test_parallel_context", None) if model_runner is not None else None
         if model_runner is not None:
             model_runner.close()
+        if parallel_context is not None:
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
         if runtime_handle is not None:
             LIB_LLAISYS.llaisysKvStateDestroy(runtime_handle)
         _restore_attn_backend(old_backend)

@@ -629,7 +629,7 @@ __global__ void paged_attention_decode_warp_kernel(T *out,
 }
 
 template <typename T>
-void launch_paged_attention_prepared(tensor_t attn_val,
+void launch_paged_attention_native(tensor_t attn_val,
                                      tensor_t q,
                                      tensor_t k_cache,
                                      tensor_t v_cache,
@@ -669,7 +669,7 @@ void launch_paged_attention_prepared(tensor_t attn_val,
 }
 
 template <typename T>
-void launch_paged_attention_decode_prepared(tensor_t attn_val,
+void launch_paged_attention_decode_native(tensor_t attn_val,
                                             tensor_t q,
                                             tensor_t k_cache,
                                             tensor_t v_cache,
@@ -1624,7 +1624,7 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
     }
 }
 
-void self_attention_paged_prepared(tensor_t attn_val,
+void self_attention_paged_native(tensor_t attn_val,
                                    tensor_t q,
                                    tensor_t k_cache,
                                    tensor_t v_cache,
@@ -1632,7 +1632,7 @@ void self_attention_paged_prepared(tensor_t attn_val,
                                    int32_t block_table_width,
                                    int32_t block_size,
                                    float scale) {
-    LLAISYS_NVTX_SCOPE("attn/self_attention_paged_prepared");
+    LLAISYS_NVTX_SCOPE("attn/self_attention_paged_native");
     const std::int32_t seqlen = static_cast<std::int32_t>(q->shape()[0]);
     const std::int32_t nhead = static_cast<std::int32_t>(q->shape()[1]);
     const std::int32_t head_dim = static_cast<std::int32_t>(q->shape()[2]);
@@ -1650,33 +1650,33 @@ void self_attention_paged_prepared(tensor_t attn_val,
     switch (q->dtype()) {
     case LLAISYS_DTYPE_F32:
         if (is_decode) {
-            launch_paged_attention_decode_prepared<float>(
+            launch_paged_attention_decode_native<float>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         } else {
-            launch_paged_attention_prepared<float>(
+            launch_paged_attention_native<float>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         }
         return;
     case LLAISYS_DTYPE_F16:
         if (is_decode) {
-            launch_paged_attention_decode_prepared<llaisys::fp16_t>(
+            launch_paged_attention_decode_native<llaisys::fp16_t>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         } else {
-            launch_paged_attention_prepared<llaisys::fp16_t>(
+            launch_paged_attention_native<llaisys::fp16_t>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         }
         return;
     case LLAISYS_DTYPE_BF16:
         if (is_decode) {
-            launch_paged_attention_decode_prepared<llaisys::bf16_t>(
+            launch_paged_attention_decode_native<llaisys::bf16_t>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         } else {
-            launch_paged_attention_prepared<llaisys::bf16_t>(
+            launch_paged_attention_native<llaisys::bf16_t>(
                 attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale, seqlen, nslot, prepared.nseq,
                 nhead, nkvhead, head_dim);
         }
@@ -1686,26 +1686,26 @@ void self_attention_paged_prepared(tensor_t attn_val,
     }
 }
 
-void dispatch_attention_with_backend(tensor_t attn_val,
-                                     tensor_t q,
-                                     tensor_t k_cache,
-                                     tensor_t v_cache,
-                                     const CommonAttentionMetadata &metadata,
-                                     PagedAttentionBackend backend,
-                                     int32_t block_table_width,
-                                     int32_t block_size,
-                                     float scale) {
+void self_attention_paged_with_backend(tensor_t attn_val,
+                                       tensor_t q,
+                                       tensor_t k_cache,
+                                       tensor_t v_cache,
+                                       const CommonAttentionMetadata &metadata,
+                                       PagedAttentionBackend backend,
+                                       int32_t block_table_width,
+                                       int32_t block_size,
+                                       float scale) {
     const CommonAttentionMetadata &prepared = metadata;
     const bool is_decode = is_decode_phase(prepared);
     const bool is_prefill = is_prefill_phase(prepared);
-    CHECK_ARGUMENT(is_decode || is_prefill, "dispatch_attention_with_backend: invalid attention phase");
+    CHECK_ARGUMENT(is_decode || is_prefill, "self_attention_paged_with_backend: invalid attention phase");
     if (backend == PagedAttentionBackend::CUDNN) {
         CHECK_ARGUMENT(prepared.cudnn_seq_lens_q != nullptr && prepared.cudnn_seq_lens_kv != nullptr &&
                            prepared.cudnn_page_table != nullptr && prepared.cudnn_b_exec > 0,
-                       "dispatch_attention_with_backend: missing CUDNN metadata");
+                       "self_attention_paged_with_backend: missing CUDNN metadata");
         if (is_prefill) {
             CHECK_ARGUMENT(prepared.cudnn_qo_ragged_offset != nullptr,
-                           "dispatch_attention_with_backend: missing CUDNN prefill ragged metadata");
+                           "self_attention_paged_with_backend: missing CUDNN prefill ragged metadata");
         }
 #ifdef ENABLE_CUDNN_API
         const bool ok = is_prefill
@@ -1721,8 +1721,8 @@ void dispatch_attention_with_backend(tensor_t attn_val,
     }
     CHECK_ARGUMENT(prepared.cu_seqlens_q != nullptr && prepared.block_tables != nullptr &&
                        prepared.cu_seqlens_k != nullptr,
-                   "dispatch_attention_with_backend: missing native BLOCK metadata");
-    self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
+                   "self_attention_paged_with_backend: missing native BLOCK metadata");
+    self_attention_paged_native(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
 }
 
 void self_attention_paged(tensor_t attn_val,
@@ -1772,7 +1772,16 @@ void self_attention_paged(tensor_t attn_val,
         max_seqlen_q,
         max_seqlen_k,
         (max_seqlen_q == 1 ? AttentionPhase::DECODE : AttentionPhase::PREFILL)};
-    self_attention_paged_prepared(attn_val, q, k_cache, v_cache, prepared, block_table_width, block_size, scale);
+    self_attention_paged_with_backend(
+        attn_val,
+        q,
+        k_cache,
+        v_cache,
+        prepared,
+        PagedAttentionBackend::NATIVE,
+        block_table_width,
+        block_size,
+        scale);
 }
 
 CudnnRuntimeState *create_cudnn_runtime_state() {

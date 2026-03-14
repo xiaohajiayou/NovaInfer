@@ -85,13 +85,11 @@ def _worker_generate(
         from llaisys.entrypoints.llm import LLM
         from llaisys.engine.types import SamplingParams
         from llaisys.libllaisys import DeviceType
-        from llaisys.libllaisys.model import KvCacheLayout
 
         llm = LLM(
             model=model_path,
             model_type="qwen2",
             device=DeviceType.NVIDIA,
-            kv_cache_layout=KvCacheLayout.BLOCK,
             kv_cache_block_size=16,
             max_model_len=int(max_model_len),
             max_num_seqs=int(max_num_seqs),
@@ -99,7 +97,6 @@ def _worker_generate(
             tensor_parallel_size=int(tp_size),
             tp_rank=int(rank),
             tp_local_rank=int(rank),
-            distributed_executor_backend="uni",
             distributed_backend="nccl",
             tensor_parallel_device_ids=device_ids,
         )

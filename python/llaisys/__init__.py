@@ -1,12 +1,12 @@
 from importlib import import_module
 
-from .runtime import RuntimeAPI
+from .bindings.runtime import RuntimeAPI
 from .libllaisys import DeviceType
 from .libllaisys import DataType
 from .libllaisys import MemcpyKind
 from .libllaisys import llaisysStream_t as Stream
-from .tensor import Tensor
-from .ops import Ops
+from .bindings.tensor import Tensor
+from .bindings.ops import Ops
 
 
 def __getattr__(name):

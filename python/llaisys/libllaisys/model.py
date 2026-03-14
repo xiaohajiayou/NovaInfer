@@ -7,6 +7,7 @@ from .tensor import llaisysTensor_t
 
 llaisysModel_t = c_void_p
 llaisysKvState_t = c_void_p
+llaisysParallelContext_t = c_void_p
 
 
 class ModelType(IntEnum):
@@ -14,9 +15,6 @@ class ModelType(IntEnum):
     QWEN2 = 1
     MOCK = 2
 
-class KvCacheLayout(IntEnum):
-    SLOT = 0
-    BLOCK = 1
 
 class AttentionPhase(IntEnum):
     PREFILL = 0
@@ -35,31 +33,23 @@ class LlaisysModelCreateParams(Structure):
 
 class LlaisysKvStateCreateParams(Structure):
     _fields_ = [
-        ("kv_cache_layout", c_int32),
         ("kv_cache_block_size", c_int32),
         ("max_model_len", c_int32),
         ("kv_cache_capacity_tokens", c_int32),
     ]
 
-class LlaisysParallelInitParams(Structure):
+
+class LlaisysParallelContextCreateParams(Structure):
     _fields_ = [
         ("tensor_parallel_size", c_int32),
-        ("pipeline_parallel_size", c_int32),
-        ("world_size", c_int32),
         ("rank", c_int32),
         ("local_rank", c_int32),
-        ("distributed_executor_backend", c_char_p),
         ("distributed_backend", c_char_p),
-        ("master_addr", c_char_p),
-        ("master_port", c_int32),
-        ("node_rank", c_int32),
-        ("nnodes", c_int32),
         ("init_method", c_char_p),
-        ("tp_group_name", c_char_p),
-        ("use_single_process_tp", c_int32),
         ("device_ids", POINTER(c_int)),
         ("ndevice", c_int32),
     ]
+
 
 class LlaisysKvStats(Structure):
     _fields_ = [
@@ -69,12 +59,10 @@ class LlaisysKvStats(Structure):
         ("peak_used_tokens", c_int64),
     ]
 
+
 class AttentionMetadata(Structure):
     _fields_ = [
-        ("mode", c_int32),
         ("phase", c_int32),
-        ("seq_ids", llaisysTensor_t),
-        ("pos_ids_host", llaisysTensor_t),
         ("cu_seqlens_q", llaisysTensor_t),
         ("cu_seqlens_k", llaisysTensor_t),
         ("max_seqlen_q", c_int32),
@@ -128,8 +116,12 @@ def load_model(lib):
 
     lib.llaisysKvStateDestroy.argtypes = [llaisysKvState_t]
     lib.llaisysKvStateDestroy.restype = None
-    lib.llaisysKvStateParallelInit.argtypes = [llaisysKvState_t, POINTER(LlaisysParallelInitParams)]
-    lib.llaisysKvStateParallelInit.restype = c_int32
+
+    lib.llaisysParallelContextCreate.argtypes = [POINTER(LlaisysParallelContextCreateParams)]
+    lib.llaisysParallelContextCreate.restype = llaisysParallelContext_t
+
+    lib.llaisysParallelContextDestroy.argtypes = [llaisysParallelContext_t]
+    lib.llaisysParallelContextDestroy.restype = None
 
     lib.llaisysModelCreate.argtypes = [POINTER(LlaisysModelCreateParams)]
     lib.llaisysModelCreate.restype = llaisysModel_t
@@ -140,6 +132,9 @@ def load_model(lib):
     lib.llaisysModelType.argtypes = [llaisysModel_t]
     lib.llaisysModelType.restype = c_int
 
+    lib.llaisysModelBindParallelContext.argtypes = [llaisysModel_t, llaisysParallelContext_t]
+    lib.llaisysModelBindParallelContext.restype = c_int32
+
     lib.llaisysModelWeights.argtypes = [llaisysModel_t]
     lib.llaisysModelWeights.restype = c_void_p
 
@@ -148,23 +143,9 @@ def load_model(lib):
 
     lib.llaisysModelForward.argtypes = [llaisysModel_t, llaisysKvState_t, POINTER(ModelForwardInput), POINTER(ModelForwardOutput)]
     lib.llaisysModelForward.restype = c_int32
+
     lib.llaisysSamplerSample.argtypes = [POINTER(SamplerInput), POINTER(SamplerOutput)]
     lib.llaisysSamplerSample.restype = c_int32
-
-    lib.llaisysKvStateSeqCp.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqCp.restype = c_int
-
-    lib.llaisysKvStateSeqRm.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqRm.restype = c_int
-
-    lib.llaisysKvStateSeqAdd.argtypes = [llaisysKvState_t, c_int64, c_int64, c_int64, c_int64]
-    lib.llaisysKvStateSeqAdd.restype = c_int
-
-    lib.llaisysKvStateSeqKeep.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqKeep.restype = c_int
-
-    lib.llaisysKvStateSeqPosMax.argtypes = [llaisysKvState_t, c_int64]
-    lib.llaisysKvStateSeqPosMax.restype = c_int64
 
     lib.llaisysKvStateRequestFree.argtypes = [llaisysKvState_t, c_int64]
     lib.llaisysKvStateRequestFree.restype = c_int
@@ -175,15 +156,16 @@ def load_model(lib):
     lib.llaisysKvStateResetPrefixCache.argtypes = [llaisysKvState_t]
     lib.llaisysKvStateResetPrefixCache.restype = c_int
 
+
 __all__ = [
     "llaisysModel_t",
     "llaisysKvState_t",
+    "llaisysParallelContext_t",
     "ModelType",
-    "KvCacheLayout",
     "AttentionPhase",
     "LlaisysModelCreateParams",
     "LlaisysKvStateCreateParams",
-    "LlaisysParallelInitParams",
+    "LlaisysParallelContextCreateParams",
     "LlaisysKvStats",
     "AttentionMetadata",
     "ModelForwardInput",

@@ -1,7 +1,7 @@
 from typing import Sequence, Tuple
 import numpy as np
 
-from .libllaisys import (
+from ..libllaisys import (
     LIB_LLAISYS,
     llaisysTensor_t,
     llaisysDeviceType_t,

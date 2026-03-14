@@ -20,7 +20,7 @@ from ..libllaisys.model import (
     ModelType,
 )
 from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2Weights
-from ..tensor import Tensor
+from ..bindings.tensor import Tensor
 
 
 _LAYER_PATTERNS: Tuple[Tuple[re.Pattern[str], str], ...] = (
@@ -500,3 +500,8 @@ class Qwen2:
         if not self._model or kv_state is None:
             return -1
         return int(LIB_LLAISYS.llaisysModelForward(self._model, kv_state, byref(fin), byref(fout)))
+
+    def bind_parallel_context(self, parallel_context) -> int:
+        if not self._model or parallel_context is None:
+            return -1
+        return int(LIB_LLAISYS.llaisysModelBindParallelContext(self._model, parallel_context))

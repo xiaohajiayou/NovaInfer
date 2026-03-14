@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from .libllaisys import LIB_LLAISYS
+from ..libllaisys import LIB_LLAISYS
 
 
 def _push(name: str) -> None:

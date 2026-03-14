@@ -1,8 +1,8 @@
 #include "kv_cache.hpp"
 
-#include "../../../utils/check.hpp"
+#include "../../utils/check.hpp"
 
-namespace llaisys::runtime::kv_cache {
+namespace llaisys::kv_cache {
 
 void KVStorage::init(size_t nlayer,
                      size_t nblocks,
@@ -58,4 +58,4 @@ tensor_t KVStorage::layer_v_block(size_t layer) const {
     return layers_[layer].v_cache;
 }
 
-} // namespace llaisys::runtime::kv_cache
+} // namespace llaisys::kv_cache

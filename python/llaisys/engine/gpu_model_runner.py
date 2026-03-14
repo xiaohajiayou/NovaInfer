@@ -11,18 +11,17 @@ from .config import EngineConfig
 from .model_registry import ModelRegistry, create_default_registry
 from .sampler import Sampler
 from .scheduler import SchedulerOutputs
-from ..nvtx import nvtx_range
+from ..utils.nvtx import nvtx_range
 from ..libllaisys import LIB_LLAISYS, DataType, DeviceType, llaisysDeviceType_t
 from ..libllaisys.model import (
     AttentionMetadata,
     AttentionPhase,
-    KvCacheLayout,
     LlaisysKvStats,
     ModelForwardInput,
     ModelForwardOutput,
 )
-from ..runtime import RuntimeAPI
-from ..tensor import Tensor
+from ..bindings.runtime import RuntimeAPI
+from ..bindings.tensor import Tensor
 
 Buffer = Tensor | CpuGpuBuffer
 ExecuteState = tuple[Tensor, int, list[Tensor], list[float], list[float], list[int], list[int], list[int]]
@@ -36,10 +35,6 @@ class PreparedTensors:
     n_outputs: int
     keepalive: list[Tensor]
     phase: int = int(AttentionPhase.PREFILL)
-    # SLOT-only tensors.
-    seq_ids: Tensor | None = None
-    pos_ids_host: Tensor | None = None
-    # BLOCK-only tensors.
     cu_seqlens_q: Tensor | None = None
     cu_seqlens_k: Tensor | None = None
     max_seqlen_q: int = 0
@@ -53,6 +48,45 @@ class PreparedTensors:
     cudnn_page_table: Tensor | None = None
     cudnn_qo_ragged_offset: Tensor | None = None
     cudnn_b_exec: int = 0
+
+
+@dataclass
+class CommonPreparedTensors:
+    input_ids: Tensor
+    pos_ids: Tensor
+    logits_indices: Tensor
+    n_outputs: int
+    keepalive: list[Tensor]
+
+
+@dataclass
+class BlockTablesTensor:
+    block_tables: Tensor
+    block_table_width: int
+    keepalive: list[Tensor]
+
+
+@dataclass
+class NativeBlockMeta:
+    cu_seqlens_q: Tensor
+    cu_seqlens_k: Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    slot_mapping: Tensor
+    keepalive: list[Tensor]
+
+
+@dataclass
+class CudnnBlockMeta:
+    slot_mapping: Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    cudnn_seq_lens_q: Tensor
+    cudnn_seq_lens_kv: Tensor
+    cudnn_page_table: Tensor
+    cudnn_qo_ragged_offset: Tensor | None
+    cudnn_b_exec: int
+    keepalive: list[Tensor]
 
 
 class GPUModelRunner:
@@ -77,25 +111,17 @@ class GPUModelRunner:
         self._head_dim = int(getattr(meta_info, "dh", 0))
         self._config.max_model_len = int(self.model.max_seq_len)
         self._config.end_token_id = int(self.model.end_token_id)
-        self._kv_state = None
-        self.allocate_kv_state()
-        self.sampler = Sampler(self._device, config=self._config)
-
-        self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._paged_attn_backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
         self._tp_size = int(getattr(self._config, "tensor_parallel_size", 1))
         self._tp_rank = int(getattr(self._config, "tp_rank", 0))
         self._num_heads_local = int(self._num_heads)
         self._local_device_id = 0
+        self._parallel_context = None
         if self._tp_size > 1:
             if self._device != DeviceType.NVIDIA:
                 raise RuntimeError("tensor parallel requires NVIDIA device")
-            if int(self._config.kv_cache_layout) != int(KvCacheLayout.BLOCK):
-                raise RuntimeError("tensor parallel requires BLOCK kv cache layout")
             if self._paged_attn_backend != "cudnn":
-                raise RuntimeError(
-                    "tensor parallel requires LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn"
-                )
+                raise RuntimeError("tensor parallel requires LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn")
             tp_dev_ids = tuple(int(v) for v in (getattr(self._config, "tensor_parallel_device_ids", None) or ()))
             if not tp_dev_ids:
                 raise RuntimeError("tensor parallel requires tensor_parallel_device_ids")
@@ -110,6 +136,12 @@ class GPUModelRunner:
                 )
             self._num_heads_local = int(self._num_heads // self._tp_size)
 
+        self._kv_state = None
+        self.allocate_kv_state()
+        self.allocate_parallel_context()
+        self.sampler = Sampler(self._device, config=self._config)
+
+        self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._compute_streams: dict[int, object] = {}
         # Decode+CUDNN block-table cache for incremental row updates.
         self._decode_block_table_cache: np.ndarray | None = None
@@ -133,31 +165,29 @@ class GPUModelRunner:
         token_shape = (self._max_num_tokens,)
         self._input_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
         self._pos_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
-        self._seq_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
         self._output_ids_buf = self._make_buffer(token_shape, DataType.I64, pin_memory=True)
 
-        if int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK):
-            self._cu_seqlens_q_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
-            self._cu_seqlens_k_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
-            self._slot_mapping_buf = self._make_buffer((self._max_num_tokens,), DataType.I32, pin_memory=True)
-            self._block_tables_buf = self._make_buffer(
-                (self._max_num_reqs * self._max_block_table_width,),
-                DataType.I32,
-                pin_memory=True,
-            )
-            # CUDNN BLOCK builder uses per-exec-row metadata buffers.
-            self._cudnn_seq_lens_q_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
-            self._cudnn_seq_lens_kv_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
-            self._cudnn_page_table_buf = self._make_buffer(
-                (self._max_num_cudnn_rows * self._max_block_table_width,),
-                DataType.I32,
-                pin_memory=True,
-            )
-            self._cudnn_qo_ragged_offset_buf = self._make_buffer(
-                (self._max_num_cudnn_rows + 1,),
-                DataType.I32,
-                pin_memory=True,
-            )
+        self._cu_seqlens_q_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
+        self._cu_seqlens_k_buf = self._make_buffer((self._max_num_reqs + 1,), DataType.I32, pin_memory=True)
+        self._slot_mapping_buf = self._make_buffer((self._max_num_tokens,), DataType.I32, pin_memory=True)
+        self._block_tables_buf = self._make_buffer(
+            (self._max_num_reqs * self._max_block_table_width,),
+            DataType.I32,
+            pin_memory=True,
+        )
+        # CUDNN BLOCK builder uses per-exec-row metadata buffers.
+        self._cudnn_seq_lens_q_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
+        self._cudnn_seq_lens_kv_buf = self._make_buffer((self._max_num_cudnn_rows,), DataType.I32, pin_memory=True)
+        self._cudnn_page_table_buf = self._make_buffer(
+            (self._max_num_cudnn_rows * self._max_block_table_width,),
+            DataType.I32,
+            pin_memory=True,
+        )
+        self._cudnn_qo_ragged_offset_buf = self._make_buffer(
+            (self._max_num_cudnn_rows + 1,),
+            DataType.I32,
+            pin_memory=True,
+        )
 
         self._logits_holder: Tensor = Tensor((1,), DataType.F32, self._device, int(self._local_device_id))
         self._execute_model_state: ExecuteState | None = None
@@ -172,29 +202,47 @@ class GPUModelRunner:
             self._model_type,
             self._model_path,
             self._device,
-            kv_cache_layout=self._config.kv_cache_layout,
             kv_cache_block_size=self._config.kv_cache_block_size,
             max_model_len=self._config.max_model_len,
             max_num_seqs=int(self._config.max_num_seqs),
             kv_cache_memory_utilization=self._config.kv_cache_memory_utilization,
-            # tp setting
-            tensor_parallel_size=int(getattr(self._config, "tensor_parallel_size", 1)),
-            pipeline_parallel_size=int(getattr(self._config, "pipeline_parallel_size", 1)),
-            distributed_executor_backend=str(getattr(self._config, "distributed_executor_backend", "uni")),
-            distributed_backend=str(getattr(self._config, "distributed_backend", "nccl")),
-            tensor_parallel_device_ids=getattr(self._config, "tensor_parallel_device_ids", None),
-            tp_rank=int(getattr(self._config, "tp_rank", 0)),
-            tp_local_rank=int(getattr(self._config, "tp_local_rank", 0)),
         )
         if kv_state is None:
             raise RuntimeError("kv-state allocation failed")
         self._kv_state = kv_state
         if kv_state_info:
             kv_capacity = kv_state_info.get("kv_cache_capacity_tokens")
-            if self._config.kv_cache_layout == KvCacheLayout.BLOCK and kv_capacity is not None:
+            if kv_capacity is not None:
                 self._config.num_kvcache_blocks = (
                     int(kv_capacity) + int(self._config.kv_cache_block_size) - 1
                 ) // int(self._config.kv_cache_block_size)
+
+    def allocate_parallel_context(self) -> None:
+        if self._parallel_context is not None:
+            return
+        if self._model_path is None:
+            raise ValueError("model_path is required for parallel-context allocation")
+        parallel_context = self._model_registry.create_parallel_context(
+            self._model_type,
+            self._model_path,
+            self._device,
+            tensor_parallel_size=int(getattr(self._config, "tensor_parallel_size", 1)),
+            distributed_backend=str(getattr(self._config, "distributed_backend", "nccl")),
+            tensor_parallel_device_ids=getattr(self._config, "tensor_parallel_device_ids", None),
+            tp_rank=int(getattr(self._config, "tp_rank", 0)),
+            tp_local_rank=int(getattr(self._config, "tp_local_rank", 0)),
+        )
+        if parallel_context is None:
+            raise RuntimeError("parallel-context allocation failed")
+        bind_fn = getattr(self.model, "bind_parallel_context", None)
+        if not callable(bind_fn):
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
+            raise RuntimeError("model wrapper must implement bind_parallel_context")
+        rc = int(bind_fn(parallel_context))
+        if rc != 0:
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
+            raise RuntimeError(f"modelBindParallelContext failed with status={rc}")
+        self._parallel_context = parallel_context
 
     def close(self) -> None:
         if self._closed:
@@ -210,11 +258,15 @@ class GPUModelRunner:
                     pass
         kv_state = self._kv_state
         self._kv_state = None
+        parallel_context = self._parallel_context
+        self._parallel_context = None
         close_fn = getattr(self.model, "close", None)
         if callable(close_fn):
             close_fn()
         if kv_state is not None:
             LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
+        if parallel_context is not None:
+            LIB_LLAISYS.llaisysParallelContextDestroy(parallel_context)
 
     def execute_model(
         self,
@@ -232,11 +284,7 @@ class GPUModelRunner:
 
             with nvtx_range("py/runner/execute_model/build_forward_io"):
                 attn = AttentionMetadata()
-                is_block = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
-                attn.mode = c_int32(int(KvCacheLayout.BLOCK if is_block else KvCacheLayout.SLOT))
                 attn.phase = c_int32(int(prepared.phase))
-                attn.seq_ids = prepared.seq_ids.lib_tensor() if prepared.seq_ids is not None else None
-                attn.pos_ids_host = prepared.pos_ids_host.lib_tensor() if prepared.pos_ids_host is not None else None
                 attn.cu_seqlens_q = (
                     prepared.cu_seqlens_q.lib_tensor() if prepared.cu_seqlens_q is not None else None
                 )
@@ -418,7 +466,6 @@ class GPUModelRunner:
         backend = str(getattr(self, "_paged_attn_backend", "native")).strip().lower()
         return (
             device == DeviceType.NVIDIA
-            and int(cfg.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             and backend == "cudnn"
         )
 
@@ -563,8 +610,7 @@ class GPUModelRunner:
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
-        include_seq_ids: bool,
-    ) -> tuple[PreparedTensors, object]:
+    ) -> tuple[CommonPreparedTensors, object]:
         ntoken = int(len(input_ids))
         n_outputs = int(len(seqs))
         if ntoken > self._max_num_tokens:
@@ -581,21 +627,16 @@ class GPUModelRunner:
             or not isinstance(self._output_ids_buf, CpuGpuBuffer)
         ):
             raise RuntimeError("GPU block common builder requires CpuGpuBuffer tensors")
-        if include_seq_ids:
-            assert self._seq_ids_buf is not None
-            if not isinstance(self._seq_ids_buf, CpuGpuBuffer):
-                raise RuntimeError("GPU slot builder requires CpuGpuBuffer seq_ids buffer")
-
         output_rows = self._build_output_rows(scheduled_token_counts, n_outputs)
         keepalive: list[Tensor] = []
 
         input_ids_host_t = self._input_ids_buf.cpu.slice(0, 0, ntoken)
-        pos_ids_host_t = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
         input_ids_t = self._input_ids_buf.gpu.slice(0, 0, ntoken)
         pos_ids_t = self._pos_ids_buf.gpu.slice(0, 0, ntoken)
         dev_id = int(input_ids_t.device_id())
         h2d_stream = self._get_compute_stream(dev_id)
         input_ids_host_t.copy_from_numpy(np.asarray(input_ids, dtype=np.int64))
+        pos_ids_host_t = self._pos_ids_buf.cpu.slice(0, 0, ntoken)
         pos_ids_host_t.copy_from_numpy(np.asarray(positions, dtype=np.int64))
         input_ids_t.copy_(input_ids_host_t, non_blocking=True, stream=h2d_stream)
         pos_ids_t.copy_(pos_ids_host_t, non_blocking=True, stream=h2d_stream)
@@ -608,25 +649,13 @@ class GPUModelRunner:
             logits_indices_t.copy_(logits_indices_host_t, non_blocking=True, stream=h2d_stream)
         keepalive.append(logits_indices_t)
 
-        prepared = PreparedTensors(
+        prepared = CommonPreparedTensors(
             input_ids=input_ids_t,
             pos_ids=pos_ids_t,
             logits_indices=logits_indices_t,
             n_outputs=n_outputs,
             keepalive=keepalive,
         )
-
-        if include_seq_ids:
-            seq_ids_per_req = np.asarray([int(seq_obj.seq_id) for seq_obj in seqs], dtype=np.int64)
-            sched_counts = np.asarray(scheduled_token_counts, dtype=np.int64)
-            seq_token_ids = np.repeat(seq_ids_per_req, sched_counts)
-            seq_ids_host_t = self._seq_ids_buf.cpu.slice(0, 0, ntoken)
-            seq_ids_t = self._seq_ids_buf.gpu.slice(0, 0, ntoken)
-            seq_ids_host_t.copy_from_numpy(seq_token_ids)
-            seq_ids_t.copy_(seq_ids_host_t, non_blocking=True, stream=h2d_stream)
-            keepalive.extend([seq_ids_t, pos_ids_host_t])
-            prepared.seq_ids = seq_ids_t
-            prepared.pos_ids_host = pos_ids_host_t
 
         return prepared, h2d_stream
 
@@ -637,25 +666,23 @@ class GPUModelRunner:
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
-    ) -> tuple[PreparedTensors, object]:
+    ) -> tuple[CommonPreparedTensors, object]:
         return self._build_common_io_tensors(
             seqs=seqs,
             input_ids=input_ids,
             positions=positions,
             scheduled_token_counts=scheduled_token_counts,
-            include_seq_ids=False,
         )
 
     def _stage_block_tables_tensor(
         self,
         *,
-        prepared: PreparedTensors,
         seqs: list,
         block_table_rows: np.ndarray,
         block_table_width: int,
         h2d_stream,
         incremental_update: bool = False,
-    ) -> None:
+    ) -> BlockTablesTensor:
         n_outputs = int(len(seqs))
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
@@ -708,15 +735,18 @@ class GPUModelRunner:
                 cache[changed_rows, :] = block_rows_np[changed_rows, :]
             self._decode_block_table_cache = cache
 
-        prepared.keepalive.append(block_tables_t)
-        prepared.block_tables = block_tables_t
-        prepared.block_table_width = int(block_table_width)
+        return BlockTablesTensor(
+            block_tables=block_tables_t,
+            block_table_width=int(block_table_width),
+            keepalive=[block_tables_t],
+        )
 
     def _build_block_native_meta(
         self,
         *,
-        prepared: PreparedTensors,
         seqs: list,
+        ntoken: int,
+        block_tables: Tensor,
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
         max_seqlen_q: int,
@@ -724,8 +754,7 @@ class GPUModelRunner:
         slot_mapping: list[int],
         block_table_width: int,
         h2d_stream,
-    ) -> None:
-        ntoken = int(prepared.input_ids.shape()[0])
+    ) -> NativeBlockMeta:
         if len(cu_seqlens_q) != len(seqs) + 1:
             raise RuntimeError("cu_seqlens_q size mismatch")
         if len(cu_seqlens_k) != len(seqs) + 1:
@@ -736,7 +765,7 @@ class GPUModelRunner:
             raise RuntimeError("slot_mapping size mismatch")
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
-        if prepared.block_tables is None or int(prepared.block_table_width) != int(block_table_width):
+        if block_tables is None:
             raise RuntimeError("block_tables must be staged before native metadata build")
 
         assert self._cu_seqlens_q_buf is not None
@@ -763,19 +792,21 @@ class GPUModelRunner:
         cu_seqlens_k_t.copy_(cu_seqlens_k_host_t, non_blocking=True, stream=h2d_stream)
         slot_mapping_t.copy_(slot_mapping_host_t, non_blocking=True, stream=h2d_stream)
 
-        prepared.keepalive.extend([cu_seqlens_q_t, cu_seqlens_k_t, slot_mapping_t])
-        prepared.cu_seqlens_q = cu_seqlens_q_t
-        prepared.cu_seqlens_k = cu_seqlens_k_t
-        prepared.max_seqlen_q = int(max_seqlen_q)
-        prepared.max_seqlen_k = int(max_seqlen_k)
-        prepared.slot_mapping = slot_mapping_t
-        prepared.block_table_width = int(block_table_width)
+        return NativeBlockMeta(
+            cu_seqlens_q=cu_seqlens_q_t,
+            cu_seqlens_k=cu_seqlens_k_t,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            slot_mapping=slot_mapping_t,
+            keepalive=[cu_seqlens_q_t, cu_seqlens_k_t, slot_mapping_t],
+        )
 
     def _build_block_cudnn_meta(
         self,
         *,
-        prepared: PreparedTensors,
         attention_phase: int,
+        ntoken: int,
+        block_tables: Tensor,
         slot_mapping: list[int],
         cu_seqlens_q: list[int],
         cu_seqlens_k: list[int],
@@ -784,11 +815,10 @@ class GPUModelRunner:
         max_seqlen_k: int,
         block_table_width: int,
         h2d_stream,
-    ) -> None:
-        ntoken = int(prepared.input_ids.shape()[0])
+    ) -> CudnnBlockMeta:
         if len(slot_mapping) != ntoken:
             raise RuntimeError("slot_mapping size mismatch")
-        if prepared.block_tables is None or int(prepared.block_table_width) != int(block_table_width):
+        if block_tables is None:
             raise RuntimeError("block_tables must be staged before cudnn metadata build")
 
         assert self._slot_mapping_buf is not None
@@ -846,41 +876,25 @@ class GPUModelRunner:
         cudnn_seq_lens_kv_t.copy_(cudnn_seq_lens_kv_host_t, non_blocking=True, stream=h2d_stream)
         cudnn_page_table_t.copy_(cudnn_page_table_host_t, non_blocking=True, stream=h2d_stream)
 
-        prepared.keepalive.extend([slot_mapping_t, cudnn_seq_lens_q_t, cudnn_seq_lens_kv_t, cudnn_page_table_t])
-        prepared.slot_mapping = slot_mapping_t
-        prepared.max_seqlen_q = int(max_seqlen_q)
-        prepared.max_seqlen_k = int(max_seqlen_k)
-        prepared.block_table_width = int(block_table_width)
-        prepared.cudnn_seq_lens_q = cudnn_seq_lens_q_t
-        prepared.cudnn_seq_lens_kv = cudnn_seq_lens_kv_t
-        prepared.cudnn_page_table = cudnn_page_table_t
-        prepared.cudnn_qo_ragged_offset = None
+        keepalive = [slot_mapping_t, cudnn_seq_lens_q_t, cudnn_seq_lens_kv_t, cudnn_page_table_t]
+        ragged_t = None
         if qo_ragged_offsets is not None:
             ragged_host_t = self._cudnn_qo_ragged_offset_buf.cpu.slice(0, 0, int(b_exec) + 1)
             ragged_t = self._cudnn_qo_ragged_offset_buf.gpu.slice(0, 0, int(b_exec) + 1)
             ragged_host_t.copy_from_numpy(qo_ragged_offsets)
             ragged_t.copy_(ragged_host_t, non_blocking=True, stream=h2d_stream)
-            prepared.keepalive.append(ragged_t)
-            prepared.cudnn_qo_ragged_offset = ragged_t
-        prepared.cudnn_b_exec = int(b_exec)
-
-    def _build_slot_tensors(
-        self,
-        *,
-        seqs: list,
-        input_ids: list[int],
-        positions: list[int],
-        scheduled_token_counts: list[int],
-    ) -> PreparedTensors:
-        with nvtx_range("py/runner/prepare_inputs/slot/build"):
-            prepared, _ = self._build_common_io_tensors(
-                seqs=seqs,
-                input_ids=input_ids,
-                positions=positions,
-                scheduled_token_counts=scheduled_token_counts,
-                include_seq_ids=True,
-            )
-            return prepared
+            keepalive.append(ragged_t)
+        return CudnnBlockMeta(
+            slot_mapping=slot_mapping_t,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            cudnn_seq_lens_q=cudnn_seq_lens_q_t,
+            cudnn_seq_lens_kv=cudnn_seq_lens_kv_t,
+            cudnn_page_table=cudnn_page_table_t,
+            cudnn_qo_ragged_offset=ragged_t,
+            cudnn_b_exec=int(b_exec),
+            keepalive=keepalive,
+        )
 
     def _build_block_tensors(
         self,
@@ -901,15 +915,14 @@ class GPUModelRunner:
     ) -> PreparedTensors:
         with nvtx_range("py/runner/prepare_inputs/block/build"):
             # Stage input/position/logits copies first so DMA can overlap with metadata construction.
-            prepared, h2d_stream = self._build_block_common_tensors(
+            common, h2d_stream = self._build_block_common_tensors(
                 seqs=seqs,
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
             )
             # Stage block table upload early for the same reason.
-            self._stage_block_tables_tensor(
-                prepared=prepared,
+            block_tables = self._stage_block_tables_tensor(
                 seqs=seqs,
                 block_table_rows=block_table_rows,
                 block_table_width=int(block_table_width),
@@ -918,9 +931,10 @@ class GPUModelRunner:
             )
             if self._use_cudnn_block_builder():
                 with nvtx_range("py/runner/prepare_inputs/block/cudnn_meta"):
-                    self._build_block_cudnn_meta(
-                        prepared=prepared,
+                    cudnn_meta = self._build_block_cudnn_meta(
                         attention_phase=int(attention_phase),
+                        ntoken=int(common.input_ids.shape()[0]),
+                        block_tables=block_tables.block_tables,
                         slot_mapping=slot_mapping,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
@@ -930,11 +944,29 @@ class GPUModelRunner:
                         block_table_width=int(block_table_width),
                         h2d_stream=h2d_stream,
                     )
+                prepared = PreparedTensors(
+                    input_ids=common.input_ids,
+                    pos_ids=common.pos_ids,
+                    logits_indices=common.logits_indices,
+                    n_outputs=common.n_outputs,
+                    keepalive=common.keepalive + block_tables.keepalive + cudnn_meta.keepalive,
+                    block_tables=block_tables.block_tables,
+                    block_table_width=block_tables.block_table_width,
+                    max_seqlen_q=cudnn_meta.max_seqlen_q,
+                    max_seqlen_k=cudnn_meta.max_seqlen_k,
+                    slot_mapping=cudnn_meta.slot_mapping,
+                    cudnn_seq_lens_q=cudnn_meta.cudnn_seq_lens_q,
+                    cudnn_seq_lens_kv=cudnn_meta.cudnn_seq_lens_kv,
+                    cudnn_page_table=cudnn_meta.cudnn_page_table,
+                    cudnn_qo_ragged_offset=cudnn_meta.cudnn_qo_ragged_offset,
+                    cudnn_b_exec=cudnn_meta.cudnn_b_exec,
+                )
             else:
                 with nvtx_range("py/runner/prepare_inputs/block/native_meta"):
-                    self._build_block_native_meta(
-                        prepared=prepared,
+                    native_meta = self._build_block_native_meta(
                         seqs=seqs,
+                        ntoken=int(common.input_ids.shape()[0]),
+                        block_tables=block_tables.block_tables,
                         cu_seqlens_q=cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=int(max_seqlen_q),
@@ -943,6 +975,20 @@ class GPUModelRunner:
                         block_table_width=int(block_table_width),
                         h2d_stream=h2d_stream,
                     )
+                prepared = PreparedTensors(
+                    input_ids=common.input_ids,
+                    pos_ids=common.pos_ids,
+                    logits_indices=common.logits_indices,
+                    n_outputs=common.n_outputs,
+                    keepalive=common.keepalive + block_tables.keepalive + native_meta.keepalive,
+                    cu_seqlens_q=native_meta.cu_seqlens_q,
+                    cu_seqlens_k=native_meta.cu_seqlens_k,
+                    max_seqlen_q=native_meta.max_seqlen_q,
+                    max_seqlen_k=native_meta.max_seqlen_k,
+                    slot_mapping=native_meta.slot_mapping,
+                    block_tables=block_tables.block_tables,
+                    block_table_width=block_tables.block_table_width,
+                )
             return prepared
 
     def prepare_prefill(
@@ -950,7 +996,6 @@ class GPUModelRunner:
         seqs: list,
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/prefill"):
-            is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             nseq = len(seqs)
             if nseq <= 0:
                 return None
@@ -985,16 +1030,6 @@ class GPUModelRunner:
                 positions[row_start:row_end] = np.arange(tok_start, tok_end, dtype=np.int64)
             if len(input_ids) <= 0:
                 return None
-
-            if not is_block_layout:
-                prepared = self._build_slot_tensors(
-                    seqs=seqs,
-                    input_ids=input_ids,
-                    positions=positions,
-                    scheduled_token_counts=scheduled_token_counts,
-                )
-                prepared.phase = int(AttentionPhase.PREFILL)
-                return prepared
 
             seqlen_q = scheduled_token_counts.astype(np.int32, copy=False)
             seqlen_k = seqlens.astype(np.int32, copy=False)
@@ -1060,7 +1095,6 @@ class GPUModelRunner:
         seqs: list,
     ) -> PreparedTensors | None:
         with nvtx_range("py/runner/prepare_inputs/decode"):
-            is_block_layout = int(self._config.kv_cache_layout) == int(KvCacheLayout.BLOCK)
             nseq = len(seqs)
             if nseq <= 0:
                 return None
@@ -1073,16 +1107,6 @@ class GPUModelRunner:
                 positions[i] = max(0, seqlen - 1)
                 seqlens_k[i] = int(seqlen)
             scheduled_token_counts = self._decode_scheduled_counts_np[:nseq]
-
-            if not is_block_layout:
-                prepared = self._build_slot_tensors(
-                    seqs=seqs,
-                    input_ids=input_ids,
-                    positions=positions,
-                    scheduled_token_counts=scheduled_token_counts,
-                )
-                prepared.phase = int(AttentionPhase.DECODE)
-                return prepared
 
             cu_seqlens_q = self._decode_cu_seqlens_q_np[: nseq + 1]
             cu_seqlens_k = self._decode_cu_seqlens_k_np[: nseq + 1]

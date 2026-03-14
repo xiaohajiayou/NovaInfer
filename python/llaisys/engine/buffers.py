@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..libllaisys import DataType, DeviceType
-from ..tensor import Tensor
+from ..bindings.tensor import Tensor
 
 
 class CpuGpuBuffer:

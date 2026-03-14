@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..libllaisys import LIB_LLAISYS, DeviceType
-from ..libllaisys.model import KvCacheLayout, LlaisysKvStateCreateParams, LlaisysParallelInitParams
+from ..libllaisys.model import LlaisysKvStateCreateParams, LlaisysParallelContextCreateParams
 from ..models import qwen2 as qwen2_impl
 
 
@@ -306,19 +306,11 @@ def _estimate_cuda_kv_capacity_tokens(
 def create_kv_state(
     *,
     device: DeviceType,
-    kv_cache_layout: KvCacheLayout,
     kv_cache_block_size: int,
     plan: KvCachePlan,
-    tensor_parallel_size: int = 1,
-    pipeline_parallel_size: int = 1,
-    distributed_executor_backend: str = "uni",
-    distributed_backend: str = "nccl",
-    tensor_parallel_device_ids: tuple[int, ...] | None = None,
-    tp_rank: int = 0,
-    tp_local_rank: int = 0,
 ):
+    del device
     params = LlaisysKvStateCreateParams(
-        int(kv_cache_layout),
         int(kv_cache_block_size),
         int(plan.max_model_len),
         int(plan.kv_cache_capacity_tokens),
@@ -326,87 +318,67 @@ def create_kv_state(
     kv_state = LIB_LLAISYS.llaisysKvStateCreate(byref(params))
     if not kv_state:
         raise RuntimeError("Failed to create kv state")
+    return kv_state
 
+def create_parallel_context(
+    *,
+    device: DeviceType,
+    tensor_parallel_size: int,
+    distributed_backend: str = "nccl",
+    tensor_parallel_device_ids: tuple[int, ...] | None = None,
+    tp_rank: int = 0,
+    tp_local_rank: int = 0,
+):
     tp_size = max(1, int(tensor_parallel_size))
-    pp_size = max(1, int(pipeline_parallel_size))
     rank = max(0, int(tp_rank))
     local_rank = max(0, int(tp_local_rank))
     if rank >= tp_size:
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError(f"tp_rank out of range: rank={rank} tp_size={tp_size}")
-    exec_backend = str(distributed_executor_backend or "uni").strip().lower()
-    dist_backend = str(distributed_backend or "nccl").strip().lower()
 
-    if tp_size > 1 and device != DeviceType.NVIDIA:
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
-        raise RuntimeError("tensor parallel currently supports NVIDIA device only")
+    dist_backend = str(distributed_backend or "nccl").strip().lower()
+    init_method = str(os.getenv("LLAISYS_TP_INIT_METHOD", "")).strip()
+    if tp_size > 1 and not init_method:
+        init_method = "file:///tmp/llaisys_tp_nccl.id"
+
     if tp_size > 1:
+        if device != DeviceType.NVIDIA:
+            raise RuntimeError("tensor parallel currently supports NVIDIA device only")
         backend = str(os.getenv("LLAISYS_CUDA_PAGED_ATTN_BACKEND", "native")).strip().lower()
         if backend == "cudnn":
             cudnn_ver = _cudnn_version()
             if cudnn_ver < 91800:
-                LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
                 raise RuntimeError(
                     "TP with cudnn backend requires cuDNN >= 9.18 "
                     f"(detected: {cudnn_ver}). Please update libcudnn in LD_LIBRARY_PATH."
                 )
-    if exec_backend != "uni":
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
-        raise NotImplementedError(f"distributed_executor_backend={exec_backend} is not supported yet")
 
-    try:
-        if device == DeviceType.NVIDIA:
-            selected_ids = select_tp_device_ids(tp_size, tensor_parallel_device_ids)
-        else:
-            if tensor_parallel_device_ids is not None and len(tuple(tensor_parallel_device_ids)) > 0:
-                raise RuntimeError("tensor_parallel_device_ids is only valid on NVIDIA device")
-            selected_ids = tuple()
-    except Exception:
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
-        raise
+    if device == DeviceType.NVIDIA:
+        selected_ids = select_tp_device_ids(tp_size, tensor_parallel_device_ids)
+    else:
+        if tensor_parallel_device_ids:
+            raise RuntimeError("tensor_parallel_device_ids is only valid on NVIDIA device")
+        selected_ids = tuple()
 
     if device == DeviceType.NVIDIA and len(selected_ids) != tp_size:
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
         raise RuntimeError(f"parallel device ids mismatch: tp_size={tp_size} selected={len(selected_ids)}")
 
-    ids_arr = (c_int * len(selected_ids))(*[int(v) for v in selected_ids])
-    dist_exec_b = str(exec_backend).encode("utf-8")
-    dist_b = str(dist_backend).encode("utf-8")
-    master_addr_b = str(os.getenv("LLAISYS_TP_MASTER_ADDR", "")).encode("utf-8")
-    master_port = int(os.getenv("LLAISYS_TP_MASTER_PORT", "0"))
-    init_method = str(os.getenv("LLAISYS_TP_INIT_METHOD", "")).strip()
-    if tp_size > 1 and not init_method:
-        init_method = "file:///tmp/llaisys_tp_nccl.id"
-    init_method_b = init_method.encode("utf-8")
-    tp_group_name_b = b"tp"
-    single_process_tp = int(os.getenv("LLAISYS_TP_SINGLE_PROCESS", "1"))
-
-    par = LlaisysParallelInitParams(
+    ids_arr = (c_int * len(selected_ids))(*[int(v) for v in selected_ids]) if selected_ids else None
+    params = LlaisysParallelContextCreateParams(
         int(tp_size),
-        int(pp_size),
-        int(tp_size * pp_size),
         int(rank),
         int(local_rank),
-        c_char_p(dist_exec_b),
-        c_char_p(dist_b),
-        c_char_p(master_addr_b),
-        int(master_port),
-        int(0),
-        int(1),
-        c_char_p(init_method_b),
-        c_char_p(tp_group_name_b),
-        int(single_process_tp),
+        c_char_p(dist_backend.encode("utf-8")),
+        c_char_p(init_method.encode("utf-8")),
         ids_arr,
         int(len(selected_ids)),
     )
-    rc = int(LIB_LLAISYS.llaisysKvStateParallelInit(kv_state, byref(par)))
-    if rc != 0:
-        LIB_LLAISYS.llaisysKvStateDestroy(kv_state)
+    ctx = LIB_LLAISYS.llaisysParallelContextCreate(byref(params))
+    if not ctx:
         raise RuntimeError(
-            "llaisysKvStateParallelInit failed "
-            f"(rc={rc}, tp_size={tp_size}, rank={rank}, local_rank={local_rank}, device_ids={list(selected_ids)})"
+            "Failed to create parallel context "
+            f"(tp_size={tp_size}, rank={rank}, local_rank={local_rank}, device_ids={list(selected_ids)})"
         )
-    return kv_state
+    return ctx
 
 
 def plan_qwen2_kv_cache(

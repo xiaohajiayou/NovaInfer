@@ -9,7 +9,6 @@ from llaisys.engine.cpu_model_runner import CPUModelRunner
 from llaisys.engine.gpu_model_runner import GPUModelRunner
 from llaisys.engine.sequence import Sequence
 from llaisys.engine.types import SamplingParams
-from llaisys.libllaisys.model import KvCacheLayout
 
 
 class _FakeSampler:
@@ -88,7 +87,6 @@ def test_sample_tokens_cpu_gpu_runner_semantics_match():
 def test_cpu_runner_block_metadata_capacity_guard():
     runner = CPUModelRunner.__new__(CPUModelRunner)
     runner._config = EngineConfig(
-        kv_cache_layout=KvCacheLayout.BLOCK,
         kv_cache_block_size=1,
     )
     runner._max_num_reqs = 2

@@ -5,7 +5,6 @@ import signal
 import threading
 
 from ..libllaisys import DeviceType
-from ..libllaisys.model import KvCacheLayout
 from ..engine.config import EngineConfig
 from .async_engine import AsyncLLMEngine
 from .http_server import LlaisysHTTPServer
@@ -28,7 +27,6 @@ def main() -> int:
     parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8000, type=int)
-    parser.add_argument("--kv-cache-layout", default="block", choices=["slot", "block"])
     parser.add_argument("--kv-cache-block-size", default=16, type=int)
     parser.add_argument("--max-model-len", default=4096, type=int)
     parser.add_argument(
@@ -48,7 +46,6 @@ def main() -> int:
         model_type=args.model_type,
         model_path=args.model_path,
         device=_parse_device(args.device),
-        kv_cache_layout=KvCacheLayout.BLOCK if args.kv_cache_layout == "block" else KvCacheLayout.SLOT,
         kv_cache_block_size=int(args.kv_cache_block_size),
         max_model_len=int(args.max_model_len),
         max_num_seqs=max(1, int(args.max_num_seqs)),
@@ -72,7 +69,7 @@ def main() -> int:
     print("Endpoints: GET /health, POST /v1/chat/completions, POST /v1/requests/{id}/cancel")
     print(
         "Server config: "
-        f"device={args.device} kv_cache_layout={args.kv_cache_layout} "
+        f"device={args.device} "
         f"max_model_len={int(args.max_model_len)} "
         f"kv_cache_memory_utilization={float(args.kv_cache_memory_utilization):.2f} "
         f"max_num_seqs={max(1, int(args.max_num_seqs))} "

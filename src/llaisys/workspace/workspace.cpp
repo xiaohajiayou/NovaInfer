@@ -1,9 +1,9 @@
 #include "workspace.hpp"
 
-#include "../../../utils.hpp"
-#include "../../../utils/check.hpp"
+#include "../../utils.hpp"
+#include "../../utils/check.hpp"
 
-namespace llaisys::runtime::workspace {
+namespace llaisys::workspace {
 
 namespace {
 
@@ -159,4 +159,4 @@ void Qwen2Workspace::reserve(size_t ntoken) {
     view_.attn_mask_flat = slice_u8_(layout, 0, token_cap_ * maxseq_, {token_cap_ * maxseq_});
 }
 
-} // namespace llaisys::runtime::workspace
+} // namespace llaisys::workspace

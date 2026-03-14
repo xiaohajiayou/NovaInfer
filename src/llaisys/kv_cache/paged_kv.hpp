@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kv_cache.hpp"
-#include "../../../utils/check.hpp"
+#include "../../utils/check.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace llaisys::runtime::kv_cache {
+namespace llaisys::kv_cache {
 
 class BlockPool {
 public:
@@ -58,7 +58,7 @@ private:
     int64_t max_pos_{-1};
 };
 
-class PagedKvImpl final : public KvCacheBase {
+class PagedKvImpl final {
 public:
     PagedKvImpl(size_t maxseq, uint32_t n_stream, size_t block_size);
 
@@ -67,18 +67,17 @@ public:
                       size_t dh,
                       llaisysDataType_t dtype,
                       llaisysDeviceType_t device_type,
-                      int device_id) override;
+                      int device_id);
     tensor_t layer_k(size_t layer) const;
     tensor_t layer_v(size_t layer) const;
 
-    KvSlotInfoVec prepare(const std::vector<KvUBatch> &ubatches) override;
-    KvStatus apply_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
-    void rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch) override;
-    KvStatus request_free(int64_t seq_id) override;
-    KvStatus reset_prefix_cache() override;
-    int64_t seq_pos_max(int64_t seq_id) const noexcept override;
-    void used_slots(std::vector<int32_t> *out) const override;
-    bool slot_visible_for(int32_t slot, const int64_t *seq_ids, int32_t n_seq_id, int64_t qpos) const override;
+    KvSlotInfoVec prepare(const std::vector<KvUBatch> &ubatches);
+    KvStatus apply_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch);
+    void rollback_ubatch(const KvSlotInfo &sinfo, const KvUBatch &ubatch);
+    KvStatus request_free(int64_t seq_id);
+    KvStatus reset_prefix_cache();
+    int64_t seq_pos_max(int64_t seq_id) const noexcept;
+    void used_slots(std::vector<int32_t> *out) const;
     bool build_attention_plan(const std::vector<std::vector<int64_t>> &seq_sets,
                               const std::vector<int64_t> &qpos,
                               std::vector<int32_t> *used_slots,
@@ -120,4 +119,4 @@ private:
     std::unordered_map<int64_t, std::unique_ptr<BlockTable>> block_tables_;
 };
 
-} // namespace llaisys::runtime::kv_cache
+} // namespace llaisys::kv_cache

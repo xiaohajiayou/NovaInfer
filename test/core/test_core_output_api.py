@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import llaisys
-from llaisys.libllaisys.model import KvCacheLayout
 from test.utils.batch_builders import build_decode_batch
 from test.utils.forward_api import (
     TinyMeta,
@@ -11,14 +10,12 @@ from test.utils.forward_api import (
     sample_from_forward,
 )
 
-TEST_KV_LAYOUT = int(KvCacheLayout.BLOCK)
 TEST_KV_BLOCK_SIZE = 16
 
 
 def _create_model(meta: TinyMeta = TinyMeta(maxseq=64)):
     return create_tiny_qwen2_model(
         meta,
-        layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
 
@@ -29,7 +26,6 @@ def _forward(runtime, model, token_ids: list[int], logits_mask: list[int] | None
         logits_mask=logits_mask,
         seq_ids=[0] * len(token_ids),
         pos_ids=[int(i) for i in range(len(token_ids))],
-        layout=KvCacheLayout(TEST_KV_LAYOUT),
         block_size=TEST_KV_BLOCK_SIZE,
     )
     return run_model_forward(model, runtime, built, device=llaisys.DeviceType.CPU)

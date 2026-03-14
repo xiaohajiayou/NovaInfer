@@ -1,5 +1,5 @@
-from . import libllaisys
-from .libllaisys import LIB_LLAISYS
+from .. import libllaisys
+from ..libllaisys import LIB_LLAISYS
 from ctypes import c_void_p
 
 
@@ -58,7 +58,6 @@ class RuntimeAPI:
         return ptr
 
     def free_device(self, ptr: c_void_p) -> None:
-        print(f"[llaisys] free_device({ptr})")
         self._api.contents.free_device(ptr)
 
     def malloc_host(self, size: int) -> c_void_p:

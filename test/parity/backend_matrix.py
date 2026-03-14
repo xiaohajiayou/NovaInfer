@@ -51,14 +51,10 @@ def parity_device_backend_layout_cases() -> list[tuple[str, str | None, str]]:
     """
     Parity matrix with KV layout dimension.
 
-    - CPU: run both block and slot layouts.
-    - NVIDIA: run block layout only (slot is unsupported on NVIDIA runtime).
+    - CPU: run block layout only.
+    - NVIDIA: run block layout only.
     """
     out: list[tuple[str, str | None, str]] = []
     for device, backend in parity_device_backend_cases():
-        if device == "cpu":
-            out.append((device, backend, "block"))
-            out.append((device, backend, "slot"))
-        else:
-            out.append((device, backend, "block"))
+        out.append((device, backend, "block"))
     return out
