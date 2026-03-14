@@ -73,6 +73,18 @@ class Worker:
         with nvtx_range("py/worker/execute_model"):
             return self._model_runner.execute_model(scheduler_outputs)
 
+    def build_batch_plan(self, scheduler_outputs):
+        fn = getattr(self._model_runner, "build_batch_plan", None)
+        if not callable(fn):
+            raise RuntimeError("model_runner must implement build_batch_plan")
+        return fn(scheduler_outputs)
+
+    def execute_model_plan(self, batch_plan):
+        fn = getattr(self._model_runner, "execute_model_plan", None)
+        if not callable(fn):
+            raise RuntimeError("model_runner must implement execute_model_plan")
+        return fn(batch_plan)
+
     def sample_tokens(self):
         with nvtx_range("py/worker/sample_tokens"):
             return self._model_runner.sample_tokens()

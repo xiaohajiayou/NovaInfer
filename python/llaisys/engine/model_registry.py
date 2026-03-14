@@ -115,6 +115,7 @@ def _create_qwen2_parallel_context(
     tensor_parallel_device_ids: tuple[int, ...] | None = None,
     tp_rank: int = 0,
     tp_local_rank: int = 0,
+    tp_init_method: str | None = None,
 ):
     del model_path
     from .runtime_factory import create_parallel_context
@@ -126,6 +127,7 @@ def _create_qwen2_parallel_context(
         tensor_parallel_device_ids=tensor_parallel_device_ids,
         tp_rank=tp_rank,
         tp_local_rank=tp_local_rank,
+        tp_init_method=tp_init_method,
     )
 
 

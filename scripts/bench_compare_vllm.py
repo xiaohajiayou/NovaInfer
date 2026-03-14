@@ -104,6 +104,7 @@ def _run_novainfer(
     tp_rank: int,
     tp_local_rank: int,
     tensor_parallel_device_ids: tuple[int, ...] | None,
+    distributed_executor_backend: str,
 ) -> dict:
     from llaisys.entrypoints.llm import LLM
     from llaisys.engine.types import SamplingParams
@@ -138,6 +139,7 @@ def _run_novainfer(
         tp_rank=int(tp_rank),
         tp_local_rank=int(tp_local_rank),
         tensor_parallel_device_ids=tensor_parallel_device_ids,
+        distributed_executor_backend=str(distributed_executor_backend),
     )
     t_init1 = time.perf_counter()
     t_warmup0 = t_init1
@@ -203,6 +205,7 @@ def _run_vllm(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     vllm_fair_mode: bool,
+    vllm_gpu_memory_utilization: float,
 ) -> dict:
     from vllm import LLM, SamplingParams
     if vllm_fair_mode:
@@ -231,6 +234,7 @@ def _run_vllm(
         "enforce_eager": False,
         "max_num_seqs": int(max_num_seqs),
         "max_num_batched_tokens": int(max_num_batched_tokens),
+        "gpu_memory_utilization": float(vllm_gpu_memory_utilization),
     }
 
     if vllm_fair_mode:
@@ -296,10 +300,12 @@ def main() -> int:
     parser.add_argument("--max-num-seqs", default=256, type=int)
     parser.add_argument("--max-num-batched-tokens", default=16384, type=int)
     parser.add_argument("--kv-cache-memory-utilization", default=0.9, type=float)
+    parser.add_argument("--vllm-gpu-memory-utilization", default=0.9, type=float)
     parser.add_argument("--tensor-parallel-size", default=1, type=int)
     parser.add_argument("--tp-rank", default=0, type=int)
     parser.add_argument("--tp-local-rank", default=0, type=int)
     parser.add_argument("--tensor-parallel-device-ids", default="", type=str)
+    parser.add_argument("--distributed-executor-backend", default="uni", choices=["uni", "mp"])
     parser.add_argument("--vllm-fair-mode", action="store_true")
     parser.add_argument("--result-json", default="", type=str)
     args = parser.parse_args()
@@ -368,6 +374,8 @@ def main() -> int:
                 str(args.max_num_batched_tokens),
                 "--kv-cache-memory-utilization",
                 str(args.kv_cache_memory_utilization),
+                "--vllm-gpu-memory-utilization",
+                str(args.vllm_gpu_memory_utilization),
                 "--tensor-parallel-size",
                 str(args.tensor_parallel_size),
                 "--tp-rank",
@@ -376,6 +384,8 @@ def main() -> int:
                 str(args.tp_local_rank),
                 "--tensor-parallel-device-ids",
                 str(args.tensor_parallel_device_ids),
+                "--distributed-executor-backend",
+                str(args.distributed_executor_backend),
                 *(["--vllm-fair-mode"] if bool(args.vllm_fair_mode) else []),
                 "--result-json",
                 result_json,
@@ -420,6 +430,7 @@ def main() -> int:
             tp_rank=int(args.tp_rank),
             tp_local_rank=int(args.tp_local_rank),
             tensor_parallel_device_ids=tp_device_ids,
+            distributed_executor_backend=str(args.distributed_executor_backend),
         )
         results.append(row)
         _print_row(row)
@@ -432,6 +443,7 @@ def main() -> int:
             max_num_seqs=int(args.max_num_seqs),
             max_num_batched_tokens=int(args.max_num_batched_tokens),
             vllm_fair_mode=bool(args.vllm_fair_mode),
+            vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
         )
         results.append(row)
         _print_row(row)

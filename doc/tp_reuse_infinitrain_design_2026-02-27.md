@@ -2103,6 +2103,13 @@ Smoke-2（中负载）：
 
 #### 13.16.11.3 吞吐验收矩阵（NovaInfer）
 
+说明：
+
+1. 本小节是较早阶段记录，TP 吞吐当时按“各 rank 吞吐平均值”记账。
+2. 该口径可用于观察趋势，但不是最终标准口径。
+3. 最终标准口径见 `13.16.12.3`，统一使用：
+   `global_tokens / max(rank_run_seconds)`
+
 `1.5B`，参数：`num_seqs=256, in=[100,1024], out=[100,1024], max_num_batched_tokens=16384`
 
 1. `TP=1`（GPU6）：`2037.82 tok/s`
@@ -2171,16 +2178,23 @@ xmake install
 
 #### 13.16.12.3 最终吞吐矩阵（NovaInfer，复验有效口径）
 
+统计口径：
+
+1. `global_tokens = 同一批请求的总生成 token 数`
+2. `global_run_seconds = max(rank_run_seconds)`
+3. `global_throughput = global_tokens / global_run_seconds`
+4. 不再使用“rank 平均吞吐”作为最终 TP 吞吐
+
 `1.5B`，参数：`num_seqs=256, in=[100,1024], out=[100,1024], max_num_batched_tokens=16384`
 
 1. `TP=1`（GPU5）：`8474.88 tok/s`
-2. `TP=2`（GPU5,6）：`10302.56 tok/s`（rank 平均）
+2. `TP=2`（GPU5,6）：以 `scripts/bench_tp_novainfer.py` 输出的 `summary.global_throughput` 为准
 
 `7B`，参数：`num_seqs=128, in=[100,1024], out=[100,1024], max_num_batched_tokens=8192`
 
 1. `TP=1`（GPU6）：`2862.61 tok/s`
-2. `TP=2`（GPU5,6）：`3909.49 tok/s`（rank 平均）
-3. `TP=4`（GPU1,2,5,6）：`4997.47 tok/s`（rank 平均）
+2. `TP=2`（GPU5,6）：以 `scripts/bench_tp_novainfer.py` 输出的 `summary.global_throughput` 为准
+3. `TP=4`（GPU1,2,5,6）：以 `scripts/bench_tp_novainfer.py` 输出的 `summary.global_throughput` 为准
 
 阶段结论：
 

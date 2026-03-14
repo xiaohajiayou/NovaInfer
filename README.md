@@ -1,159 +1,5 @@
 # NovaInfer
 
-## Current Status
-
-Core/runtime:
-
-- `llaisysModelDecode` runs true batched decode (no per-token `infer(..., 1)` loop).
-- KV cache supports both `block` and `slot` layouts.
-- Prefix-sharing semantics are enabled in block layout via shared slot metadata.
-- NVIDIA paged attention backend is selectable via environment:
-  - `LLAISYS_CUDA_PAGED_ATTN_BACKEND=native`
-  - `LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn`
-
-Server/streaming:
-
-- OpenAI-compatible chat API supports non-stream and SSE stream.
-- Reasoning/content are parsed into separate fields (`reasoning`, `content`) in OpenAI responses.
-- Async stream race issues (late subscribe losing prefix tokens / terminal chunk before last token) have been fixed.
-
-Testing/CI:
-
-- Pytest supports axis filtering: `--device`, `--layout`, `--backend`.
-- Real-model parity covers CPU and NVIDIA paths; NVIDIA includes `native` and `cudnn`.
-- CI model is aligned to `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`.
-
-Known limits:
-
-- Sliding-window KV policy is not implemented yet.
-- Attention kernel path is functional-first; `cudnn` backend is still being optimized vs `native`/vLLM-class kernels.
-
-## System Architecture & Sequence
-
-### Layered Architecture
-
-```mermaid
-flowchart LR
-  subgraph Client
-    UI[Web UI]
-    CLI[curl / SDK]
-  end
-
-  subgraph Server["Python Server Layer"]
-    HTTP[HttpServer / OpenAIServer]
-    AENG[AsyncLLMEngine]
-  end
-
-  subgraph Engine["Python Engine Layer"]
-    ENG[LLMEngine]
-    SCH[RequestScheduler]
-    EXE[Executor]
-    WRK[Worker]
-    RUN[Model Runner<br/>python/llaisys/models/qwen2.py]
-  end
-
-  subgraph Core["C++ Core Layer"]
-    CAPI[llaisysModel* C API]
-    DEC[Qwen2Model::decode]
-    KV[KvCache + KvCells]
-    OPS[Workspace + Ops + OutputBuffer]
-  end
-
-  UI --> HTTP
-  CLI --> HTTP
-  HTTP --> AENG --> ENG
-  ENG --> SCH --> EXE --> WRK --> RUN --> CAPI --> DEC
-  DEC --> KV
-  DEC --> OPS
-```
-
-### Offline Sequence (`LLM.generate`)
-
-```mermaid
-sequenceDiagram
-  participant App as App / Script
-  participant LLM as llaisys.LLM
-  participant E as LLMEngine
-  participant S as Scheduler
-  participant X as Executor
-  participant W as Worker
-  participant R as Qwen2 Runner
-  participant C as C++ Core
-
-  App->>LLM: generate(inputs, sampling_params)
-  LLM->>E: submit request
-  loop each decode step
-    E->>S: build_plan()
-    S-->>E: BatchPlan
-    E->>X: execute(plan)
-    X->>W: run(plan)
-    W->>R: decode_batch(...)
-    R->>C: llaisysModelDecode(batch)
-    C-->>R: logits + output_ids
-    R-->>W: logits rows
-    W-->>X: logits rows
-    X-->>E: sampled token(s)
-  end
-  E-->>LLM: final output
-  LLM-->>App: token_ids / text / finish_reason
-```
-
-### Online Streaming Sequence (SSE)
-
-```mermaid
-sequenceDiagram
-  participant U as WebUI / Client
-  participant API as OpenAIServer
-  participant AE as AsyncLLMEngine
-  participant ENG as LLMEngine
-  participant WRK as Worker + Runner
-  participant CORE as C++ Core
-
-  U->>API: POST /v1/chat/completions (stream=true)
-  API->>AE: submit(request)
-  AE->>ENG: enqueue(request)
-
-  loop each decode step
-    ENG->>WRK: execute next plan
-    WRK->>CORE: llaisysModelDecode(batch)
-    CORE-->>WRK: logits
-    WRK-->>ENG: sampled token
-    ENG-->>AE: chunk(delta, token_id)
-    AE-->>API: stream chunk
-    API-->>U: SSE data: {...}
-  end
-
-  ENG-->>AE: finished
-  AE-->>API: final chunk + [DONE]
-  API-->>U: stream closed
-
-  opt cancel request
-    U->>API: POST /v1/requests/{id}/cancel
-    API->>AE: cancel(id)
-    AE->>ENG: mark request aborted
-  end
-```
-
-### Core Decode Internal Sequence
-
-```mermaid
-sequenceDiagram
-  participant D as Qwen2Model::decode
-  participant K as KvCache
-  participant O as Attention/MLP Ops
-  participant B as OutputBuffer
-
-  D->>K: prepare(ubatch)
-  D->>K: apply_ubatch(slot_info, ubatch)
-  D->>K: used_slots() + slot_visible_for()
-  D->>O: embedding -> blocks -> lm_head
-  O-->>D: logits tensor
-  D->>B: append rows by logits mask
-
-  alt exception
-    D->>K: rollback_ubatch(slot_info, ubatch)
-  end
-```
 
 ## Build
 
@@ -248,6 +94,44 @@ python scripts/bench_tp2_novainfer.py \
   --max-num-batched-tokens 16384
 ```
 
+TP=2 benchmark (built-in `mp` executor):
+
+```bash
+export CUDNN_HOME=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib:/home/xiaohajiayou/NovaInfer/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH:-}"
+export LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn
+
+python scripts/bench_tp_novainfer.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --tp-size 2 \
+  --cuda-visible-devices 5,6 \
+  --tensor-parallel-device-ids 0,1 \
+  --num-seqs 256 \
+  --min-input-len 100 --max-input-len 1024 \
+  --min-output-len 100 --max-output-len 1024 \
+  --max-model-len 4096 \
+  --max-num-seqs 256 \
+  --max-num-batched-tokens 16384
+```
+
+TP=2 HF parity (built-in `mp` executor):
+
+```bash
+export CUDNN_HOME=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib:/home/xiaohajiayou/NovaInfer/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH:-}"
+export LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn
+
+CUDA_VISIBLE_DEVICES=5,6 \
+python scripts/tp_hf_parity.py \
+  --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --tp-size 2 \
+  --tensor-parallel-device-ids 0,1 \
+  --max-new-tokens 8 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --max-num-batched-tokens 4096
+```
+
 ### 2. Install Python package
 
 ```bash
@@ -257,7 +141,13 @@ pip install -e ./python[test]
 `[test]` extra installs pytest and related deps.
 
 ## Run Inference Services
-
+```
+ssh -N \
+    -o ExitOnForwardFailure=yes \
+    -L 127.0.0.1:18082:127.0.0.1:8081 \
+    -L 127.0.0.1:18003:127.0.0.1:8675 \
+    aliyun-2222
+```
 ### 1. Start API server
 
 CPU backend:
@@ -292,7 +182,7 @@ PYTHONPATH=python python -m llaisys.server \
 NVIDIA backend (cuDNN paged attention):
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 \
+CUDA_VISIBLE_DEVICES=5 \
 LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
 PYTHONPATH=python python -m llaisys.server \
   --model-path /home/xiaohajiayou/NovaInfer/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
@@ -301,6 +191,27 @@ PYTHONPATH=python python -m llaisys.server \
   --kv-cache-memory-utilization 0.9 \
   --host 127.0.0.1 \
   --port 8000 \
+  --verbose
+```
+
+NVIDIA backend, TP server on one host (rank0 owns HTTP, internal `mp` executor spawns other ranks):
+
+```bash
+export CUDNN_HOME=/home/xiaohajiayou/opt/cudnn-linux-x86_64-9.18.1.3_cuda12-archive
+export LD_LIBRARY_PATH="$CUDNN_HOME/lib:/home/xiaohajiayou/NovaInfer/.venv/lib/python3.12/site-packages/nvidia/nccl/lib:${LD_LIBRARY_PATH:-}"
+
+CUDA_VISIBLE_DEVICES=5,6 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+PYTHONPATH=python python -m llaisys.server \
+  --model-path /home/xiaohajiayou/NovaInfer/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+  --model-type qwen2 \
+  --device nvidia \
+  --tensor-parallel-size 2 \
+  --distributed-executor-backend mp \
+  --tensor-parallel-device-ids 5,6 \
+  --kv-cache-memory-utilization 0.9 \
+  --host 127.0.0.1 \
+  --port 8675 \
   --verbose
 ```
 

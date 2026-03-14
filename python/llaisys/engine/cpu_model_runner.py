@@ -32,7 +32,7 @@ class CPUModelRunner(GPUModelRunner):
     def _build_block_tensors(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         attention_phase: int,
         input_ids: list[int],
         positions: list[int],
@@ -49,7 +49,7 @@ class CPUModelRunner(GPUModelRunner):
         cudnn_page_table: list[int] | None = None,
         cudnn_b_exec: int = 0,
         incremental_block_table_update: bool = False,
-    ) -> PreparedTensors:
+        ) -> PreparedTensors:
         del (
             attention_phase,
             cudnn_seq_lens_q,
@@ -59,14 +59,13 @@ class CPUModelRunner(GPUModelRunner):
             incremental_block_table_update,
         )
         ntoken = len(input_ids)
-        n_outputs = len(seqs)
         if ntoken > self._max_num_tokens:
             raise RuntimeError("ntoken exceeds configured max_num_batched_tokens")
         if n_outputs > self._max_num_reqs:
             raise RuntimeError("n_outputs exceeds configured max_num_seqs")
-        if len(cu_seqlens_q) != len(seqs) + 1:
+        if len(cu_seqlens_q) != int(n_outputs) + 1:
             raise RuntimeError("cu_seqlens_q size mismatch")
-        if len(cu_seqlens_k) != len(seqs) + 1:
+        if len(cu_seqlens_k) != int(n_outputs) + 1:
             raise RuntimeError("cu_seqlens_k size mismatch")
         if int(cu_seqlens_q[-1]) != int(ntoken):
             raise RuntimeError("cu_seqlens_q[-1] must equal ntoken")
@@ -75,7 +74,7 @@ class CPUModelRunner(GPUModelRunner):
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
 
-        n_block_elems = len(seqs) * block_table_width
+        n_block_elems = int(n_outputs) * block_table_width
         if n_block_elems > (self._max_num_reqs * self._max_block_table_width):
             raise RuntimeError("n_block_elems exceeds configured BLOCK metadata capacity")
 

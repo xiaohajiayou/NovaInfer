@@ -4,13 +4,13 @@ import argparse
 import json
 import os
 import traceback
-from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
 
 def _default_init_method(tag: str) -> str:
     tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
 
 
@@ -38,6 +38,39 @@ def _encode_prompts_for_llm(model_path: str, prompts: list[str]) -> list[list[in
         else:
             rows.append([int(v) for v in tokenizer.encode(prompt)])
     return rows
+
+
+def _render_token_piece(tokenizer: Any, token_id: int) -> str:
+    text = str(tokenizer.decode([int(token_id)], skip_special_tokens=False))
+    text = text.replace("\n", "\\n").replace("\t", "\\t")
+    if text == "":
+        text = "<empty>"
+    return text
+
+
+def _print_aligned_answers(tokenizer: Any, prompts: list[str], hf_rows: list[list[int]], tp_rows: list[list[int]]) -> None:
+    for i, prompt in enumerate(prompts):
+        hf_row = hf_rows[i] if i < len(hf_rows) else []
+        tp_row = tp_rows[i] if i < len(tp_rows) else []
+        ncols = max(len(hf_row), len(tp_row))
+        hf_cells = [_render_token_piece(tokenizer, tid) for tid in hf_row]
+        tp_cells = [_render_token_piece(tokenizer, tid) for tid in tp_row]
+        widths: list[int] = []
+        for idx in range(ncols):
+            hf_cell = hf_cells[idx] if idx < len(hf_cells) else "-"
+            tp_cell = tp_cells[idx] if idx < len(tp_cells) else "-"
+            widths.append(max(len(hf_cell), len(tp_cell), 1))
+
+        def format_row(label: str, cells: list[str]) -> str:
+            parts: list[str] = []
+            for idx, width in enumerate(widths):
+                cell = cells[idx] if idx < len(cells) else "-"
+                parts.append(cell.ljust(width))
+            return f"[tp_hf_parity] {label:<2} | " + " | ".join(parts)
+
+        print(f"[tp_hf_parity] prompt[{i}]={prompt}")
+        print(format_row("HF", hf_cells))
+        print(format_row("TP", tp_cells))
 
 
 def _hf_generate_tokens(model_path: str, prompt_token_ids: list[list[int]], max_new_tokens: int) -> list[list[int]]:
@@ -79,6 +112,7 @@ def _worker_generate(
     max_num_seqs: int,
     max_num_batched_tokens: int,
     device_ids: tuple[int, ...] | None,
+    distributed_executor_backend: str,
     out_json: str,
 ) -> int:
     try:
@@ -99,6 +133,7 @@ def _worker_generate(
             tp_local_rank=int(rank),
             distributed_backend="nccl",
             tensor_parallel_device_ids=device_ids,
+            distributed_executor_backend=str(distributed_executor_backend),
         )
         params = [
             SamplingParams(
@@ -128,11 +163,6 @@ def _worker_generate(
         print(f"[tp_hf_parity] rank={rank} failed: {exc}")
         traceback.print_exc()
         return 1
-
-
-def _worker_entry(*args: Any) -> None:
-    rc = int(_worker_generate(*args))
-    raise SystemExit(rc)
 
 
 def _first_diff(a: list[list[int]], b: list[list[int]]) -> str:
@@ -165,7 +195,15 @@ def main() -> int:
         default="",
         type=str,
     )
+    parser.add_argument(
+        "--distributed-executor-backend",
+        default="mp",
+        type=str,
+        help="TP parity now requires mp. This flag is kept only for CLI compatibility.",
+    )
     args = parser.parse_args()
+    if str(args.distributed_executor_backend).strip().lower() != "mp":
+        raise ValueError("tp_hf_parity.py only supports distributed_executor_backend=mp")
 
     tp_size = max(1, int(args.tp_size))
     prompts = [p.strip() for p in str(args.prompts).split(",") if p.strip()]
@@ -184,46 +222,35 @@ def main() -> int:
     hf_tokens = _hf_generate_tokens(str(args.model_path), prompt_token_ids, int(args.max_new_tokens))
     print(f"[tp_hf_parity] hf_generate done")
 
-    ctx = get_context("spawn")
+    rank_tokens: list[list[list[int]]] = []
     tmp_dir = Path(os.environ.get("TMPDIR", "/tmp")) / f"tp_hf_parity_{os.getpid()}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    procs = []
-    out_jsons: list[Path] = []
-    for rank in range(tp_size):
-        out_json = tmp_dir / f"rank{rank}.json"
-        p = ctx.Process(
-            target=_worker_entry,
-            args=(
-                int(rank),
-                int(tp_size),
-                str(args.model_path),
-                prompt_token_ids,
-                int(args.max_new_tokens),
-                int(args.max_model_len),
-                int(args.max_num_seqs),
-                int(args.max_num_batched_tokens),
-                device_ids_opt,
-                str(out_json),
-            ),
-        )
-        p.start()
-        procs.append(p)
-        out_jsons.append(out_json)
-
-    exitcodes: list[int] = []
-    for p in procs:
-        p.join()
-        exitcodes.append(int(p.exitcode))
-    print(f"[tp_hf_parity] exitcodes={exitcodes}")
-    if any(c != 0 for c in exitcodes):
+    out_json = tmp_dir / "rank0.json"
+    rc = _worker_generate(
+        0,
+        int(tp_size),
+        str(args.model_path),
+        prompt_token_ids,
+        int(args.max_new_tokens),
+        int(args.max_model_len),
+        int(args.max_num_seqs),
+        int(args.max_num_batched_tokens),
+        device_ids_opt,
+        "mp",
+        str(out_json),
+    )
+    print(f"[tp_hf_parity] exitcodes={[int(rc)]}")
+    if rc != 0:
         return 1
-
-    rank_tokens: list[list[list[int]]] = []
-    for p in out_jsons:
-        obj = json.loads(p.read_text(encoding="utf-8"))
-        rank_tokens.append([[int(v) for v in row] for row in obj["tokens"]])
+    obj = json.loads(out_json.read_text(encoding="utf-8"))
+    rank_tokens.append([[int(v) for v in row] for row in obj["tokens"]])
 
     base = rank_tokens[0]
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(args.model_path), trust_remote_code=True)
+    _print_aligned_answers(tokenizer, prompts, hf_tokens, base)
+
     for rank in range(1, len(rank_tokens)):
         if rank_tokens[rank] != base:
             print(f"[tp_hf_parity] mismatch between rank0 and rank{rank}: {_first_diff(base, rank_tokens[rank])}")

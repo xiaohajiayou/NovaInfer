@@ -72,9 +72,40 @@ CUDA_VISIBLE_DEVICES=5 \
     --max-num-batched-tokens 16384
 
 
-CUDA_VISIBLE_DEVICES=4 \
+CUDA_VISIBLE_DEVICES=5 \
    python scripts/bench_compare_vllm.py\
     --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --backend vllm \
+    --num-seqs 256 \
+    --min-input-len 100 \
+    --max-input-len 1024 \
+    --min-output-len 100 \
+    --max-output-len 1024 \
+    --max-model-len 4096 \
+    --seed 0 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 16384 \
+    --vllm-fair-mode
+
+
+CUDA_VISIBLE_DEVICES=5 \
+  LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
+   python scripts/bench_compare_vllm.py\
+    --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
+    --backend novainfer \
+    --num-seqs 256 \
+    --min-input-len 100 \
+    --max-input-len 1024 \
+    --min-output-len 100 \
+    --max-output-len 1024 \
+    --max-model-len 4096 \
+    --seed 0 \
+    --max-num-seqs 256 \
+    --max-num-batched-tokens 16384
+
+CUDA_VISIBLE_DEVICES=5 \
+   python scripts/bench_compare_vllm.py\
+    --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
     --backend vllm \
     --num-seqs 256 \
     --min-input-len 100 \

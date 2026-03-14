@@ -328,6 +328,7 @@ def create_parallel_context(
     tensor_parallel_device_ids: tuple[int, ...] | None = None,
     tp_rank: int = 0,
     tp_local_rank: int = 0,
+    tp_init_method: str | None = None,
 ):
     tp_size = max(1, int(tensor_parallel_size))
     rank = max(0, int(tp_rank))
@@ -336,7 +337,7 @@ def create_parallel_context(
         raise RuntimeError(f"tp_rank out of range: rank={rank} tp_size={tp_size}")
 
     dist_backend = str(distributed_backend or "nccl").strip().lower()
-    init_method = str(os.getenv("LLAISYS_TP_INIT_METHOD", "")).strip()
+    init_method = str(tp_init_method or "").strip() or str(os.getenv("LLAISYS_TP_INIT_METHOD", "")).strip()
     if tp_size > 1 and not init_method:
         init_method = "file:///tmp/llaisys_tp_nccl.id"
 

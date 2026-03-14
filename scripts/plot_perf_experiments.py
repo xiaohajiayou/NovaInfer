@@ -10,6 +10,10 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+def _display_backend_name(backend: str) -> str:
+    return "ours" if backend == "novainfer" else backend
+
+
 def _load_rows(path: Path) -> list[dict]:
     rows: list[dict] = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -36,7 +40,7 @@ def _mean(vals: list[float]) -> float:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Plot NovaInfer-vs-vLLM perf experiment results.")
+    parser = argparse.ArgumentParser(description="Plot ours-vs-vLLM perf experiment results.")
     parser.add_argument("--input-jsonl", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("perf_plots"))
     args = parser.parse_args()
@@ -86,7 +90,7 @@ def main() -> int:
             highs.append(max(0.0, max(vals) - m))
         offset = (-0.5 + bi) * width
         xs = [xx + offset for xx in x]
-        ax.bar(xs, means, width=width, label=backend)
+        ax.bar(xs, means, width=width, label=_display_backend_name(backend))
         ax.errorbar(xs, means, yerr=[lows, highs], fmt="none", capsize=4, linewidth=1)
 
     ax.set_xticks(x)
@@ -117,7 +121,7 @@ def main() -> int:
     ax.axhline(1.0, color="red", linestyle="--", linewidth=1)
     ax.set_xticks(positions)
     ax.set_xticklabels(cases)
-    ax.set_ylabel("Speedup (NovaInfer / vLLM)")
+    ax.set_ylabel("Speedup (ours / vLLM)")
     ax.set_title("Speedup distribution by case")
     ax.grid(axis="y", linestyle="--", alpha=0.35)
     fig.tight_layout()
@@ -132,7 +136,7 @@ def main() -> int:
         med_run = [_median(by_case_backend_time.get((c, backend), [])) for c in cases]
         offset = (-0.5 + bi) * width
         xs = [xx + offset for xx in x]
-        ax.bar(xs, med_run, width=width, label=f"{backend} run_seconds")
+        ax.bar(xs, med_run, width=width, label=f"{_display_backend_name(backend)} run_seconds")
     ax.set_xticks(x)
     ax.set_xticklabels(cases)
     ax.set_ylabel("Run seconds (median)")
@@ -149,7 +153,7 @@ def main() -> int:
         n = _median(by_case_backend.get((c, "novainfer"), []))
         v = _median(by_case_backend.get((c, "vllm"), []))
         ratio = (n / v) if v > 0 else math.nan
-        print(f"  case={c:>5s} novainfer={n:8.2f} vllm={v:8.2f} ratio={ratio:6.3f}x")
+        print(f"  case={c:>5s} ours={n:8.2f} vllm={v:8.2f} ratio={ratio:6.3f}x")
     print(f"[plot] wrote png files to {args.out_dir}")
     return 0
 

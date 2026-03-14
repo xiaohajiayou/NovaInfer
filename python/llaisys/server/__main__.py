@@ -20,6 +20,13 @@ def _parse_device(name: str) -> DeviceType:
     raise ValueError(f"unsupported device: {name}")
 
 
+def _parse_device_ids(raw: str) -> tuple[int, ...] | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    return tuple(int(v.strip()) for v in text.split(",") if v.strip())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run NovaInfer HTTP server")
     parser.add_argument("--model-path", required=True, help="Local model path")
@@ -37,10 +44,19 @@ def main() -> int:
     )
     parser.add_argument("--max-num-seqs", default=8, type=int)
     parser.add_argument("--max-num-batched-tokens", default=0, type=int)
+    parser.add_argument("--tensor-parallel-size", default=1, type=int)
+    parser.add_argument("--tensor-parallel-device-ids", default="", type=str)
+    parser.add_argument("--distributed-executor-backend", default="uni", choices=["uni", "mp"])
+    parser.add_argument("--tp-init-method", default="", type=str)
     parser.add_argument("--verbose", action="store_true", help="Print HTTP request logs")
     args = parser.parse_args()
 
     max_num_batched_tokens = int(args.max_num_batched_tokens) if int(args.max_num_batched_tokens) > 0 else None
+
+    tp_size = max(1, int(args.tensor_parallel_size))
+    dist_backend = str(args.distributed_executor_backend or "uni").strip().lower()
+    if tp_size > 1 and dist_backend != "mp":
+        raise ValueError("server TP requires --distributed-executor-backend mp")
 
     cfg = EngineConfig(
         model_type=args.model_type,
@@ -51,6 +67,10 @@ def main() -> int:
         max_num_seqs=max(1, int(args.max_num_seqs)),
         max_num_batched_tokens=max_num_batched_tokens,
         kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
+        tensor_parallel_size=tp_size,
+        tensor_parallel_device_ids=_parse_device_ids(args.tensor_parallel_device_ids),
+        distributed_executor_backend=dist_backend,
+        tp_init_method=(str(args.tp_init_method).strip() or None),
     )
     async_engine = AsyncLLMEngine(config=cfg)
     openai_server = OpenAIServer(async_engine)
@@ -73,7 +93,10 @@ def main() -> int:
         f"max_model_len={int(args.max_model_len)} "
         f"kv_cache_memory_utilization={float(args.kv_cache_memory_utilization):.2f} "
         f"max_num_seqs={max(1, int(args.max_num_seqs))} "
-        f"max_num_batched_tokens={max_num_batched_tokens if max_num_batched_tokens is not None else 'auto'}"
+        f"max_num_batched_tokens={max_num_batched_tokens if max_num_batched_tokens is not None else 'auto'} "
+        f"distributed_executor_backend={dist_backend} "
+        f"tensor_parallel_size={tp_size} "
+        f"tensor_parallel_device_ids={list(cfg.tensor_parallel_device_ids or ())}"
     )
     print("Press Ctrl+C to stop.")
 

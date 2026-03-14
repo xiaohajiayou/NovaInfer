@@ -9,6 +9,7 @@ from pathlib import Path
 
 def _default_init_method(tag: str) -> str:
     tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
 
 

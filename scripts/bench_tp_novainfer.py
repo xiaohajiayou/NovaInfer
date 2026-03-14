@@ -10,6 +10,7 @@ from pathlib import Path
 
 def _default_init_method(tag: str) -> str:
     tmp_dir = Path(os.environ.get("TMPDIR", "/tmp"))
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     return f"file://{(tmp_dir / f'llaisys_{tag}_{os.getpid()}.id').resolve()}"
 
 
@@ -40,7 +41,7 @@ def _summarize_paths(raw: str, limit: int = 4) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run NovaInfer TP bench in N processes.")
+    parser = argparse.ArgumentParser(description="Run NovaInfer TP bench via built-in mp executor.")
     parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument("--tp-size", default=2, type=int)
     parser.add_argument("--num-seqs", default=256, type=int)
@@ -71,7 +72,21 @@ def main() -> int:
         type=str,
         help="TP init method shared by all ranks.",
     )
+    parser.add_argument(
+        "--result-json",
+        default="",
+        type=str,
+        help="Optional path to write structured summary JSON.",
+    )
+    parser.add_argument(
+        "--distributed-executor-backend",
+        default="mp",
+        type=str,
+        help="TP bench now requires mp. This flag is kept only for CLI compatibility.",
+    )
     args = parser.parse_args()
+    if str(args.distributed_executor_backend).strip().lower() != "mp":
+        raise ValueError("bench_tp_novainfer.py only supports distributed_executor_backend=mp")
 
     tp_size = max(1, int(args.tp_size))
     py = Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
@@ -110,6 +125,8 @@ def main() -> int:
         str(tp_size),
         "--tensor-parallel-device-ids",
         str(args.tensor_parallel_device_ids),
+        "--distributed-executor-backend",
+        str(args.distributed_executor_backend),
     ]
 
     init_method = str(args.init_method).strip() or _default_init_method(f"tp{tp_size}_nccl_bench")
@@ -127,52 +144,27 @@ def main() -> int:
     )
 
     root = Path(tempfile.mkdtemp(prefix=f"tp{tp_size}_bench_"))
-    procs: list[subprocess.Popen] = []
-    logs: list[Path] = []
-    jsons: list[Path] = []
-    for rank in range(tp_size):
-        r_log = root / f"rank{rank}.log"
-        r_json = root / f"rank{rank}.json"
-        cmd = common + [
-            "--tp-rank",
-            str(rank),
-            "--tp-local-rank",
-            str(rank),
-            "--result-json",
-            str(r_json),
-        ]
-        fh = r_log.open("w", encoding="utf-8")
-        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env)
-        proc._llaisys_log_fh = fh  # type: ignore[attr-defined]
-        procs.append(proc)
-        logs.append(r_log)
-        jsons.append(r_json)
-
-    rcs: list[int] = []
-    for proc in procs:
-        rc = int(proc.wait())
-        rcs.append(rc)
-        try:
-            proc._llaisys_log_fh.close()  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
-    print(f"[tp_bench] tp_size={tp_size} rcs={rcs} log_dir={root}")
-    if any(rc != 0 for rc in rcs):
-        for rank, r_log in enumerate(logs):
-            print(f"[tp_bench] rank={rank} tail:")
-            print(_tail(r_log))
-        return 1
-
     rows: list[dict] = []
-    for rank, r_json in enumerate(jsons):
-        try:
-            row = json.loads(r_json.read_text(encoding="utf-8"))
-            rows.append(row)
-        except Exception:
-            print(f"[tp_bench] rank={rank} failed to parse result json")
-            print(_tail(logs[rank]))
-            return 1
+    run_log = root / "mp.log"
+    run_json = root / "mp.json"
+    cmd = common + [
+        "--result-json",
+        str(run_json),
+    ]
+    with run_log.open("w", encoding="utf-8") as fh:
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, env=env)
+        rc = int(proc.wait())
+    print(f"[tp_bench] tp_size={tp_size} backend=mp rcs={[rc]} log_dir={root}")
+    if rc != 0:
+        print("[tp_bench] rank=0 tail:")
+        print(_tail(run_log))
+        return 1
+    try:
+        rows.append(json.loads(run_json.read_text(encoding="utf-8")))
+    except Exception:
+        print("[tp_bench] failed to parse result json")
+        print(_tail(run_log))
+        return 1
 
     tputs = [float(r.get("actual_tokens_per_sec", 0.0)) for r in rows]
     run_secs = [float(r.get("run_seconds", r.get("seconds", 0.0))) for r in rows]
@@ -186,16 +178,31 @@ def main() -> int:
             f"rank={rank} throughput_actual={float(row.get('actual_tokens_per_sec', 0.0)):.4f} tok/s "
             f"run_seconds={float(row.get('run_seconds', row.get('seconds', 0.0))):.4f}"
         )
+    summary = {
+        "tp_size": tp_size,
+        "global_tokens": int(global_tokens),
+        "global_run_seconds": float(global_run_seconds),
+        "global_throughput": float(global_throughput),
+        "throughput_actual_avg": float(sum(tputs) / max(1, len(tputs))),
+        "throughput_actual_min": float(min(tputs)),
+        "throughput_actual_max": float(max(tputs)),
+        "run_seconds_avg": float(sum(run_secs) / max(1, len(run_secs))),
+        "rows": rows,
+        "cuda_visible_devices": env.get("CUDA_VISIBLE_DEVICES", ""),
+        "backend": env.get("LLAISYS_CUDA_PAGED_ATTN_BACKEND", ""),
+    }
     print(
         "[tp_bench] summary "
-        f"global_tokens={global_tokens} "
-        f"global_run_seconds={global_run_seconds:.4f} "
-        f"global_throughput={global_throughput:.4f} "
-        f"throughput_actual_avg={sum(tputs)/max(1, len(tputs)):.4f} "
-        f"throughput_actual_min={min(tputs):.4f} "
-        f"throughput_actual_max={max(tputs):.4f} "
-        f"run_seconds_avg={sum(run_secs)/max(1, len(run_secs)):.4f}"
+        f"global_tokens={summary['global_tokens']} "
+        f"global_run_seconds={summary['global_run_seconds']:.4f} "
+        f"global_throughput={summary['global_throughput']:.4f} "
+        f"throughput_actual_avg={summary['throughput_actual_avg']:.4f} "
+        f"throughput_actual_min={summary['throughput_actual_min']:.4f} "
+        f"throughput_actual_max={summary['throughput_actual_max']:.4f} "
+        f"run_seconds_avg={summary['run_seconds_avg']:.4f}"
     )
+    if args.result_json:
+        Path(args.result_json).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
 

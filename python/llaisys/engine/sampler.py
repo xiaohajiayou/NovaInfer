@@ -20,18 +20,20 @@ class Sampler:
         device: DeviceType,
         max_num_seqs: int | None = None,
         config: EngineConfig | None = None,
+        device_id: int = 0,
     ):
         cfg = config or EngineConfig(
             device=device,
             max_num_seqs=(max(1, int(max_num_seqs)) if max_num_seqs is not None else 8),
         )
         self._device = cfg.device
+        self._device_id = int(device_id)
         self._max_num_seqs = max(1, int(cfg.max_num_seqs))
-        self._temperatures = Tensor((self._max_num_seqs,), DataType.F32, self._device, 0)
-        self._top_ps = Tensor((self._max_num_seqs,), DataType.F32, self._device, 0)
-        self._top_ks = Tensor((self._max_num_seqs,), DataType.I32, self._device, 0)
-        self._seeds = Tensor((self._max_num_seqs,), DataType.I64, self._device, 0)
-        self._has_seeds = Tensor((self._max_num_seqs,), DataType.I32, self._device, 0)
+        self._temperatures = Tensor((self._max_num_seqs,), DataType.F32, self._device, self._device_id)
+        self._top_ps = Tensor((self._max_num_seqs,), DataType.F32, self._device, self._device_id)
+        self._top_ks = Tensor((self._max_num_seqs,), DataType.I32, self._device, self._device_id)
+        self._seeds = Tensor((self._max_num_seqs,), DataType.I64, self._device, self._device_id)
+        self._has_seeds = Tensor((self._max_num_seqs,), DataType.I32, self._device, self._device_id)
 
     @staticmethod
     def _is_greedy_row(

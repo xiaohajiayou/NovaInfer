@@ -87,6 +87,7 @@ def _run_one_backend(
     seed: int,
     max_model_len: int,
     env: dict[str, str],
+    vllm_gpu_memory_utilization: float,
 ) -> tuple[dict, str]:
     script = root / "scripts" / "bench_compare_vllm.py"
     with tempfile.NamedTemporaryFile(prefix=f"perf_{backend}_{case.name}_", suffix=".json", delete=False) as tf:
@@ -121,6 +122,8 @@ def _run_one_backend(
         "--result-json",
         str(result_json),
     ]
+    if backend == "vllm":
+        cmd.extend(["--vllm-gpu-memory-utilization", str(vllm_gpu_memory_utilization)])
     if case.vllm_fair_mode:
         cmd.append("--vllm-fair-mode")
 
@@ -174,6 +177,7 @@ def main() -> int:
         choices=["cudnn", "native"],
         help="LLAISYS_CUDA_PAGED_ATTN_BACKEND value for NovaInfer runs",
     )
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -198,6 +202,7 @@ def main() -> int:
                     seed=seed,
                     max_model_len=int(args.max_model_len),
                     env=env,
+                    vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
                 )
                 rec = {
                     "ts": int(time.time()),
@@ -206,6 +211,7 @@ def main() -> int:
                     "seed": seed,
                     "backend": backend,
                     "llaisys_paged_attn_backend": args.cudnn_backend,
+                    "vllm_gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
                     "run_config": asdict(case),
                     "result": row,
                 }

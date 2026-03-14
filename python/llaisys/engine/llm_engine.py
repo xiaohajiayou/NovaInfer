@@ -6,6 +6,7 @@ from typing import Dict, Sequence
 from ..utils.nvtx import nvtx_range
 from .config import EngineConfig
 from .executor import Executor
+from .mp_executor import MPExecutor
 from .model_registry import ModelRegistry
 from .sequence import Sequence as EngineSequence
 from .scheduler import RequestScheduler
@@ -70,20 +71,36 @@ class LLMEngine:
             raise TypeError(f"LLMEngine got unexpected keyword argument(s): {names}")
         cfg = config or EngineConfig(**config_kwargs)
         self._config = cfg
-
-        self._worker = Worker(
-            config=cfg,
-            model_registry=model_registry,
-        )
+        backend = str(getattr(cfg, "distributed_executor_backend", "uni") or "uni").strip().lower()
+        if int(getattr(cfg, "tensor_parallel_size", 1)) > 1 and backend != "mp":
+            raise ValueError("tensor_parallel_size > 1 requires distributed_executor_backend='mp'")
+        if backend == "mp":
+            self._executor = MPExecutor(cfg, model_registry=model_registry)
+        elif backend == "uni":
+            self._executor = Executor(
+                Worker(
+                    config=cfg,
+                    model_registry=model_registry,
+                )
+            )
+        else:
+            raise NotImplementedError(f"unsupported distributed_executor_backend: {backend}")
+        self._worker = self._executor.worker
+        worker_cfg = getattr(self._worker, "_config", None)
+        if worker_cfg is not None:
+            if getattr(worker_cfg, "max_model_len", None) is not None:
+                cfg.max_model_len = int(worker_cfg.max_model_len)
+            if getattr(worker_cfg, "end_token_id", None) is not None:
+                cfg.end_token_id = int(worker_cfg.end_token_id)
+            if getattr(worker_cfg, "num_kvcache_blocks", None) is not None:
+                cfg.num_kvcache_blocks = int(worker_cfg.num_kvcache_blocks)
         self._prefix_cache_enabled = bool(cfg.enable_prefix_caching)
         # Runtime-derived capacity/length are synced into cfg during model runner init.
         cfg.enable_prefix_caching = bool(self._prefix_cache_enabled)
         if cfg.end_token_id is None:
             raise ValueError("end_token_id is required")
         self._end_token_id = int(cfg.end_token_id)
-
         self._scheduler = RequestScheduler(cfg)
-        self._executor = Executor(self._worker)
 
         self._requests: Dict[str, RequestState] = {}
         self._seq_by_id: Dict[int, EngineSequence] = {}
@@ -96,9 +113,9 @@ class LLMEngine:
         self._runtime_peak_used_tokens_observed = 0
 
     def close(self) -> None:
-        worker = getattr(self, "_worker", None)
-        if worker is not None:
-            close_fn = getattr(worker, "close", None)
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            close_fn = getattr(executor, "close", None)
             if callable(close_fn):
                 close_fn()
 
@@ -154,14 +171,10 @@ class LLMEngine:
 
     def reset_prefix_cache(self) -> int:
         self._scheduler.block_manager.reset_prefix_cache()
-        runner = self._worker.model_runner
-        reset_fn = getattr(runner, "kv_reset_prefix_cache", None)
+        reset_fn = getattr(self._executor, "reset_prefix_cache", None)
         if callable(reset_fn):
-            try:
-                return int(reset_fn())
-            except Exception:
-                return 5
-        return 0
+            return int(reset_fn())
+        return 5
 
     def submit(self, inputs: Sequence[int], sampling_params: SamplingParams) -> str:
         req = self._create_request([int(t) for t in inputs])
@@ -431,7 +444,7 @@ class LLMEngine:
         )
         self._finished_outputs[request_id] = output
         self._scheduler.finish(seq_id)
-        self._worker.free_request(seq.seq_id)
+        self._executor.free_request(seq.seq_id)
         self._seq_by_id.pop(seq_id, None)
         self._request_id_by_seq_id.pop(seq_id, None)
         self._seq_id_by_request.pop(request_id, None)

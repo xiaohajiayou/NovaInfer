@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
+from .batch_plan import BatchPlan
 from .buffers import CpuGpuBuffer
 from .config import EngineConfig
 from .model_registry import ModelRegistry, create_default_registry
@@ -139,7 +140,7 @@ class GPUModelRunner:
         self._kv_state = None
         self.allocate_kv_state()
         self.allocate_parallel_context()
-        self.sampler = Sampler(self._device, config=self._config)
+        self.sampler = Sampler(self._device, config=self._config, device_id=int(self._local_device_id))
 
         self._runtime_api = RuntimeAPI(DeviceType.NVIDIA) if self._device == DeviceType.NVIDIA else None
         self._compute_streams: dict[int, object] = {}
@@ -231,6 +232,7 @@ class GPUModelRunner:
             tensor_parallel_device_ids=getattr(self._config, "tensor_parallel_device_ids", None),
             tp_rank=int(getattr(self._config, "tp_rank", 0)),
             tp_local_rank=int(getattr(self._config, "tp_local_rank", 0)),
+            tp_init_method=getattr(self._config, "tp_init_method", None),
         )
         if parallel_context is None:
             raise RuntimeError("parallel-context allocation failed")
@@ -274,11 +276,18 @@ class GPUModelRunner:
     ):
         with nvtx_range("py/runner/execute_model"):
             self._execute_model_state = None
-            seqs = scheduler_outputs.scheduled_seqs
-            if not seqs:
+            batch_plan = self.build_batch_plan(scheduler_outputs)
+            if batch_plan is None:
+                return None
+            return self.execute_model_plan(batch_plan)
+
+    def execute_model_plan(self, batch_plan: BatchPlan | None):
+        with nvtx_range("py/runner/execute_model_plan"):
+            self._execute_model_state = None
+            if batch_plan is None or int(batch_plan.n_outputs) <= 0:
                 return None
             with nvtx_range("py/runner/execute_model/prepare_inputs"):
-                prepared = self.prepare_prefill(seqs) if bool(scheduler_outputs.is_prefill) else self.prepare_decode(seqs)
+                prepared = self._prepare_from_batch_plan(batch_plan)
             if prepared is None:
                 return None
 
@@ -336,7 +345,11 @@ class GPUModelRunner:
                 if int(logits_shape[0]) != int(prepared.n_outputs):
                     raise RuntimeError("modelForward logits row count mismatch with logits_indices")
 
-                temperatures, top_ps, top_ks, seeds, has_seeds = self.prepare_sample(seqs)
+                temperatures = list(batch_plan.temperatures)
+                top_ps = list(batch_plan.top_ps)
+                top_ks = list(batch_plan.top_ks)
+                seeds = list(batch_plan.seeds)
+                has_seeds = list(batch_plan.has_seeds)
                 if len(temperatures) != int(prepared.n_outputs):
                     raise RuntimeError("sampling params count mismatch with logits rows")
                 self._execute_model_state = (
@@ -606,13 +619,12 @@ class GPUModelRunner:
     def _build_common_io_tensors(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
     ) -> tuple[CommonPreparedTensors, object]:
         ntoken = int(len(input_ids))
-        n_outputs = int(len(seqs))
         if ntoken > self._max_num_tokens:
             raise RuntimeError("ntoken exceeds configured max_num_batched_tokens")
         if n_outputs > self._max_num_reqs:
@@ -662,13 +674,13 @@ class GPUModelRunner:
     def _build_block_common_tensors(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         input_ids: list[int],
         positions: list[int],
         scheduled_token_counts: list[int],
     ) -> tuple[CommonPreparedTensors, object]:
         return self._build_common_io_tensors(
-            seqs=seqs,
+            n_outputs=n_outputs,
             input_ids=input_ids,
             positions=positions,
             scheduled_token_counts=scheduled_token_counts,
@@ -677,13 +689,12 @@ class GPUModelRunner:
     def _stage_block_tables_tensor(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         block_table_rows: np.ndarray,
         block_table_width: int,
         h2d_stream,
         incremental_update: bool = False,
     ) -> BlockTablesTensor:
-        n_outputs = int(len(seqs))
         if block_table_width <= 0:
             raise RuntimeError("invalid block_table_width")
         n_block_elems = int(n_outputs) * int(block_table_width)
@@ -744,7 +755,7 @@ class GPUModelRunner:
     def _build_block_native_meta(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         ntoken: int,
         block_tables: Tensor,
         cu_seqlens_q: list[int],
@@ -755,9 +766,9 @@ class GPUModelRunner:
         block_table_width: int,
         h2d_stream,
     ) -> NativeBlockMeta:
-        if len(cu_seqlens_q) != len(seqs) + 1:
+        if len(cu_seqlens_q) != int(n_outputs) + 1:
             raise RuntimeError("cu_seqlens_q size mismatch")
-        if len(cu_seqlens_k) != len(seqs) + 1:
+        if len(cu_seqlens_k) != int(n_outputs) + 1:
             raise RuntimeError("cu_seqlens_k size mismatch")
         if int(cu_seqlens_q[-1]) != int(ntoken):
             raise RuntimeError("cu_seqlens_q[-1] must equal ntoken")
@@ -899,7 +910,7 @@ class GPUModelRunner:
     def _build_block_tensors(
         self,
         *,
-        seqs: list,
+        n_outputs: int,
         attention_phase: int,
         input_ids: list[int],
         positions: list[int],
@@ -916,14 +927,14 @@ class GPUModelRunner:
         with nvtx_range("py/runner/prepare_inputs/block/build"):
             # Stage input/position/logits copies first so DMA can overlap with metadata construction.
             common, h2d_stream = self._build_block_common_tensors(
-                seqs=seqs,
+                n_outputs=int(n_outputs),
                 input_ids=input_ids,
                 positions=positions,
                 scheduled_token_counts=scheduled_token_counts,
             )
             # Stage block table upload early for the same reason.
             block_tables = self._stage_block_tables_tensor(
-                seqs=seqs,
+                n_outputs=int(n_outputs),
                 block_table_rows=block_table_rows,
                 block_table_width=int(block_table_width),
                 h2d_stream=h2d_stream,
@@ -964,7 +975,7 @@ class GPUModelRunner:
             else:
                 with nvtx_range("py/runner/prepare_inputs/block/native_meta"):
                     native_meta = self._build_block_native_meta(
-                        seqs=seqs,
+                        n_outputs=int(n_outputs),
                         ntoken=int(common.input_ids.shape()[0]),
                         block_tables=block_tables.block_tables,
                         cu_seqlens_q=cu_seqlens_q,
@@ -1073,7 +1084,7 @@ class GPUModelRunner:
                 ),
             )
             prepared = self._build_block_tensors(
-                seqs=seqs,
+                n_outputs=nseq,
                 attention_phase=int(AttentionPhase.PREFILL),
                 input_ids=input_ids,
                 positions=positions,
@@ -1131,7 +1142,7 @@ class GPUModelRunner:
                 ),
             )
             prepared = self._build_block_tensors(
-                seqs=seqs,
+                n_outputs=nseq,
                 attention_phase=int(AttentionPhase.DECODE),
                 input_ids=input_ids,
                 positions=positions,
@@ -1147,6 +1158,188 @@ class GPUModelRunner:
             )
             prepared.phase = int(AttentionPhase.DECODE)
             return prepared
+
+    def _prepare_from_batch_plan(self, batch_plan: BatchPlan) -> PreparedTensors:
+        prepared = self._build_block_tensors(
+            n_outputs=int(batch_plan.n_outputs),
+            attention_phase=(
+                int(AttentionPhase.PREFILL)
+                if bool(batch_plan.is_prefill)
+                else int(AttentionPhase.DECODE)
+            ),
+            input_ids=batch_plan.input_ids,
+            positions=batch_plan.positions,
+            scheduled_token_counts=batch_plan.scheduled_token_counts,
+            cu_seqlens_q=batch_plan.cu_seqlens_q,
+            cu_seqlens_k=batch_plan.cu_seqlens_k,
+            max_seqlen_q=int(batch_plan.max_seqlen_q),
+            max_seqlen_k=int(batch_plan.max_seqlen_k),
+            slot_mapping=batch_plan.slot_mapping,
+            block_table_rows=batch_plan.block_table_rows,
+            block_table_width=int(batch_plan.block_table_width),
+            incremental_block_table_update=bool(batch_plan.incremental_block_table_update),
+        )
+        prepared.phase = (
+            int(AttentionPhase.PREFILL)
+            if bool(batch_plan.is_prefill)
+            else int(AttentionPhase.DECODE)
+        )
+        return prepared
+
+    def build_batch_plan(self, scheduler_outputs: SchedulerOutputs) -> BatchPlan | None:
+        seqs = scheduler_outputs.scheduled_seqs
+        if not seqs:
+            return None
+        if bool(scheduler_outputs.is_prefill):
+            nseq = len(seqs)
+            starts = np.empty((nseq,), dtype=np.int64)
+            ends = np.empty((nseq,), dtype=np.int64)
+            seqlens = np.empty((nseq,), dtype=np.int64)
+            for i, seq in enumerate(seqs):
+                start = max(0, int(seq.num_cached_tokens))
+                end = int(len(seq))
+                if end <= start:
+                    raise RuntimeError("scheduler invariant violated: prefill sequence has zero scheduled tokens")
+                starts[i] = int(start)
+                ends[i] = int(end)
+                seqlens[i] = int(end)
+
+            scheduled_token_counts = (ends - starts).astype(np.int64, copy=False)
+            ntoken = int(scheduled_token_counts.sum(dtype=np.int64))
+            input_ids = np.empty((ntoken,), dtype=np.int64)
+            positions = np.empty((ntoken,), dtype=np.int64)
+            offsets = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int64),
+                    np.cumsum(scheduled_token_counts, dtype=np.int64),
+                )
+            )
+            for i, seq in enumerate(seqs):
+                row_start = int(offsets[i])
+                row_end = int(offsets[i + 1])
+                tok_start = int(starts[i])
+                tok_end = int(ends[i])
+                input_ids[row_start:row_end] = np.asarray(seq.prompt_token_ids[tok_start:tok_end], dtype=np.int64)
+                positions[row_start:row_end] = np.arange(tok_start, tok_end, dtype=np.int64)
+            if len(input_ids) <= 0:
+                return None
+
+            seqlen_q = scheduled_token_counts.astype(np.int32, copy=False)
+            seqlen_k = seqlens.astype(np.int32, copy=False)
+            cu_seqlens_q = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int32),
+                    np.cumsum(seqlen_q, dtype=np.int32),
+                )
+            )
+            cu_seqlens_k = np.concatenate(
+                (
+                    np.zeros((1,), dtype=np.int32),
+                    np.cumsum(seqlen_k, dtype=np.int32),
+                )
+            )
+            max_seqlen_q = int(seqlen_q.max())
+            max_seqlen_k = int(seqlen_k.max())
+            slot_mapping = np.empty((ntoken,), dtype=np.int32)
+            slot_off = 0
+            for seq in seqs:
+                if not seq.block_table:
+                    raise ValueError("BLOCK layout requires non-empty block_table for every scheduled sequence")
+                for i in range(int(seq.num_cached_blocks), int(seq.num_blocks)):
+                    start = int(seq.block_table[i]) * int(self._config.kv_cache_block_size)
+                    if i != int(seq.num_blocks) - 1:
+                        end = start + int(self._config.kv_cache_block_size)
+                    else:
+                        end = start + int(seq.last_block_num_tokens)
+                    n = int(end - start)
+                    slot_mapping[slot_off: slot_off + n] = np.arange(start, end, dtype=np.int32)
+                    slot_off += n
+            if int(cu_seqlens_q[-1]) != int(ntoken):
+                raise ValueError("sum(seqlen_q) must equal ntoken")
+            if int(slot_off) != int(ntoken):
+                raise ValueError("slot_mapping length must equal ntoken")
+
+            block_table_rows, block_table_width = self._build_packed_block_table_rows(
+                seqs,
+                target_width=(
+                    int(self._max_block_table_width) if self._use_cudnn_block_builder() else None
+                ),
+            )
+            temperatures, top_ps, top_ks, seeds, has_seeds = self.prepare_sample(seqs)
+            return BatchPlan(
+                is_prefill=True,
+                input_ids=input_ids,
+                positions=positions,
+                scheduled_token_counts=scheduled_token_counts,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                slot_mapping=slot_mapping,
+                block_table_rows=block_table_rows,
+                block_table_width=int(block_table_width),
+                incremental_block_table_update=False,
+                temperatures=temperatures,
+                top_ps=top_ps,
+                top_ks=top_ks,
+                seeds=seeds,
+                has_seeds=has_seeds,
+            )
+
+        nseq = len(seqs)
+        input_ids = self._decode_input_ids_np[:nseq].copy()
+        positions = self._decode_positions_np[:nseq].copy()
+        seqlens_k = self._decode_seqlens_k_np[:nseq].copy()
+        for i, seq in enumerate(seqs):
+            seqlen = int(len(seq))
+            input_ids[i] = int(seq.last_token)
+            positions[i] = max(0, seqlen - 1)
+            seqlens_k[i] = int(seqlen)
+        scheduled_token_counts = self._decode_scheduled_counts_np[:nseq].copy()
+
+        cu_seqlens_q = self._decode_cu_seqlens_q_np[: nseq + 1].copy()
+        cu_seqlens_k = self._decode_cu_seqlens_k_np[: nseq + 1].copy()
+        cu_seqlens_k[0] = 0
+        np.cumsum(seqlens_k, dtype=np.int32, out=cu_seqlens_k[1:])
+        max_seqlen_q = 1
+        max_seqlen_k = int(seqlens_k.max())
+        slot_mapping = self._decode_slot_mapping_np[:nseq].copy()
+        for i, seq in enumerate(seqs):
+            if not seq.block_table:
+                raise ValueError("BLOCK layout requires non-empty block_table for every scheduled sequence")
+            slot_mapping[i] = (
+                int(seq.block_table[-1]) * int(self._config.kv_cache_block_size)
+                + int(seq.last_block_num_tokens)
+                - 1
+            )
+
+        block_table_rows, block_table_width = self._build_packed_block_table_rows(
+            seqs,
+            target_width=(
+                int(self._max_block_table_width) if self._use_cudnn_block_builder() else None
+            ),
+        )
+        temperatures, top_ps, top_ks, seeds, has_seeds = self.prepare_sample(seqs)
+        return BatchPlan(
+            is_prefill=False,
+            input_ids=input_ids,
+            positions=positions,
+            scheduled_token_counts=scheduled_token_counts,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping,
+            block_table_rows=block_table_rows,
+            block_table_width=int(block_table_width),
+            incremental_block_table_update=bool(self._use_cudnn_block_builder()),
+            temperatures=temperatures,
+            top_ps=top_ps,
+            top_ks=top_ks,
+            seeds=seeds,
+            has_seeds=has_seeds,
+        )
+
     def request_free(self, seq_id: int) -> None:
         if self._kv_state is None:
             return

@@ -22,10 +22,12 @@ class EngineConfig:
     kv_cache_block_size: int = 256
 
     tensor_parallel_size: int = 1
+    distributed_executor_backend: str = "uni"
     distributed_backend: str = "nccl"
     tensor_parallel_device_ids: Sequence[int] | None = None
     tp_rank: int = 0
     tp_local_rank: int = 0
+    tp_init_method: str | None = None
 
     device: DeviceType = DeviceType.CPU
     enable_prefix_caching: bool = True
@@ -45,6 +47,9 @@ class EngineConfig:
         self.tensor_parallel_size = max(1, int(self.tensor_parallel_size))
         self.tp_rank = max(0, int(self.tp_rank))
         self.tp_local_rank = max(0, int(self.tp_local_rank))
+        self.distributed_executor_backend = str(self.distributed_executor_backend or "uni").strip().lower()
         self.distributed_backend = str(self.distributed_backend or "nccl").strip().lower()
+        if self.tp_init_method is not None:
+            self.tp_init_method = str(self.tp_init_method).strip() or None
         if self.tensor_parallel_device_ids is not None:
             self.tensor_parallel_device_ids = tuple(int(v) for v in self.tensor_parallel_device_ids)
