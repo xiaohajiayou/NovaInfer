@@ -62,6 +62,13 @@ def _available_memory_bytes(device: DeviceType) -> int:
         return 0
 
     if device == DeviceType.NVIDIA:
+        try:
+            free_b = int(LIB_LLAISYS.llaisysGetDeviceFreeMemory(DeviceType.NVIDIA, 0))
+            if free_b > 0:
+                return free_b
+        except Exception:
+            pass
+
         cudart = None
         candidates = [
             find_library("cudart"),

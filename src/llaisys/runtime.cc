@@ -17,6 +17,14 @@ __C llaisysStream_t llaisysGetContextComputeStream(llaisysDeviceType_t device_ty
     }
 }
 
+__C size_t llaisysGetDeviceFreeMemory(llaisysDeviceType_t device_type, int device_id) {
+    return llaisys::device::getDeviceFreeMemory(device_type, device_id);
+}
+
+__C size_t llaisysGetDeviceTotalMemory(llaisysDeviceType_t device_type, int device_id) {
+    return llaisys::device::getDeviceTotalMemory(device_type, device_id);
+}
+
 // Llaisys API for getting the runtime APIs
 __C const LlaisysRuntimeAPI *llaisysGetRuntimeAPI(llaisysDeviceType_t device_type) {
     return llaisys::device::getRuntimeAPI(device_type);

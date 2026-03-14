@@ -19,9 +19,26 @@ option("nv-cudnn")
     set_description("Whether to enable cuDNN backend integration for Nvidia GPU")
 option_end()
 
+option("maca-gpu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile CUDA-compatible implementations with MXMACA cu-bridge")
+option_end()
+
+option("maca-cudnn")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to enable cuDNN-compatible integration through MXMACA cu-bridge")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+if has_config("maca-gpu") then
+    add_defines("ENABLE_NVIDIA_API", "ENABLE_MACA_CUDA_BRIDGE")
+    includes("xmake/maca.lua")
 end
 
 target("llaisys-utils")
@@ -111,6 +128,10 @@ target("llaisys")
     add_deps("llaisys-core")
     add_deps("llaisys-tensor")
     add_deps("llaisys-ops")
+    if has_config("maca-gpu") then
+        add_deps("llaisys-device-nvidia")
+        add_deps("llaisys-ops-cuda")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -121,6 +142,13 @@ target("llaisys")
             "-Wl,--export-dynamic-symbol=llaisysSamplerSample"
         )
         add_syslinks("gomp")
+    end
+    if has_config("maca-gpu") then
+        add_linkdirs("/opt/maca/lib", "/opt/maca/tools/cu-bridge/lib")
+        add_rpathdirs("/opt/maca/lib", "/opt/maca/tools/cu-bridge/lib")
+        add_shflags("-Wl,--no-as-needed")
+        add_links("mcruntime", "mcblas", "mcblasLt", "mccompiler", "runtime_cu")
+        add_shflags("-Wl,--as-needed")
     end
     add_files("src/llaisys/*.cc")
     add_files("src/llaisys/kv_cache/*.cpp")
@@ -142,6 +170,15 @@ target("llaisys")
         end
         if is_plat("macosx") then
             os.cp("lib/*.dylib", "python/llaisys/libllaisys/")
+        end
+    end)
+    after_load(function (target)
+        if has_config("maca-gpu") then
+            local device = target:dep("llaisys-device-nvidia")
+            local ops = target:dep("llaisys-ops-cuda")
+            if device and ops then
+                target:add("shflags", "-Wl,--whole-archive", device:targetfile(), ops:targetfile(), "-Wl,--no-whole-archive")
+            end
         end
     end)
 target_end()

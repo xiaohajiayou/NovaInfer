@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import pytest
+import types
 
 import llaisys
 from llaisys.engine.buffers import CpuGpuBuffer
 from llaisys.engine.config import EngineConfig
 from llaisys.engine.cpu_model_runner import CPUModelRunner
-from llaisys.engine.gpu_model_runner import GPUModelRunner
+from llaisys.engine.gpu_model_runner import GPUModelRunner, PreparedTensors
 from llaisys.engine.sequence import Sequence
 from llaisys.engine.types import SamplingParams
 
@@ -108,3 +109,57 @@ def test_cpu_runner_block_metadata_capacity_guard():
 
     with pytest.raises(RuntimeError, match="n_block_elems exceeds configured BLOCK metadata capacity"):
         runner.prepare_prefill([seq1, seq2])
+
+
+def test_gpu_runner_prefill_recompute_replays_full_prefix_not_prompt_only():
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner._config = EngineConfig(
+        kv_cache_block_size=4,
+        max_num_seqs=2,
+        max_num_batched_tokens=16,
+        max_model_len=16,
+        device=llaisys.DeviceType.NVIDIA,
+    )
+    runner._device = llaisys.DeviceType.CPU
+    runner._paged_attn_backend = "native"
+    runner._max_num_reqs = 2
+    runner._max_num_tokens = 16
+    runner._max_num_cudnn_rows = 2
+    runner._max_block_table_width = 4
+    runner._input_ids_buf = llaisys.Tensor((16,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._pos_ids_buf = llaisys.Tensor((16,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._output_ids_buf = llaisys.Tensor((16,), llaisys.DataType.I64, llaisys.DeviceType.CPU, 0)
+    runner._cu_seqlens_q_buf = llaisys.Tensor((3,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cu_seqlens_k_buf = llaisys.Tensor((3,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._slot_mapping_buf = llaisys.Tensor((16,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._block_tables_buf = llaisys.Tensor((8,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cudnn_seq_lens_q_buf = llaisys.Tensor((2,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cudnn_seq_lens_kv_buf = llaisys.Tensor((2,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cudnn_page_table_buf = llaisys.Tensor((8,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    runner._cudnn_qo_ragged_offset_buf = llaisys.Tensor((3,), llaisys.DataType.I32, llaisys.DeviceType.CPU, 0)
+    captured = {}
+
+    def _fake_build_block_tensors(self, **kwargs):
+        captured["input_ids"] = kwargs["input_ids"].tolist()
+        captured["positions"] = kwargs["positions"].tolist()
+        return PreparedTensors(
+            input_ids=self._input_ids_buf,
+            pos_ids=self._pos_ids_buf,
+            logits_indices=self._output_ids_buf,
+            n_outputs=len(kwargs["seqs"]),
+            keepalive=[],
+        )
+
+    runner._build_block_tensors = types.MethodType(_fake_build_block_tensors, runner)
+
+    sp = SamplingParams(max_new_tokens=4, top_k=1, top_p=1.0, temperature=1.0)
+    seq = Sequence(seq_id=1, token_ids=[10, 11, 12, 13, 21, 22], sampling_params=sp, block_size=4)
+    seq.num_prompt_tokens = 4
+    seq.num_cached_tokens = 4
+    seq.block_table = [3, 4]
+
+    prepared = runner.prepare_prefill([seq])
+    assert prepared is not None
+    assert prepared.n_outputs == 1
+    assert captured["input_ids"] == [21, 22]
+    assert captured["positions"] == [4, 5]

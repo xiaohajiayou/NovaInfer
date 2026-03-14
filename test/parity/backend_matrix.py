@@ -7,12 +7,23 @@ import torch
 import llaisys
 
 
-def has_nvidia_runtime() -> bool:
+def has_llaisys_nvidia_runtime() -> bool:
     try:
         api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
-        return api.get_device_count() > 0 and torch.cuda.is_available()
+        return api.get_device_count() > 0
     except Exception:
         return False
+
+
+def has_torch_cuda() -> bool:
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+def has_nvidia_runtime() -> bool:
+    return has_llaisys_nvidia_runtime()
 
 
 def parity_device_backend_cases() -> list[tuple[str, str | None]]:

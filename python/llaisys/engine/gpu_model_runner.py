@@ -937,7 +937,10 @@ class GPUModelRunner:
                 row_end = int(offsets[i + 1])
                 tok_start = int(starts[i])
                 tok_end = int(ends[i])
-                input_ids[row_start:row_end] = np.asarray(seq.prompt_token_ids[tok_start:tok_end], dtype=np.int64)
+                # Recompute-prefill must replay the full scheduled prefix, not only
+                # the original prompt. After preemption, len(seq) may include already
+                # generated tokens beyond prompt_token_ids.
+                input_ids[row_start:row_end] = np.asarray(seq.token_ids[tok_start:tok_end], dtype=np.int64)
                 positions[row_start:row_end] = np.arange(tok_start, tok_end, dtype=np.int64)
             if len(input_ids) <= 0:
                 return None

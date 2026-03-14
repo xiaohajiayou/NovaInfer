@@ -205,6 +205,17 @@ xmake -j8
 xmake install
 ```
 
+MXMACA / 沐曦平台：
+
+```bash
+xmake f --root -c --maca-gpu=y --maca-cudnn=n
+xmake --root -r -j4
+cp build/linux/x86_64/release/libllaisys.so python/llaisys/libllaisys/libllaisys.so
+```
+
+详细说明见：
+`doc/maca_usage.md`
+
 For repeatable large-vs-small benchmark experiment design and plotting scripts, see:
 `doc/novainfer_vs_vllm_perf_experiment_2026-03-12.md`
 Notes:

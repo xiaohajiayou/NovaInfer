@@ -1,7 +1,7 @@
 #include "nvtx.hpp"
 #include <cstdint>
 
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) && !defined(ENABLE_MACA_CUDA_BRIDGE)
 extern "C" int nvtxRangePushA(const char *message);
 extern "C" int nvtxRangePop(void);
 extern "C" std::uint64_t nvtxRangeStartA(const char *message);
@@ -11,7 +11,7 @@ extern "C" int nvtxRangeEnd(std::uint64_t id);
 namespace llaisys::utils {
 
 void nvtx_range_push(const char *name) noexcept {
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) && !defined(ENABLE_MACA_CUDA_BRIDGE)
     if (name == nullptr || *name == '\0') {
         return;
     }
@@ -22,13 +22,13 @@ void nvtx_range_push(const char *name) noexcept {
 }
 
 void nvtx_range_pop() noexcept {
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) && !defined(ENABLE_MACA_CUDA_BRIDGE)
     (void)nvtxRangePop();
 #endif
 }
 
 std::uint64_t nvtx_range_start(const char *name) noexcept {
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) && !defined(ENABLE_MACA_CUDA_BRIDGE)
     if (name == nullptr || *name == '\0') {
         return 0;
     }
@@ -40,7 +40,7 @@ std::uint64_t nvtx_range_start(const char *name) noexcept {
 }
 
 void nvtx_range_end(std::uint64_t id) noexcept {
-#ifdef ENABLE_NVIDIA_API
+#if defined(ENABLE_NVIDIA_API) && !defined(ENABLE_MACA_CUDA_BRIDGE)
     if (id == 0) {
         return;
     }

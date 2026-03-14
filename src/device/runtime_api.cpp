@@ -96,6 +96,36 @@ const LlaisysRuntimeAPI *getUnsupportedRuntimeAPI() {
     return &NOOP_RUNTIME_API;
 }
 
+size_t getDeviceFreeMemory(llaisysDeviceType_t device_type, int device_id) {
+    switch (device_type) {
+    case LLAISYS_DEVICE_CPU:
+        return 0;
+    case LLAISYS_DEVICE_NVIDIA:
+#ifdef ENABLE_NVIDIA_API
+        return llaisys::device::nvidia::getDeviceFreeMemory(device_id);
+#else
+        return 0;
+#endif
+    default:
+        return 0;
+    }
+}
+
+size_t getDeviceTotalMemory(llaisysDeviceType_t device_type, int device_id) {
+    switch (device_type) {
+    case LLAISYS_DEVICE_CPU:
+        return 0;
+    case LLAISYS_DEVICE_NVIDIA:
+#ifdef ENABLE_NVIDIA_API
+        return llaisys::device::nvidia::getDeviceTotalMemory(device_id);
+#else
+        return 0;
+#endif
+    default:
+        return 0;
+    }
+}
+
 const LlaisysRuntimeAPI *getRuntimeAPI(llaisysDeviceType_t device_type) {
     // Implement for all device types
     switch (device_type) {

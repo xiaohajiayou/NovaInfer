@@ -58,6 +58,10 @@ def load_runtime(lib):
     lib.llaisysSetContextRuntime.restype = None
     lib.llaisysGetContextComputeStream.argtypes = [llaisysDeviceType_t, c_int]
     lib.llaisysGetContextComputeStream.restype = llaisysStream_t
+    lib.llaisysGetDeviceFreeMemory.argtypes = [llaisysDeviceType_t, c_int]
+    lib.llaisysGetDeviceFreeMemory.restype = c_size_t
+    lib.llaisysGetDeviceTotalMemory.argtypes = [llaisysDeviceType_t, c_int]
+    lib.llaisysGetDeviceTotalMemory.restype = c_size_t
 
     lib.llaisysNvtxRangePush.argtypes = [ctypes.c_char_p]
     lib.llaisysNvtxRangePush.restype = None

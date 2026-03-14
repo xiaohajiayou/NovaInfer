@@ -17,6 +17,22 @@ from .qwen2 import load_qwen2
 from .model import load_model
 
 
+def _preload_maca_bridge():
+    if not sys.platform.startswith("linux"):
+        return
+
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    for path in (
+        "/opt/maca/lib/libmcblas.so",
+        "/opt/maca/lib/libmcblasLt.so",
+        "/opt/maca/lib/libmcruntime.so",
+        "/opt/maca/lib/libmccompiler.so",
+        "/opt/maca/lib/libruntime_cu.so",
+    ):
+        if os.path.isfile(path):
+            ctypes.CDLL(path, mode=mode)
+
+
 def load_shared_library():
     lib_dir = Path(__file__).parent
 
@@ -33,6 +49,7 @@ def load_shared_library():
     if not os.path.isfile(lib_path):
         raise FileNotFoundError(f"Shared library not found: {lib_path}")
 
+    _preload_maca_bridge()
     return ctypes.CDLL(str(lib_path))
 
 

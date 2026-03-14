@@ -9,17 +9,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import llaisys
 from llaisys.engine.runtime_factory import create_kv_state, plan_qwen2_kv_cache
 from llaisys.libllaisys import LIB_LLAISYS
-from test.parity.backend_matrix import parity_device_backend_layout_cases
+from test.parity.backend_matrix import has_llaisys_nvidia_runtime, has_torch_cuda, parity_device_backend_layout_cases
 from test.utils.batch_builders import BlockBatchState, build_decode_batch
 from test.utils.forward_api import run_model_forward, sample_from_forward
 
 
 def _has_nvidia_runtime() -> bool:
-    try:
-        api = llaisys.RuntimeAPI(llaisys.DeviceType.NVIDIA)
-        return api.get_device_count() > 0 and torch.cuda.is_available()
-    except Exception:
-        return False
+    return has_llaisys_nvidia_runtime()
 
 
 def _set_attn_backend(backend: str | None):
@@ -69,7 +65,9 @@ def _torch_device(device_name: str):
     if device_name == "cpu":
         return torch.device("cpu")
     if device_name == "nvidia":
-        return torch.device("cuda:0")
+        if has_torch_cuda():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
     raise ValueError(f"Unsupported device: {device_name}")
 
 

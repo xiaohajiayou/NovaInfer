@@ -27,6 +27,13 @@ def torch_self_attention(attn_val, query, key, value, scale):
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_val.copy_((attn_weight @ value).transpose(-2, -3))
 
+def torch_self_attention_reference(attn_val, query, key, value, scale):
+    # Use CPU as the numerical reference. On MXMACA, torch's GPU attention path
+    # can differ from the straightforward reference by ~1e-4 in f32.
+    ref = torch.empty_like(attn_val, device="cpu")
+    torch_self_attention(ref, query.cpu(), key.cpu(), value.cpu(), scale)
+    attn_val.copy_(ref.to(device=attn_val.device))
+
 
 def test_op_self_attention(
     qlen,
@@ -49,7 +56,7 @@ def test_op_self_attention(
     scale = 1.0 / (hd**0.5)
 
     attn_val, attn_val_ = random_tensor((qlen, nh, hd), dtype_name, device_name)
-    torch_self_attention(attn_val, q, k, v, scale)
+    torch_self_attention_reference(attn_val, q, k, v, scale)
     llaisys.Ops.self_attention(attn_val_, q_, k_, v_, scale)
     assert check_equal(attn_val_, attn_val, atol=atol, rtol=rtol)
 

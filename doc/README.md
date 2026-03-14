@@ -9,6 +9,7 @@
 5. `doc/qwen2_next_dev_plan_2026-02.md`：执行计划与未完成清单
 6. `doc/qwen2_cuda_perf_tracking_2026-02-21.md`：本轮 CUDA/cudnn 性能数据、适配现状与问题复盘
 7. `doc/python_cpp_runner_alignment_plan_2026-03-01.md`：Python->C++ 全链路对齐 vLLM Runner 的重构方案与验收标准
+8. `doc/maca_usage.md`：MXMACA / 沐曦平台构建、验证与测试说明
 
 ## 2. 归档文档
 
