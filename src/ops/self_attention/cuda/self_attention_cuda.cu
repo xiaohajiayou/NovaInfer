@@ -891,7 +891,6 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
                                     bool is_prefill,
                                     int64_t b_exec,
                                     int64_t warmup_b,
-                                    int64_t warmup_s_q,
                                     int64_t max_seq_len_q,
                                     int64_t nhead,
                                     int64_t nkvhead,
@@ -910,7 +909,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     // Rebuild when any runtime bound grows beyond built template, or cache geometry changes.
     bool need_rebuild = force_rebuild || !plan.graph_ready;
     if (!need_rebuild) {
-        if (b_exec_safe > plan.built_b || s_q_exec > plan.built_s_q) {
+        if (b_exec_safe > plan.built_b) {
             need_rebuild = true;
         }
     }
@@ -950,7 +949,9 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
 
     auto io_dtype = dtype == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
     const int64_t b_plan = is_prefill ? pick_prefill_b_plan(b_exec_safe, warmup_b) : b_exec_safe;
-    const int64_t s_q_plan = is_prefill ? pick_prefill_s_q_plan(s_q_exec, warmup_s_q) : s_q_exec;
+    // const int64_t s_q_plan = is_prefill ? pick_prefill_s_q_plan(s_q_exec, warmup_s_q) : s_q_exec;
+    // const int64_t b_plan = b_exec_safe;
+    const int64_t s_q_plan = s_q_exec;
     const int32_t table_size_plan = table_size;
     const int64_t max_seq_len_kv_plan = max_seq_len_kv;
     if (is_prefill && cudnnGetVersion() < 90700) {
@@ -1222,16 +1223,16 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
             {PAGE_TABLE_K_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
             {PAGE_TABLE_V_UID, const_cast<int32_t *>(prepared.cudnn_page_table)},
         };
-        build_cudnn_override_tensors(
-            /*is_prefill=*/false,
-            b_exec,
-            /*s_q_exec=*/1,
-            nhead,
-            head_dim,
-            table_size,
-            override_uids,
-            override_shapes,
-            override_strides);
+        // build_cudnn_override_tensors(
+        //     /*is_prefill=*/false,
+        //     b_exec,
+        //     /*s_q_exec=*/1,
+        //     nhead,
+        //     head_dim,
+        //     table_size,
+        //     override_uids,
+        //     override_shapes,
+        //     override_strides);
         cudnn_debug_dump_override(override_uids, override_shapes, override_strides);
         cudnn_debug_dump_i32("decode.seq_lens_q", prepared.cudnn_seq_lens_q, b_exec, 32);
         cudnn_debug_dump_i32("decode.seq_lens_kv", prepared.cudnn_seq_lens_kv, b_exec, 32);
@@ -1375,7 +1376,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
 
     auto &plan = select_cudnn_plan(*state, /*is_prefill=*/true);
     if (!ensure_cudnn_plan_ready(
-            plan, state->handle, q->dtype(), true, b_exec, prepared.cudnn_warmup_b, prepared.cudnn_warmup_s_q,
+            plan, state->handle, q->dtype(), true, b_exec, prepared.cudnn_warmup_b,
             max_seq_len_q, nhead, nkvhead,
             head_dim, num_blocks,
             table_size, max_seq_len_kv, block_size, scale)) {
@@ -1404,7 +1405,7 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
         };
         build_cudnn_override_tensors(
             /*is_prefill=*/true,
-            b_exec,
+            plan.built_b,
             std::max<int64_t>(1, max_seq_len_q),
             nhead,
             head_dim,
@@ -1434,7 +1435,6 @@ bool cudnn_try_paged_attention_prefill(tensor_t attn_val,
                                     true,
                                     b_exec,
                                     prepared.cudnn_warmup_b,
-                                    prepared.cudnn_warmup_s_q,
                                     max_seq_len_q,
                                     nhead,
                                     nkvhead,
