@@ -76,7 +76,6 @@ class AttentionMetadata(Structure):
         ("cudnn_qo_ragged_offset", llaisysTensor_t),
         ("cudnn_b_exec", c_int32),
         ("cudnn_warmup_b", c_int32),
-        ("cudnn_warmup_s_q", c_int32),
     ]
 
 

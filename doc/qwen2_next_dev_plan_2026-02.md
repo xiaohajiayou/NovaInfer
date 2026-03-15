@@ -59,7 +59,7 @@
 CUDA_VISIBLE_DEVICES=5 \
   LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
    python scripts/bench_compare_vllm.py\
-    --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
+    --model-path /home/xiaohajiayou/NovaInfer/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
     --backend novainfer \
     --num-seqs 256 \
     --min-input-len 100 \

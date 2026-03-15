@@ -67,7 +67,6 @@ def main() -> int:
         max_model_len=int(args.max_model_len),
         max_num_seqs=max(1, int(args.max_num_seqs)),
         max_num_batched_tokens=max_num_batched_tokens,
-        cudnn_prefill_warmup_max_seqlen_q=max(1, int(args.cudnn_prefill_warmup_max_seqlen_q)),
         kv_cache_memory_utilization=float(args.kv_cache_memory_utilization),
         tensor_parallel_size=tp_size,
         tensor_parallel_device_ids=_parse_device_ids(args.tensor_parallel_device_ids),
@@ -96,7 +95,6 @@ def main() -> int:
         f"kv_cache_memory_utilization={float(args.kv_cache_memory_utilization):.2f} "
         f"max_num_seqs={max(1, int(args.max_num_seqs))} "
         f"max_num_batched_tokens={max_num_batched_tokens if max_num_batched_tokens is not None else 'auto'} "
-        f"cudnn_prefill_warmup_max_seqlen_q={max(1, int(args.cudnn_prefill_warmup_max_seqlen_q))} "
         f"distributed_executor_backend={dist_backend} "
         f"tensor_parallel_size={tp_size} "
         f"tensor_parallel_device_ids={list(cfg.tensor_parallel_device_ids or ())}"

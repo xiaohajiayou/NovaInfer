@@ -66,30 +66,30 @@ struct CudnnRuntimeState {
 
 namespace {
 
-static int64_t parse_env_i64(const char *name, int64_t fallback) {
-    const char *raw = std::getenv(name);
-    if (raw == nullptr || *raw == '\0') {
-        return fallback;
-    }
-    char *end = nullptr;
-    const long long parsed = std::strtoll(raw, &end, 10);
-    if (end == raw || (end != nullptr && *end != '\0')) {
-        return fallback;
-    }
-    return std::max<int64_t>(1, static_cast<int64_t>(parsed));
-}
+// static int64_t parse_env_i64(const char *name, int64_t fallback) {
+//     const char *raw = std::getenv(name);
+//     if (raw == nullptr || *raw == '\0') {
+//         return fallback;
+//     }
+//     char *end = nullptr;
+//     const long long parsed = std::strtoll(raw, &end, 10);
+//     if (end == raw || (end != nullptr && *end != '\0')) {
+//         return fallback;
+//     }
+//     return std::max<int64_t>(1, static_cast<int64_t>(parsed));
+// }
 
-static int64_t pick_prefill_b_plan(int64_t runtime_b_exec, int64_t warmup_b) {
-    const int64_t safe = std::max<int64_t>(1, runtime_b_exec);
-    const int64_t configured = parse_env_i64("LLAISYS_CUDNN_PREFILL_WARMUP_B", warmup_b);
-    return std::max<int64_t>(safe, configured);
-}
+// static int64_t pick_prefill_b_plan(int64_t runtime_b_exec, int64_t warmup_b) {
+//     const int64_t safe = std::max<int64_t>(1, runtime_b_exec);
+//     const int64_t configured = parse_env_i64("LLAISYS_CUDNN_PREFILL_WARMUP_B", warmup_b);
+//     return std::max<int64_t>(safe, configured);
+// }
 
-static int64_t pick_prefill_s_q_plan(int64_t runtime_s_q_exec, int64_t warmup_s_q) {
-    const int64_t safe = std::max<int64_t>(1, runtime_s_q_exec);
-    const int64_t configured = parse_env_i64("LLAISYS_CUDNN_PREFILL_WARMUP_SQ", warmup_s_q);
-    return std::max<int64_t>(safe, configured);
-}
+// static int64_t pick_prefill_s_q_plan(int64_t runtime_s_q_exec, int64_t warmup_s_q) {
+//     const int64_t safe = std::max<int64_t>(1, runtime_s_q_exec);
+//     const int64_t configured = parse_env_i64("LLAISYS_CUDNN_PREFILL_WARMUP_SQ", warmup_s_q);
+//     return std::max<int64_t>(safe, configured);
+// }
 
 template <typename T>
 __global__ void self_attention_kernel(T *out,
@@ -948,7 +948,7 @@ static bool ensure_cudnn_plan_ready(CudnnPagedPlan &plan,
     }
 
     auto io_dtype = dtype == LLAISYS_DTYPE_BF16 ? fe::DataType_t::BFLOAT16 : fe::DataType_t::HALF;
-    const int64_t b_plan = is_prefill ? pick_prefill_b_plan(b_exec_safe, warmup_b) : b_exec_safe;
+    const int64_t b_plan = std::max(b_exec_safe, warmup_b);
     // const int64_t s_q_plan = is_prefill ? pick_prefill_s_q_plan(s_q_exec, warmup_s_q) : s_q_exec;
     // const int64_t b_plan = b_exec_safe;
     const int64_t s_q_plan = s_q_exec;
@@ -1199,7 +1199,7 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
 
     auto &plan = select_cudnn_plan(*state, /*is_prefill=*/false);
     if (!ensure_cudnn_plan_ready(
-            plan, state->handle, q->dtype(), false, b_exec, 0, 0, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
+            plan, state->handle, q->dtype(), false, b_exec, prepared.cudnn_warmup_b, max_seq_len_q, nhead, nkvhead, head_dim, num_blocks,
             table_size, max_seq_len_kv, block_size, scale)) {
         return false;
     }
@@ -1253,8 +1253,7 @@ bool cudnn_try_paged_attention_decode(tensor_t attn_val,
                                     q->dtype(),
                                     false,
                                     b_exec,
-                                    0,
-                                    0,
+                                    prepared.cudnn_warmup_b,
                                     max_seq_len_q,
                                     nhead,
                                     nkvhead,
@@ -1805,7 +1804,6 @@ void self_attention_paged(tensor_t attn_val,
         nullptr,
         nullptr,
         nullptr,
-        0,
         0,
         0,
         static_cast<int32_t>(cu_seqlens_q->shape()[0]) - 1,

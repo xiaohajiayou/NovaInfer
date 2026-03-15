@@ -67,8 +67,8 @@ CUDA_VISIBLE_DEVICES=5 \
   --cases smallseqs_tightbatch smallseqs_smallbatch largeseqs_smallbatch largeseqs_largebatch \
   --backend-order novainfer vllm \
   --cudnn-backend cudnn \
-  --output-jsonl perf_results_a100_2026-03-14.jsonl \
-  --output-log-dir perf_logs_a100_2026-03-14
+  --output-jsonl perf_results_a100_2026-03-15.jsonl \
+  --output-log-dir perf_logs_a100_2026-03-15
 ```
 
 ### 3.3 原始数据与图表

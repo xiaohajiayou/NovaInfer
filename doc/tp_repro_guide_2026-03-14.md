@@ -125,6 +125,7 @@ CUDA_VISIBLE_DEVICES=5,6 \
 
 ```bash
 CUDA_VISIBLE_DEVICES=5,6 \
+LLAISYS_CUDA_PAGED_ATTN_BACKEND=cudnn \
 .venv/bin/python scripts/tp_hf_parity.py \
   --model-path models/deepseek-ai/DeepSeek-R1-Distill-Qwen-7B \
   --tp-size 2 \

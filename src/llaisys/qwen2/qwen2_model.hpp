@@ -140,7 +140,6 @@ private:
         tensor_t cudnn_qo_ragged_offset{};
         int32_t cudnn_b_exec{0};
         int32_t cudnn_warmup_b{0};
-        int32_t cudnn_warmup_s_q{0};
         std::vector<int32_t> used_slots{};
     };
 

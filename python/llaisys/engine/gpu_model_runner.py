@@ -50,7 +50,6 @@ class PreparedTensors:
     cudnn_qo_ragged_offset: Tensor | None = None
     cudnn_b_exec: int = 0
     cudnn_warmup_b: int = 0
-    cudnn_warmup_s_q: int = 0
 
 
 @dataclass
@@ -90,7 +89,6 @@ class CudnnBlockMeta:
     cudnn_qo_ragged_offset: Tensor | None
     cudnn_b_exec: int
     cudnn_warmup_b: int
-    cudnn_warmup_s_q: int
     keepalive: list[Tensor]
 
 
@@ -323,7 +321,6 @@ class GPUModelRunner:
                 )
                 attn.cudnn_b_exec = c_int32(int(prepared.cudnn_b_exec))
                 attn.cudnn_warmup_b = c_int32(int(prepared.cudnn_warmup_b))
-                attn.cudnn_warmup_s_q = c_int32(int(prepared.cudnn_warmup_s_q))
 
                 fin = ModelForwardInput()
                 fin.input_ids = prepared.input_ids.lib_tensor()
@@ -924,7 +921,6 @@ class GPUModelRunner:
             cudnn_qo_ragged_offset=ragged_t,
             cudnn_b_exec=int(b_exec),
             cudnn_warmup_b=int(self._config.max_num_seqs),
-            cudnn_warmup_s_q=int(self._config.cudnn_prefill_warmup_max_seqlen_q),
             keepalive=keepalive,
         )
 

@@ -62,7 +62,6 @@ __C {
         llaisysTensor_t cudnn_qo_ragged_offset;
         int32_t cudnn_b_exec;
         int32_t cudnn_warmup_b;
-        int32_t cudnn_warmup_s_q;
     };
 
     struct ModelForwardInput {

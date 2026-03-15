@@ -16,7 +16,6 @@ class EngineConfig:
     end_token_id: int | None = None
     max_num_seqs: int = 8
     max_num_batched_tokens: int = 4096
-    cudnn_prefill_warmup_max_seqlen_q: int | None = None
 
     kv_cache_memory_utilization: float = 0.9
     num_kvcache_blocks: int = 0
@@ -38,9 +37,6 @@ class EngineConfig:
         self.max_num_seqs = max(1, int(self.max_num_seqs))
         if self.max_model_len is not None:
             self.max_model_len = max(1, int(self.max_model_len))
-        if self.cudnn_prefill_warmup_max_seqlen_q is None:
-            self.cudnn_prefill_warmup_max_seqlen_q = 1024
-        self.cudnn_prefill_warmup_max_seqlen_q = max(1, int(self.cudnn_prefill_warmup_max_seqlen_q))
         if self.end_token_id is not None:
             self.end_token_id = int(self.end_token_id)
         self.max_num_batched_tokens = max(1, int(self.max_num_batched_tokens or 4096))

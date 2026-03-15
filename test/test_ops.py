@@ -58,6 +58,17 @@ def test_ops_linear_cpu():
         profile=False,
     )
 
+# @pytest.mark.ops
+# def test_ops_linear_cpu_big():
+#     linear_ops.test_op_linear(
+#         out_shape=(512, 4096),
+#         x_shape=(512, 4096),
+#         w_shape=(4096, 4096),
+#         use_bias=True,
+#         dtype_name="f32",
+#         device_name="cpu",
+#         profile=True,
+#     )
 
 @pytest.mark.ops
 def test_ops_rms_norm_cpu():
@@ -75,6 +86,11 @@ def test_ops_self_attention_cpu():
         qlen=4, kvlen=8, nh=4, nkvh=2, hd=8, dtype_name="f32", device_name="cpu", profile=False
     )
 
+@pytest.mark.ops
+def test_ops_self_attention_cpu_big():
+    self_attention_ops.test_op_self_attention(
+        qlen=5, kvlen=11, nh=4, nkvh=2, hd=8, dtype_name="f32", device_name="cpu", profile=True
+    )
 
 @pytest.mark.ops
 def test_ops_swiglu_cpu():
